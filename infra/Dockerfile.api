@@ -1,0 +1,26 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install pnpm
+RUN npm install -g pnpm
+
+# Copy workspace files
+COPY package.json pnpm-workspace.yaml turbo.json tsconfig.json ./
+COPY packages ./packages
+COPY apps/api ./apps/api
+
+# Install dependencies
+RUN pnpm install --frozen-lockfile
+
+# Build packages
+RUN pnpm --filter @zend/shared build
+RUN pnpm --filter @zend/db build
+RUN pnpm --filter @zend/paj-client build
+
+# Build API
+RUN pnpm --filter @zend/api build
+
+WORKDIR /app/apps/api
+
+CMD ["node", "dist/index.js"]

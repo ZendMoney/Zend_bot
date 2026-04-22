@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  # PostgreSQL database
+  postgres:
+    image: postgres:15-alpine
+    container_name: zend-postgres
+    environment:
+      POSTGRES_USER: zend
+      POSTGRES_PASSWORD: zend_dev_password
+      POSTGRES_DB: zend
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zend"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis for sessions and caching
+  redis:
+    image: redis:7-alpine
+    container_name: zend-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+  # Bot service
+  bot:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.bot
+    container_name: zend-bot
+    environment:
+      - NODE_ENV=development
+      - BOT_TOKEN=${BOT_TOKEN}
+      - DATABASE_URL=postgres://zend:zend_dev_password@postgres:5432/zend
+      - REDIS_URL=redis://redis:6379
+      - SOLANA_RPC_URL=https://api.devnet.solana.com
+      - FEE_PAYER_KEY=${FEE_PAYER_KEY}
+      - PAJ_API_KEY=${PAJ_API_KEY}
+      - PAJ_API_SECRET=${PAJ_API_SECRET}
+      - PAJ_BASE_URL=${PAJ_BASE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - ../:/app
+      - /app/node_modules
+
+  # API service
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    container_name: zend-api
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - API_PORT=3000
+      - DATABASE_URL=postgres://zend:zend_dev_password@postgres:5432/zend
+      - PAJ_API_KEY=${PAJ_API_KEY}
+      - PAJ_API_SECRET=${PAJ_API_SECRET}
+      - PAJ_BASE_URL=${PAJ_BASE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../:/app
+      - /app/node_modules
+
+volumes:
+  postgres_data:
+  redis_data:

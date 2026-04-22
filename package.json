@@ -1,0 +1,20 @@
+{
+  "name": "zend",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.30.3",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "db:migrate": "pnpm --filter @zend/db migrate",
+    "db:generate": "pnpm --filter @zend/db generate",
+    "bot:dev": "pnpm --filter @zend/bot dev",
+    "api:dev": "pnpm --filter @zend/api dev"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.0",
+    "typescript": "^5.6.0"
+  }
+}
