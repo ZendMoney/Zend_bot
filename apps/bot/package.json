@@ -15,6 +15,7 @@
     "@zend/db": "workspace:*",
     "@zend/solana": "workspace:*",
     "@zend/paj-client": "workspace:*",
+    "@zend/nlu": "workspace:*",
     "ioredis": "^5.4.0"
   },
   "devDependencies": {

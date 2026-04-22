@@ -1,4 +1,5 @@
 import { ConversationState, parseAmountInput, normalizeBank } from '@zend/shared';
+import { parseUserInput } from '@zend/nlu';
 import type { ZendContext } from '../middleware/session.js';
 
 export async function textHandler(ctx: ZendContext) {
@@ -27,63 +28,100 @@ export async function textHandler(ctx: ZendContext) {
       return;
   }
 
-  // Natural language parsing (when not in a conversation flow)
-  const lowerText = text.toLowerCase();
+  // Natural language parsing with Kimi AI
+  const parsed = await parseUserInput(text);
 
-  // Balance queries
-  if (lowerText.match(/balance|how much|wetin be my balance/)) {
-    const { balanceHandler } = await import('./balance.js');
-    await balanceHandler(ctx);
-    return;
-  }
+  switch (parsed.intent) {
+    case 'BALANCE':
+      await balanceHandler(ctx);
+      return;
 
-  // Send money
-  if (lowerText.match(/send|transfer|give/)) {
-    const parsed = parseAmountInput(text);
-    if (parsed) {
-      await ctx.reply(
-        `📤 I understood: Send ${parsed.currency === 'NGN' ? '₦' : ''}${parsed.value.toLocaleString()} ${parsed.currency || ''}\n\n` +
-        `Who should receive it?`,
-      );
+    case 'NGN_SEND':
+      session.pendingIntent = parsed;
       session.state = ConversationState.AWAITING_SEND_RECIPIENT;
-      session.pendingIntent = {
-        intent: 'NGN_SEND',
-        confidence: 0.9,
-        entities: [
-          { type: 'amount', value: parsed.value },
-          { type: 'currency', value: parsed.currency || 'NGN' },
-        ],
-        rawText: text,
-      };
-    } else {
-      await ctx.reply('📤 How much do you want to send?');
-      session.state = ConversationState.AWAITING_SEND_AMOUNT;
+
+      const amount = parsed.entities.find(e => e.type === 'amount')?.value;
+      const currency = parsed.entities.find(e => e.type === 'currency')?.value || 'NGN';
+
+      if (amount) {
+        await ctx.reply(
+          `📤 Send ${currency === 'NGN' ? '₦' : ''}${Number(amount).toLocaleString()} ${currency}\n\n` +
+          `Who should receive it?\n` +
+          `Type: "Name Bank AccountNumber"\n` +
+          `Example: "Tunde GTBank 0123456789"`,
+        );
+      } else {
+        await ctx.reply('📤 How much do you want to send?');
+        session.state = ConversationState.AWAITING_SEND_AMOUNT;
+      }
+      return;
+
+    case 'NGN_RECEIVE':
+      await buyHandler(ctx);
+      return;
+
+    case 'CRYPTO_SEND':
+      await sellHandler(ctx);
+      return;
+
+    case 'SWAP': {
+      const fromAsset = parsed.entities.find(e => e.type === 'from_asset')?.value;
+      const toAsset = parsed.entities.find(e => e.type === 'to_asset')?.value;
+      const swapAmount = parsed.entities.find(e => e.type === 'amount')?.value;
+
+      await ctx.reply(
+        `🔄 Swap ${fromAsset || 'SOL'} → ${toAsset || 'USDT'}\n\n` +
+        `${swapAmount ? `Amount: ${swapAmount}` : 'How much do you want to swap?'}`,
+      );
+      return;
     }
-    return;
-  }
 
-  // Buy / Add money
-  if (lowerText.match(/buy|add|fund|deposit|wan add/)) {
-    const { buyHandler } = await import('./buy.js');
-    await buyHandler(ctx);
-    return;
-  }
+    case 'HISTORY':
+      await historyHandler(ctx);
+      return;
 
-  // Sell / Withdraw
-  if (lowerText.match(/sell|withdraw|cash out/)) {
-    const { sellHandler } = await import('./sell.js');
-    await sellHandler(ctx);
-    return;
-  }
+    case 'VAULT_SAVE':
+    case 'VAULT_LOCK':
+    case 'VAULT_WITHDRAW':
+      await vaultHandler(ctx);
+      return;
 
-  // Fallback
-  await ctx.reply(
-    `🤔 I didn't understand that.\n\n` +
-    `Try:\n` +
-    `• "Send 50k to Tunde GTB"\n` +
-    `• "What's my balance?"\n` +
-    `• /help for all commands`,
-  );
+    case 'SCHEDULE':
+      await ctx.reply('📅 Scheduled transfers coming soon!');
+      return;
+
+    case 'SETTINGS':
+      await settingsHandler(ctx);
+      return;
+
+    case 'HELP':
+      await helpHandler(ctx);
+      return;
+
+    case 'GREETING':
+      await ctx.reply(
+        `👋 Hello! I'm Zend — your crypto wallet in Telegram.\n\n` +
+        `What would you like to do?\n` +
+        `• Send money: "Send 50k to Tunde"\n` +
+        `• Check balance: "What's my balance?"\n` +
+        `• Add money: /buy\n` +
+        `• /help for all commands`,
+      );
+      return;
+
+    case 'CRYPTO_RECEIVE':
+      await receiveHandler(ctx);
+      return;
+
+    default:
+      await ctx.reply(
+        `🤔 I understood: "${parsed.intent}" (confidence: ${Math.round(parsed.confidence * 100)}%)\n\n` +
+        `But I'm not sure what to do. Try:\n` +
+        `• "Send 50k to Tunde GTB"\n` +
+        `• "What's my balance?"\n` +
+        `• /help for all commands`,
+      );
+  }
 }
 
 async function handleSendAmount(ctx: ZendContext, text: string) {
