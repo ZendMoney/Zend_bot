@@ -31,10 +31,20 @@ export function calculatePajFee(ngnAmount: number, feeBps: number): number {
   return Math.floor(ngnAmount * (feeBps / 10000));
 }
 
-// Calculate total USDT needed (including fee)
-export function calculateTotalUsdt(ngnAmount: number, rate: number, feeBps: number): number {
-  const ngnWithFee = ngnAmount + calculatePajFee(ngnAmount, feeBps);
-  return ngnToUsdt(ngnWithFee, rate);
+// Calculate Zend spread
+export function calculateZendSpread(ngnAmount: number, spreadBps: number): number {
+  return Math.floor(ngnAmount * (spreadBps / 10000));
+}
+
+// Calculate total cost (PAJ fee + Zend spread)
+export function calculateTotalFees(ngnAmount: number, pajFeeBps: number, zendSpreadBps: number): number {
+  return calculatePajFee(ngnAmount, pajFeeBps) + calculateZendSpread(ngnAmount, zendSpreadBps);
+}
+
+// Calculate total USDT needed (including all fees)
+export function calculateTotalUsdt(ngnAmount: number, rate: number, pajFeeBps: number, zendSpreadBps: number): number {
+  const ngnWithFees = ngnAmount + calculateTotalFees(ngnAmount, pajFeeBps, zendSpreadBps);
+  return ngnToUsdt(ngnWithFees, rate);
 }
 
 // Parse amount from user input (handles "50k", "50,000", "fifty thousand")
@@ -96,7 +106,9 @@ export function generateReference(): string {
 
 // Sleep utility
 export function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(resolve => {
+    (globalThis as any).setTimeout(resolve, ms);
+  });
 }
 
 // Check if string is valid Solana address
@@ -128,4 +140,52 @@ export function getTokenByMint(mint: string) {
 // Get token info by symbol
 export function getTokenBySymbol(symbol: string) {
   return Object.values(SOLANA_TOKENS).find(t => t.symbol === symbol.toUpperCase());
+}
+
+// Hash PIN (simple hash for demo - use bcrypt in production)
+export function hashPin(pin: string): string {
+  // In production: import bcrypt from 'bcrypt'; return bcrypt.hashSync(pin, 10);
+  return `hashed_${pin}`;
+}
+
+// Verify PIN
+export function verifyPin(pin: string, hashedPin: string): boolean {
+  // In production: import bcrypt from 'bcrypt'; return bcrypt.compareSync(pin, hashedPin);
+  return hashedPin === `hashed_${pin}`;
+}
+
+// Generate OTP
+export function generateOTP(): string {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// Generate referral code
+export function generateReferralCode(userId: string): string {
+  return `ref_${userId.slice(-8)}`;
+}
+
+// Parse frequency from natural language
+export function parseFrequency(input: string): 'daily' | 'weekly' | 'monthly' | null {
+  const lower = input.toLowerCase();
+  if (lower.match(/daily|every day|everyday/)) return 'daily';
+  if (lower.match(/weekly|every week/)) return 'weekly';
+  if (lower.match(/monthly|every month/)) return 'monthly';
+  return null;
+}
+
+// Calculate next run date for scheduled transfers
+export function calculateNextRun(startAt: Date, frequency: string): Date {
+  const next = new Date(startAt);
+  switch (frequency) {
+    case 'daily':
+      next.setDate(next.getDate() + 1);
+      break;
+    case 'weekly':
+      next.setDate(next.getDate() + 7);
+      break;
+    case 'monthly':
+      next.setMonth(next.getMonth() + 1);
+      break;
+  }
+  return next;
 }

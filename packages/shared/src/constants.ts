@@ -123,3 +123,6 @@ export const PAJ_MIN_DEPOSIT_NGN = 1_000;
 
 // Auto-save rates (in basis points)
 export const AUTO_SAVE_RATES = [100, 200, 300, 500, 1000] as const; // 1%, 2%, 3%, 5%, 10%
+
+// Zend spread (your margin on top of PAJ)
+export const ZEND_SPREAD_BPS = 50; // 0.5% - adjust as needed

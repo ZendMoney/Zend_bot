@@ -63,6 +63,7 @@ export interface Transaction {
   ngnAmount?: number;
   ngnRate?: number;
   pajFeeBps?: number;
+  zendSpreadBps?: number;
   
   // Recipient (for sends)
   recipientBankCode?: string;
@@ -188,4 +189,34 @@ export interface UserSession {
 export interface ZendContext {
   user?: User;
   session: UserSession;
+}
+
+// Jupiter Swap
+export interface JupiterQuote {
+  inputMint: string;
+  outputMint: string;
+  inAmount: number;
+  outAmount: number;
+  priceImpact: number;
+  route: string[];
+  slippageBps: number;
+}
+
+// Email OTP
+export interface EmailOTP {
+  email: string;
+  code: string;
+  expiresAt: Date;
+  verified: boolean;
+}
+
+// Referral
+export interface Referral {
+  id: string;
+  referrerId: string;
+  referredId: string;
+  status: 'pending' | 'completed';
+  rewardAmount?: number;
+  createdAt: Date;
+  completedAt?: Date;
 }

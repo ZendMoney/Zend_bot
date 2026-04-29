@@ -1,23 +1,33 @@
-import type { MiddlewareFn } from 'telegraf';
+import { MiddlewareFn } from 'telegraf';
 import { db, users } from '@zend/db';
 import { eq } from 'drizzle-orm';
-import type { ZendContext } from './session.js';
 
-export const authMiddleware: MiddlewareFn<ZendContext> = async (ctx, next) => {
-  const telegramId = ctx.from?.id.toString();
-  if (!telegramId) {
+/**
+ * Auth middleware: ensures user exists in DB.
+ * If not, redirects to /start.
+ */
+export const authMiddleware: MiddlewareFn<any> = async (ctx, next) => {
+  if (!ctx.from) return next();
+
+  const userId = ctx.from.id.toString();
+
+  // Skip auth for /start command
+  if (ctx.message && 'text' in ctx.message && ctx.message.text === '/start') {
     return next();
   }
 
-  // Try to find user in database
-  const user = await db.query.users.findFirst({
-    where: eq(users.id, telegramId),
-  });
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
 
-  if (user) {
-    // Attach user to context
-    (ctx as any).user = user;
+  if (user.length === 0) {
+    await ctx.reply(
+      '👋 Welcome! Please run /start to create your Zend wallet.',
+      { parse_mode: 'Markdown' }
+    );
+    return;
   }
 
-  await next();
+  // Attach user to context for handlers
+  (ctx as any).zendUser = user[0];
+
+  return next();
 };

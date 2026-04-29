@@ -2,19 +2,34 @@
   "name": "zend",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "packageManager": "pnpm@10.30.3",
   "scripts": {
-    "build": "turbo run build",
-    "dev": "turbo run dev",
-    "lint": "turbo run lint",
-    "test": "turbo run test",
-    "db:migrate": "pnpm --filter @zend/db migrate",
-    "db:generate": "pnpm --filter @zend/db generate",
-    "bot:dev": "pnpm --filter @zend/bot dev",
-    "api:dev": "pnpm --filter @zend/api dev"
+    "build": "tsc",
+    "dev:bot": "tsx watch apps/bot/src/index.ts",
+    "dev:api": "tsx watch apps/api/src/index.ts",
+    "start:bot": "node apps/bot/dist/index.js",
+    "start:api": "node apps/api/dist/index.js",
+    "db:migrate": "drizzle-kit migrate",
+    "db:generate": "drizzle-kit generate",
+    "db:studio": "drizzle-kit studio"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.0",
+    "@solana/spl-token": "^0.4.0",
+    "@solana/web3.js": "^1.98.0",
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.38.0",
+    "hono": "^4.6.0",
+    "ioredis": "^5.4.0",
+    "paj_ramp": "^1.5.4",
+    "postgres": "^3.4.0",
+    "telegraf": "^4.16.0"
   },
   "devDependencies": {
-    "turbo": "^2.3.0",
+    "@types/node": "^22.0.0",
+    "drizzle-kit": "^0.30.0",
+    "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   }
 }

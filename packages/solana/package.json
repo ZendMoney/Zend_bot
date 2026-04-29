@@ -2,19 +2,9 @@
   "name": "@zend/solana",
   "version": "0.1.0",
   "private": true,
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
-    "lint": "eslint src/**/*.ts"
-  },
-  "dependencies": {
-    "@solana/web3.js": "^1.98.0",
-    "@solana/spl-token": "^0.4.0",
-    "@zend/shared": "workspace:*"
-  },
-  "devDependencies": {
-    "typescript": "^5.6.0"
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
   }
 }

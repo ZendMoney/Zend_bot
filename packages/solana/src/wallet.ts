@@ -14,15 +14,13 @@ import {
   createTransferInstruction,
   getAccount,
 } from '@solana/spl-token';
-import { SOLANA_TOKENS } from '@zend/shared';
+import { SOLANA_TOKENS } from '../../shared/src/constants.js';
 
 export class WalletService {
   private connection: Connection;
-  private feePayer: Keypair;
 
-  constructor(rpcUrl: string, feePayerSecret: Uint8Array) {
+  constructor(rpcUrl: string) {
     this.connection = new Connection(rpcUrl, 'confirmed');
-    this.feePayer = Keypair.fromSecretKey(feePayerSecret);
   }
 
   // Generate a new Solana wallet for a user
@@ -74,7 +72,7 @@ export class WalletService {
     ];
   }
 
-  // Build and sign a transaction (fee payer pays gas, user wallet authorizes)
+  // Build and sign a transaction (user pays gas with their own SOL)
   async signAndSend(
     userWallet: Keypair,
     instructions: TransactionInstruction[],
@@ -96,15 +94,15 @@ export class WalletService {
     allInstructions.push(...instructions);
 
     const messageV0 = new TransactionMessage({
-      payerKey: this.feePayer.publicKey,
+      payerKey: userWallet.publicKey, // USER pays gas
       recentBlockhash: blockhash,
       instructions: allInstructions,
     }).compileToV0Message();
 
     const transaction = new VersionedTransaction(messageV0);
     
-    // Both sign: fee payer pays for gas, user wallet authorizes the action
-    transaction.sign([this.feePayer, userWallet]);
+    // User signs alone — they pay gas AND authorize the action
+    transaction.sign([userWallet]);
 
     const signature = await this.connection.sendTransaction(transaction, {
       maxRetries: 3,
@@ -121,6 +119,7 @@ export class WalletService {
   }
 
   // Send SPL tokens (USDT, USDC) to a recipient
+  // NOTE: User must have SOL for gas. Zend can optionally fund their wallet on first deposit.
   async sendSplToken(
     userWallet: Keypair,
     recipientAddress: string,
@@ -136,9 +135,9 @@ export class WalletService {
     const rawAmount = BigInt(Math.round(amount * Math.pow(10, decimals)));
 
     const instructions: TransactionInstruction[] = [
-      // Ensure recipient token account exists
+      // Ensure recipient token account exists (user pays for this ATA creation)
       createAssociatedTokenAccountIdempotentInstruction(
-        this.feePayer.publicKey,
+        userWallet.publicKey, // user pays
         recipientTokenAccount,
         recipientPubkey,
         mintPubkey
@@ -185,9 +184,11 @@ export class WalletService {
     );
   }
 
-  // Get fee payer balance (monitor this!)
-  async getFeePayerBalance(): Promise<number> {
-    const balance = await this.connection.getBalance(this.feePayer.publicKey);
-    return balance / LAMPORTS_PER_SOL;
+  // Check if user has enough SOL for gas
+  async hasEnoughSolForGas(walletAddress: string, minSol = 0.001): Promise<boolean> {
+    const balance = await this.getSolBalance(walletAddress);
+    return balance >= minSol;
   }
+
+
 }
