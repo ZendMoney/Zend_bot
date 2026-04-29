@@ -1,24 +1,42 @@
+// ─── Load .env FIRST — before any imports that need env vars ───
+import { config } from 'dotenv';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
+const __dirname = dirname(fileURLToPath(import.meta.url));
+config({ path: resolve(__dirname, '../../../.env') });
+
 import { Telegraf, Markup, Context } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { db, checkConnection } from '@zend/db';
 import { users, transactions } from '@zend/db';
 import { eq } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
-import { createPAJClient, PAJClient, Currency, Chain, Environment } from '@zend/paj-client';
+import type { PAJClient } from '@zend/paj-client';
 import {
   ConversationState,
   SOLANA_TOKENS,
   NIGERIAN_BANKS,
   PAJ_MIN_DEPOSIT_NGN,
 } from '@zend/shared';
-import crypto from 'crypto';
 
-// ─── Config ───
-import { config } from 'dotenv';
-config({ path: '.env' });
+import crypto from 'crypto';
 
 const BOT_TOKEN = process.env.BOT_TOKEN!;
 const SOLANA_RPC = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
+
+// Lazy-load PAJ client to ensure .env is loaded first
+let _pajClient: PAJClient | null = null;
+async function getPAJClient(): Promise<PAJClient | null> {
+  if (_pajClient) return _pajClient;
+  const { createPAJClient } = await import('@zend/paj-client');
+  _pajClient = createPAJClient();
+  return _pajClient;
+}
+
+// Re-export enums from paj_ramp via paj-client for static use
+const _pajEnums = await import('@zend/paj-client');
+const Currency = _pajEnums.Currency;
+const Chain = _pajEnums.Chain;
 
 // ─── Types ───
 interface ZendSession {
@@ -56,7 +74,6 @@ function setSession(userId: string, session: ZendSession): void {
 
 // ─── Services ───
 const walletService = new WalletService(SOLANA_RPC);
-const pajClient: PAJClient | null = createPAJClient();
 
 // ─── Helpers ───
 function generateTxId(): string {
@@ -176,6 +193,7 @@ bot.hears('💰 Balance', async (ctx) => {
 
   try {
     const balances = await walletService.getAllBalances(walletAddress);
+    const pajClient = await getPAJClient();
     const rates = pajClient ? await pajClient.getAllRates() : null;
     const offRampRate = rates?.offRampRate?.rate || 1550;
 
@@ -215,6 +233,7 @@ bot.hears('💵 Add Naira', async (ctx) => {
   }
 
   // Check if PAJ is configured
+  const pajClient = await getPAJClient();
   if (!pajClient) {
     await ctx.reply('❌ PAJ service is not configured. Please contact support.', mainMenu);
     return;
@@ -270,6 +289,7 @@ bot.on(message('text'), async (ctx) => {
       return;
     }
 
+    const pajClient = await getPAJClient();
     if (!pajClient) {
       await ctx.reply('❌ PAJ service unavailable.', mainMenu);
       setSession(userId, { state: ConversationState.IDLE });
@@ -310,6 +330,7 @@ bot.on(message('text'), async (ctx) => {
     const otp = text.trim();
     const contact = session.pajContact;
 
+    const pajClient = await getPAJClient();
     if (!contact || !pajClient) {
       await ctx.reply('❌ Session expired. Please start over.', mainMenu);
       setSession(userId, { state: ConversationState.IDLE });
@@ -375,6 +396,7 @@ bot.on(message('text'), async (ctx) => {
     let rate = 1550;
     let fee = 0;
     try {
+      const pajClient = await getPAJClient();
       if (pajClient) {
         const rateData = await pajClient.getRateByAmount(amount);
         rate = rateData.rate.rate;
@@ -491,6 +513,7 @@ bot.on(message('text'), async (ctx) => {
 // ═════════════════════════════════════════════════════════════════════════════
 
 async function showVirtualAccount(ctx: ZendContext, userId: string, sessionToken: string): Promise<void> {
+  const pajClient = await getPAJClient();
   if (!pajClient) {
     await ctx.reply('❌ PAJ service unavailable.', mainMenu);
     return;
@@ -626,6 +649,7 @@ bot.action('confirm_send', async (ctx) => {
     const walletAddress = user[0].walletAddress;
     let offRampRef = 'MOCK-' + Math.random().toString(36).substring(2, 8).toUpperCase();
 
+    const pajClient = await getPAJClient();
     if (pajClient && user[0].pajSessionToken) {
       // Real PAJ off-ramp
       const order = await pajClient.createOfframp({
@@ -854,6 +878,7 @@ async function main() {
   }
   console.log('✅ Database connected');
 
+  const pajClient = await getPAJClient();
   if (pajClient) {
     try {
       const rates = await pajClient.getAllRates();

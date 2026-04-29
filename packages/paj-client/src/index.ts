@@ -59,17 +59,11 @@ import {
 } from 'paj_ramp';
 
 // ─── Init ───
-// Lazy init: load env when module is first used
-let _initialized = false;
-let _apiKey = '';
-
-function ensureInit() {
-  if (_initialized) return;
-  const env = (process.env.PAJ_ENVIRONMENT as Environment) || Environment.Staging;
-  initializeSDK(env);
-  _apiKey = process.env.PAJ_BUSINESS_API_KEY || '';
-  _initialized = true;
-}
+// Eager init: runs when module is first imported (after .env is loaded!)
+const _env = (process.env.PAJ_ENVIRONMENT as Environment) || Environment.Staging;
+initializeSDK(_env);
+const _apiKey = process.env.PAJ_BUSINESS_API_KEY || '';
+console.log('[PAJ] Initialized:', _env, 'Key:', _apiKey ? 'SET' : 'NOT SET');
 
 // ─── Session Management ───
 
@@ -224,7 +218,6 @@ export class PAJClient {
 // ─── Factory ───
 
 export function createPAJClient(): PAJClient | null {
-  ensureInit();
   if (!_apiKey || _apiKey === 'your_paj_business_api_key') {
     console.warn('⚠️  PAJ_BUSINESS_API_KEY not set. PAJ features disabled.');
     return null;
