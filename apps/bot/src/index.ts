@@ -529,7 +529,7 @@ async function showVirtualAccount(ctx: ZendContext, userId: string, sessionToken
     try {
       // Create on-ramp order to get virtual account
       const order = await pajClient.createOnramp({
-        fiatAmount: 0, // Will be set by user deposit
+        fiatAmount: PAJ_MIN_DEPOSIT_NGN, // PAJ requires minimum > 0
         currency: Currency.NGN,
         recipient: walletAddress,
         mint: SOLANA_TOKENS.USDT.mint,
