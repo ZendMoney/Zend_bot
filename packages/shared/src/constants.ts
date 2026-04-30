@@ -66,6 +66,7 @@ export enum ConversationState {
   AWAITING_PIN = 'awaiting_pin',
   AWAITING_BANK_ACCOUNT_NUMBER = 'awaiting_bank_account_number',
   AWAITING_BANK_ACCOUNT_NAME = 'awaiting_bank_account_name',
+  AWAITING_ONRAMP_AMOUNT = 'awaiting_onramp_amount',
 }
 
 // Transaction Types

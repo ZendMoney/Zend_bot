@@ -52,6 +52,7 @@ interface ZendSession {
     hasGas?: boolean;
   }>;
   pajContact?: string; // email/phone pending OTP
+  onrampAmount?: number; // pending on-ramp amount in NGN
 }
 
 interface ZendContext extends Context {
@@ -239,22 +240,14 @@ bot.hears('💵 Add Naira', async (ctx) => {
     return;
   }
 
-  const u = user[0];
-
-  // If user has a valid PAJ session, create on-ramp order directly
-  if (u.pajSessionToken && u.pajSessionExpiresAt && new Date(u.pajSessionExpiresAt) > new Date()) {
-    await showVirtualAccount(ctx, userId, u.pajSessionToken);
-    return;
-  }
-
-  // Need to authenticate with PAJ — ask for email or phone
-  setSession(userId, { state: ConversationState.AWAITING_EMAIL });
+  // Step 1: Ask how much NGN they want to add
+  setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT });
 
   await ctx.reply(
-    `🔐 *PAJ Authentication Required*\n\n` +
-    `To add naira, you need to verify with PAJ (our NGN partner).\n\n` +
-    `Enter your email or phone number (with country code):\n` +
-    `Example: user@email.com or +2348012345678`,
+    `💵 *Add Naira*\n\n` +
+    `How much NGN do you want to add to your wallet?\n\n` +
+    `Minimum: ${formatNgn(PAJ_MIN_DEPOSIT_NGN)}\n\n` +
+    `Enter the amount (numbers only):`,
     { parse_mode: 'Markdown', ...cancelKeyboard }
   );
 });
@@ -269,6 +262,71 @@ bot.on(message('text'), async (ctx) => {
   if (text === '❌ Cancel') {
     setSession(userId, { state: ConversationState.IDLE });
     await ctx.reply('Cancelled.', mainMenu);
+    return;
+  }
+
+  // ─── ADD NAIRA: AWAITING_ONRAMP_AMOUNT ───
+  if (session.state === ConversationState.AWAITING_ONRAMP_AMOUNT) {
+    const amount = parseInt(text.replace(/[^0-9]/g, ''), 10);
+
+    if (!amount || amount < PAJ_MIN_DEPOSIT_NGN) {
+      await ctx.reply(
+        `❌ Please enter a valid amount.\n` +
+        `Minimum deposit is ${formatNgn(PAJ_MIN_DEPOSIT_NGN)}.`,
+        cancelKeyboard
+      );
+      return;
+    }
+
+    const pajClient = await getPAJClient();
+    if (!pajClient) {
+      await ctx.reply('❌ PAJ service unavailable.', mainMenu);
+      setSession(userId, { state: ConversationState.IDLE });
+      return;
+    }
+
+    // Get rate for this amount
+    let rate = 1550;
+    let fee = 0;
+    try {
+      const rateData = await pajClient.getRateByAmount(amount);
+      rate = rateData.rate.rate;
+      fee = rateData.fee || 0;
+    } catch (err) {
+      console.log('Using fallback rate for on-ramp');
+    }
+
+    const usdtAmount = amount / rate;
+    const feeNgn = fee;
+    const totalNgn = amount + feeNgn;
+
+    // Store amount and check PAJ auth
+    session.onrampAmount = amount;
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    const hasPajSession = user[0]?.pajSessionToken && user[0]?.pajSessionExpiresAt && new Date(user[0].pajSessionExpiresAt) > new Date();
+
+    if (hasPajSession && user[0]) {
+      // Already authenticated — create order and show VA
+      setSession(userId, { state: ConversationState.IDLE, onrampAmount: amount });
+      await showVirtualAccount(ctx, userId, user[0].pajSessionToken!, amount, rate, feeNgn);
+      return;
+    }
+
+    // Need PAJ auth — proceed to email/phone
+    session.state = ConversationState.AWAITING_EMAIL;
+    setSession(userId, session);
+
+    await ctx.reply(
+      `💵 *Deposit Preview*\n\n` +
+      `Amount: ${formatNgn(amount)}\n` +
+      `Rate: ₦${rate.toLocaleString()}/USD\n` +
+      `Fee: ${formatNgn(feeNgn)}\n` +
+      `You receive: ~${usdtAmount.toFixed(2)} USDT\n\n` +
+      `🔐 *PAJ Authentication Required*\n\n` +
+      `Enter your email or phone number (with country code):\n` +
+      `Example: user@email.com or +2348012345678`,
+      { parse_mode: 'Markdown', ...cancelKeyboard }
+    );
     return;
   }
 
@@ -370,8 +428,23 @@ bot.on(message('text'), async (ctx) => {
         { parse_mode: 'Markdown' }
       );
 
-      // Now show virtual account
-      await showVirtualAccount(ctx, userId, verified.token);
+      // Now show virtual account (with pending amount if any)
+      const onrampAmount = session.onrampAmount;
+      if (onrampAmount) {
+        // Get rate for the pending amount
+        let rate = 1550;
+        let fee = 0;
+        try {
+          const rateData = await pajClient.getRateByAmount(onrampAmount);
+          rate = rateData.rate.rate;
+          fee = rateData.fee || 0;
+        } catch (err) {
+          console.log('Using fallback rate for on-ramp after verify');
+        }
+        await showVirtualAccount(ctx, userId, verified.token, onrampAmount, rate, fee);
+      } else {
+        await showVirtualAccount(ctx, userId, verified.token);
+      }
     } catch (err: any) {
       console.error('[PAJ] Verify failed:', err);
       await ctx.reply(
@@ -512,7 +585,14 @@ bot.on(message('text'), async (ctx) => {
 // SHOW VIRTUAL ACCOUNT (PAJ On-Ramp)
 // ═════════════════════════════════════════════════════════════════════════════
 
-async function showVirtualAccount(ctx: ZendContext, userId: string, sessionToken: string): Promise<void> {
+async function showVirtualAccount(
+  ctx: ZendContext,
+  userId: string,
+  sessionToken: string,
+  amount?: number,
+  rate?: number,
+  fee?: number
+): Promise<void> {
   const pajClient = await getPAJClient();
   if (!pajClient) {
     await ctx.reply('❌ PAJ service unavailable.', mainMenu);
@@ -522,53 +602,73 @@ async function showVirtualAccount(ctx: ZendContext, userId: string, sessionToken
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
   const walletAddress = user[0].walletAddress;
 
-  // Check if we already have a cached virtual account
-  let virtualAccount = user[0].virtualAccount as any;
+  // Use provided amount or default to minimum
+  const fiatAmount = amount && amount >= PAJ_MIN_DEPOSIT_NGN ? amount : PAJ_MIN_DEPOSIT_NGN;
 
-  if (!virtualAccount) {
+  // Get rate if not provided
+  let _rate = rate || 1550;
+  let _fee = fee || 0;
+  if (!rate) {
     try {
-      // Create on-ramp order to get virtual account
-      const order = await pajClient.createOnramp({
-        fiatAmount: PAJ_MIN_DEPOSIT_NGN, // PAJ requires minimum > 0
-        currency: Currency.NGN,
-        recipient: walletAddress,
-        mint: SOLANA_TOKENS.USDT.mint,
-        chain: Chain.SOLANA,
-        webhookURL: `${process.env.WEBHOOK_BASE_URL || 'https://your-domain.com'}/webhooks/paj`,
-      }, sessionToken);
-
-      virtualAccount = {
-        bankCode: 'WEM', // PAJ uses Wema Bank
-        bankName: order.bank,
-        accountNumber: order.accountNumber,
-        accountName: order.accountName,
-        orderId: order.id,
-      };
-
-      // Cache in DB
-      await db.update(users)
-        .set({ virtualAccount })
-        .where(eq(users.id, userId));
-
-      console.log('[PAJ] Virtual account created:', order.accountNumber);
-    } catch (err: any) {
-      console.error('[PAJ] createOnramp failed:', err);
-      await ctx.reply(
-        `❌ Could not create virtual account.\n` +
-        `Error: ${err.message || 'Unknown error'}`,
-        mainMenu
-      );
-      return;
+      const rateData = await pajClient.getRateByAmount(fiatAmount);
+      _rate = rateData.rate.rate;
+      _fee = rateData.fee || 0;
+    } catch (err) {
+      console.log('Using fallback rate for VA display');
     }
+  }
+  const usdtAmount = fiatAmount / _rate;
+
+  // Always create a fresh on-ramp order for the specific amount
+  // (Don't reuse cached VAs since amounts may differ)
+  let virtualAccount: any;
+  try {
+    const order = await pajClient.createOnramp({
+      fiatAmount,
+      currency: Currency.NGN,
+      recipient: walletAddress,
+      mint: SOLANA_TOKENS.USDT.mint,
+      chain: Chain.SOLANA,
+      webhookURL: `${process.env.WEBHOOK_BASE_URL || 'https://your-domain.com'}/webhooks/paj`,
+    }, sessionToken);
+
+    virtualAccount = {
+      bankCode: 'WEM', // PAJ uses Wema Bank
+      bankName: order.bank,
+      accountNumber: order.accountNumber,
+      accountName: order.accountName,
+      orderId: order.id,
+      amount: fiatAmount,
+      createdAt: new Date().toISOString(),
+    };
+
+    // Cache in DB (overwrite previous)
+    await db.update(users)
+      .set({ virtualAccount })
+      .where(eq(users.id, userId));
+
+    console.log('[PAJ] Virtual account created:', order.accountNumber, 'for ₦', fiatAmount);
+  } catch (err: any) {
+    console.error('[PAJ] createOnramp failed:', err);
+    await ctx.reply(
+      `❌ Could not create virtual account.\n` +
+      `Error: ${err.message || 'Unknown error'}`,
+      mainMenu
+    );
+    return;
   }
 
   await ctx.reply(
     `💵 *Add Naira to Your Wallet*\n\n` +
-    `Send a bank transfer to this account:\n\n` +
+    `*Deposit Details:*\n` +
+    `Amount: ${formatNgn(fiatAmount)}\n` +
+    `Rate: ₦${_rate.toLocaleString()}/USD\n` +
+    `Fee: ${formatNgn(_fee)}\n` +
+    `You receive: ~${usdtAmount.toFixed(2)} USDT\n\n` +
+    `*Send bank transfer to:*\n` +
     `🏦 *${virtualAccount.bankName}*\n` +
     `🔢 \`${virtualAccount.accountNumber}\`\n` +
     `👤 *${virtualAccount.accountName}*\n\n` +
-    `💡 Minimum: ${formatNgn(PAJ_MIN_DEPOSIT_NGN)}\n` +
     `⏱️ Arrives in: 2-5 minutes\n\n` +
     `📋 Tap to copy account number\n\n` +
     `⚠️ *Important:* Send from a bank account in your name.`,
