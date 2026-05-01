@@ -6,6 +6,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 config({ path: resolve(__dirname, '../../../.env') });
 
 import { Telegraf, Markup, Context } from 'telegraf';
+import { Keypair } from '@solana/web3.js';
+import bs58 from 'bs58';
 import { message } from 'telegraf/filters';
 import { db, checkConnection } from '@zend/db';
 import { users, transactions } from '@zend/db';
@@ -94,6 +96,19 @@ function encryptPrivateKey(secretKey: Uint8Array): string {
   return iv.toString('hex') + ':' + authTag.toString('hex') + ':' + encrypted.toString('hex');
 }
 
+function decryptPrivateKey(encryptedKey: string): Uint8Array {
+  const key = crypto.scryptSync(process.env.ENCRYPTION_KEY || 'zend-dev-key', 'salt', 32);
+  const parts = encryptedKey.split(':');
+  if (parts.length !== 3) throw new Error('Invalid encrypted key format');
+  const iv = Buffer.from(parts[0], 'hex');
+  const authTag = Buffer.from(parts[1], 'hex');
+  const encrypted = Buffer.from(parts[2], 'hex');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(authTag);
+  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  return new Uint8Array(decrypted);
+}
+
 function formatBalance(amount: number, symbol: string): string {
   return `${amount.toFixed(symbol === 'SOL' ? 4 : 2)} ${symbol}`;
 }
@@ -175,6 +190,79 @@ bot.command('start', async (ctx) => {
     `💡 Tap *💵 Add Naira* to get your virtual bank account.`,
     { parse_mode: 'Markdown', ...mainMenu }
   );
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// /WALLET — View Address & Export Private Key
+// ═════════════════════════════════════════════════════════════════════════════
+
+bot.command('wallet', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+
+  if (user.length === 0) {
+    await ctx.reply('Please run /start first.', mainMenu);
+    return;
+  }
+
+  const u = user[0];
+
+  await ctx.reply(
+    `👛 *Your Wallet*\n\n` +
+    `*Solana Address:*\n` +
+    `\`${u.walletAddress}\`\n\n` +
+    `Tap to copy the address above.\n\n` +
+    `*Network:* Solana Devnet\n` +
+    `*Tokens:* SOL, USDT, USDC\n\n` +
+    `⚠️ To export your private key, tap the button below.`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('🔑 Export Private Key', 'export_key')],
+      ]),
+    }
+  );
+});
+
+bot.action('export_key', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+
+  if (user.length === 0) {
+    await ctx.reply('Please run /start first.', mainMenu);
+    return;
+  }
+
+  try {
+    const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
+    const keypair = Keypair.fromSecretKey(secretKey);
+
+    await ctx.editMessageText(
+      `🔑 *Private Key Export*\n\n` +
+      `⚠️ *SECURITY WARNING*\n` +
+      `Never share this with anyone. Zend will NEVER ask for it.\n\n` +
+      `*Private Key (Base58):*\n` +
+      `\`${bs58.encode(secretKey)}\`\n\n` +
+      `*Private Key (Hex):*\n` +
+      `\`${Buffer.from(secretKey).toString('hex')}\`\n\n` +
+      `Copy this and store it in a password manager or write it down.\n` +
+      `This message will self-destruct in 1 minute.`,
+      { parse_mode: 'Markdown' }
+    );
+
+    // Auto-delete after 60 seconds for security
+    setTimeout(async () => {
+      try {
+        await ctx.deleteMessage();
+      } catch (err) {
+        // Message may already be deleted
+      }
+    }, 60000);
+  } catch (err) {
+    console.error('Export key error:', err);
+    await ctx.reply('❌ Could not export private key. Please contact support.', mainMenu);
+  }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -629,7 +717,6 @@ async function showVirtualAccount(
       recipient: walletAddress,
       mint: SOLANA_TOKENS.USDT.mint,
       chain: Chain.SOLANA,
-      webhookURL: `${process.env.WEBHOOK_BASE_URL || 'https://your-domain.com'}/webhooks/paj`,
     }, sessionToken);
 
     virtualAccount = {
@@ -759,7 +846,6 @@ bot.action('confirm_send', async (ctx) => {
         fiatAmount: amountNgn!,
         mint: SOLANA_TOKENS.USDT.mint,
         chain: Chain.SOLANA,
-        webhookURL: `${process.env.WEBHOOK_BASE_URL || 'https://your-domain.com'}/webhooks/paj`,
       }, user[0].pajSessionToken);
 
       offRampRef = order.id;
