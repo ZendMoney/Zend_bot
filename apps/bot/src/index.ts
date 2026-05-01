@@ -13,6 +13,7 @@ import { db, checkConnection } from '@zend/db';
 import { users, transactions } from '@zend/db';
 import { eq } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
+import { parseCommand, transcribeVoice, type ParsedCommand } from './services/nlp.js';
 import type { PAJClient } from '@zend/paj-client';
 import {
   ConversationState,
@@ -46,6 +47,7 @@ interface ZendSession {
   pendingTransaction?: Partial<{
     amountNgn: number;
     amountUsdt: number;
+    recipientName: string;
     recipientBankCode: string;
     recipientBankName: string;
     recipientAccountNumber: string;
@@ -660,10 +662,162 @@ bot.on(message('text'), async (ctx) => {
     return;
   }
 
-  // ─── Default ───
+  // ─── NLP: Parse natural language when IDLE ───
   if (session.state === ConversationState.IDLE) {
+    const parsed = await parseCommand(text);
+    console.log('[NLP] Parsed:', parsed);
+
+    switch (parsed.intent) {
+      case 'send': {
+        if (!parsed.amount) {
+          await ctx.reply('❌ How much do you want to send? Example: "Send 5000 to Tunde"', cancelKeyboard);
+          return;
+        }
+        if (!parsed.accountNumber && !parsed.walletAddress) {
+          await ctx.reply('❌ Please include account details. Example: "Send 5000 to Tunde GTB 0123456789"', cancelKeyboard);
+          return;
+        }
+
+        // Pre-fill transaction and go to confirmation
+        const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+        if (user.length === 0) {
+          await ctx.reply('Please run /start first.', mainMenu);
+          return;
+        }
+
+        const pajClient = await getPAJClient();
+        let rate = 1550;
+        try {
+          if (pajClient) {
+            const rateData = await pajClient.getRateByAmount(parsed.amount);
+            rate = rateData.rate.rate;
+          }
+        } catch (err) {
+          console.log('Using fallback rate for NLP send');
+        }
+
+        const usdtNeeded = parsed.amount / rate;
+        const walletAddress = user[0].walletAddress;
+        const hasGas = walletAddress ? await walletService.hasEnoughSolForGas(walletAddress, 0.001) : false;
+
+        session.pendingTransaction = {
+          amountNgn: parsed.amount,
+          amountUsdt: usdtNeeded,
+          hasGas,
+          recipientName: parsed.recipientName,
+          recipientBankName: parsed.bankName,
+          recipientBankCode: parsed.bankCode,
+          recipientAccountNumber: parsed.accountNumber,
+          recipientWalletAddress: parsed.walletAddress,
+        };
+        session.state = ConversationState.AWAITING_CONFIRMATION;
+        setSession(userId, session);
+
+        let msg = `📤 *Confirm Transfer*\n\n` +
+          `To: *${parsed.recipientName || 'Recipient'}*\n` +
+          `Bank: ${parsed.bankName || 'Crypto'}\n` +
+          `Account: \`${parsed.accountNumber || parsed.walletAddress}\`\n` +
+          `Amount: ${formatNgn(parsed.amount)}\n` +
+          `You pay: *${usdtNeeded.toFixed(2)} USDT*\n` +
+          `Rate: ${formatNgn(rate)}/USDT\n\n`;
+
+        if (!hasGas) {
+          msg += `⚠️ You need SOL for gas. Send some SOL first.\n\n`;
+        }
+
+        msg += `Confirm?`;
+
+        await ctx.reply(msg, {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Confirm', 'confirm_send')],
+            [Markup.button.callback('❌ Cancel', 'cancel_send')],
+          ]),
+        });
+        return;
+      }
+
+      case 'add_naira': {
+        // Simulate clicking Add Naira
+        await ctx.reply(`💵 *Add Naira*\n\n` +
+          (parsed.amount
+            ? `Amount: ${formatNgn(parsed.amount)}\n\nHow much do you want to add? (Minimum ₦1,000)`
+            : `How much NGN do you want to add? (Minimum ₦1,000)`),
+          { parse_mode: 'Markdown', ...cancelKeyboard }
+        );
+        setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampAmount: parsed.amount });
+        return;
+      }
+
+      case 'balance': {
+        // Simulate clicking Balance
+        await bot.handleUpdate({ ...ctx.update, message: { ...ctx.message, text: '💰 Balance' } } as any);
+        return;
+      }
+
+      default: {
+        await ctx.reply(
+          `I didn't understand that. Try using the menu below or type a command like "Send 50k to Tunde GTB 0123456789".`,
+          mainMenu
+        );
+      }
+    }
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 🎙️ VOICE MESSAGES — Transcribe & Parse
+// ═════════════════════════════════════════════════════════════════════════════
+
+bot.on(message('voice'), async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+
+  if (user.length === 0) {
+    await ctx.reply('Please run /start first.', mainMenu);
+    return;
+  }
+
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey || apiKey === 'your_openai_key') {
     await ctx.reply(
-      `I didn't understand that. Try using the menu below or type a command like "Send 50k to Tunde GTB 0123456789".`,
+      '❌ Voice messages are not configured yet.\n\n' +
+      'Please type your command or use the menu below.',
+      mainMenu
+    );
+    return;
+  }
+
+  await ctx.reply('🎙️ Transcribing your voice note...');
+
+  try {
+    // Download voice file
+    const fileLink = await ctx.telegram.getFileLink(ctx.message.voice.file_id);
+    const response = await fetch(fileLink.toString());
+    const audioBuffer = Buffer.from(await response.arrayBuffer());
+
+    // Transcribe
+    const text = await transcribeVoice(audioBuffer, apiKey);
+    console.log('[Voice] Transcribed:', text);
+
+    await ctx.reply(`📝 *You said:* "${text}"\n\nParsing...`, { parse_mode: 'Markdown' });
+
+    // Parse transcribed text
+    const parsed = await parseCommand(text, true); // use Kimi for voice
+
+    // Forward to text handler logic
+    // Create a synthetic text message update
+    (ctx as any).message.text = text;
+    (ctx as any).message.voice = undefined;
+
+    // Re-process as text
+    await bot.handleUpdate(ctx.update);
+
+  } catch (err: any) {
+    console.error('[Voice] Error:', err);
+    await ctx.reply(
+      '❌ Could not process voice note.\n\n' +
+      'Please type your command or use the menu below.',
       mainMenu
     );
   }
