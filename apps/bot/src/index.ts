@@ -673,6 +673,10 @@ bot.on(message('text'), async (ctx) => {
           await ctx.reply('❌ How much do you want to send? Example: "Send 5000 to Tunde"', cancelKeyboard);
           return;
         }
+        if (parsed.amount < 100) {
+          await ctx.reply(`❌ Minimum send amount is ${formatNgn(100)}.`, cancelKeyboard);
+          return;
+        }
         if (!parsed.accountNumber && !parsed.walletAddress) {
           await ctx.reply('❌ Please include account details. Example: "Send 5000 to Tunde GTB 0123456789"', cancelKeyboard);
           return;
@@ -682,6 +686,33 @@ bot.on(message('text'), async (ctx) => {
         const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
         if (user.length === 0) {
           await ctx.reply('Please run /start first.', mainMenu);
+          return;
+        }
+
+        // If bank not found for account number transfer, ask user to specify
+        if (parsed.accountNumber && !parsed.bankCode) {
+          const bankButtons = NIGERIAN_BANKS.map(b => Markup.button.callback(b.name, `nlp_bank:${b.code}`));
+          const rows: any[] = [];
+          for (let i = 0; i < bankButtons.length; i += 2) {
+            rows.push(bankButtons.slice(i, i + 2));
+          }
+
+          // Store pending NLP data in session
+          session.pendingTransaction = {
+            amountNgn: parsed.amount,
+            recipientName: parsed.recipientName,
+            recipientAccountNumber: parsed.accountNumber,
+          };
+          session.state = ConversationState.AWAITING_BANK_DETAILS;
+          setSession(userId, session);
+
+          await ctx.reply(
+            `🏦 Which bank is this account with?\n\n` +
+            `Account: \`${parsed.accountNumber}\`\n` +
+            `Amount: ${formatNgn(parsed.amount)}\n\n` +
+            `Select the bank:`,
+            { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }
+          );
           return;
         }
 
@@ -705,6 +736,7 @@ bot.on(message('text'), async (ctx) => {
           amountUsdt: usdtNeeded,
           hasGas,
           recipientName: parsed.recipientName,
+          recipientAccountName: parsed.recipientName,
           recipientBankName: parsed.bankName,
           recipientBankCode: parsed.bankCode,
           recipientAccountNumber: parsed.accountNumber,
@@ -715,7 +747,7 @@ bot.on(message('text'), async (ctx) => {
 
         let msg = `📤 *Confirm Transfer*\n\n` +
           `To: *${parsed.recipientName || 'Recipient'}*\n` +
-          `Bank: ${parsed.bankName || 'Crypto'}\n` +
+          `Bank: ${parsed.bankName || 'Solana'}\n` +
           `Account: \`${parsed.accountNumber || parsed.walletAddress}\`\n` +
           `Amount: ${formatNgn(parsed.amount)}\n` +
           `You pay: *${usdtNeeded.toFixed(2)} USDT*\n` +
@@ -750,8 +782,39 @@ bot.on(message('text'), async (ctx) => {
       }
 
       case 'balance': {
-        // Simulate clicking Balance
-        await bot.handleUpdate({ ...ctx.update, message: { ...ctx.message, text: '💰 Balance' } } as any);
+        // Direct balance logic (avoid hacky handleUpdate)
+        const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+        if (user.length === 0) {
+          await ctx.reply('Please run /start first.', mainMenu);
+          return;
+        }
+        const walletAddress = user[0].walletAddress;
+        try {
+          const balances = await walletService.getAllBalances(walletAddress);
+          const pajClient = await getPAJClient();
+          const rates = pajClient ? await pajClient.getAllRates() : null;
+          const offRampRate = rates?.offRampRate?.rate || 1550;
+
+          let msg = `💰 *Your Balance*\n\n`;
+          let totalNgn = 0;
+
+          for (const bal of balances) {
+            const ngnEquiv = bal.symbol === 'SOL'
+              ? bal.amount * offRampRate * 0.0006
+              : bal.amount * offRampRate;
+            totalNgn += ngnEquiv;
+            const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : '🟡';
+            msg += `${emoji} *${bal.symbol}*  ${formatBalance(bal.amount, bal.symbol)}  (≈${formatNgn(ngnEquiv)})\n`;
+          }
+
+          msg += `\n━━━━━━━━━━━━━━━━━━━━\n`;
+          msg += `💵 Total: ≈${formatNgn(totalNgn)}`;
+
+          await ctx.reply(msg, { parse_mode: 'Markdown', ...mainMenu });
+        } catch (err) {
+          console.error('Balance error:', err);
+          await ctx.reply('❌ Could not fetch balance. Please try again.', mainMenu);
+        }
         return;
       }
 
@@ -762,6 +825,23 @@ bot.on(message('text'), async (ctx) => {
         );
       }
     }
+  }
+
+  // ─── PIN: AWAITING_PIN ───
+  if (session.state === ConversationState.AWAITING_PIN) {
+    const pin = text.trim();
+    if (!/^\d{4}$/.test(pin)) {
+      await ctx.reply('❌ Please enter a valid 4-digit PIN.', cancelKeyboard);
+      return;
+    }
+
+    await db.update(users)
+      .set({ transactionPin: pin })
+      .where(eq(users.id, userId));
+
+    setSession(userId, { state: ConversationState.IDLE });
+    await ctx.reply('✅ PIN set successfully.', mainMenu);
+    return;
   }
 });
 
@@ -958,8 +1038,14 @@ bot.action('confirm_send', async (ctx) => {
     return;
   }
 
-  const { amountNgn, amountUsdt, recipientBankCode, recipientBankName, recipientAccountNumber, recipientAccountName } =
+  const { amountNgn, amountUsdt, recipientBankCode, recipientBankName, recipientAccountNumber, recipientAccountName, recipientName } =
     session.pendingTransaction;
+
+  // Use recipientName as fallback for recipientAccountName (from NLP)
+  const finalAccountName = recipientAccountName || recipientName || 'Recipient';
+  const finalBankName = recipientBankName || 'Unknown';
+  const finalBankCode = recipientBankCode || 'UNKNOWN';
+  const finalAccountNumber = recipientAccountNumber || '0000000000';
 
   const txId = generateTxId();
   await db.insert(transactions).values({
@@ -969,10 +1055,10 @@ bot.action('confirm_send', async (ctx) => {
     status: 'processing',
     ngnAmount: amountNgn!.toString(),
     ngnRate: '1550',
-    recipientBankCode: recipientBankCode!,
-    recipientBankName: recipientBankName!,
-    recipientAccountNumber: recipientAccountNumber!,
-    recipientAccountName: recipientAccountName!,
+    recipientBankCode: finalBankCode,
+    recipientBankName: finalBankName,
+    recipientAccountNumber: finalAccountNumber,
+    recipientAccountName: finalAccountName,
   });
 
   setSession(userId, { state: ConversationState.IDLE });
@@ -994,8 +1080,8 @@ bot.action('confirm_send', async (ctx) => {
     if (pajClient && user[0].pajSessionToken) {
       // Real PAJ off-ramp
       const order = await pajClient.createOfframp({
-        bank: recipientBankCode!,
-        accountNumber: recipientAccountNumber!,
+        bank: finalBankCode,
+        accountNumber: finalAccountNumber,
         currency: Currency.NGN,
         fiatAmount: amountNgn!,
         mint: SOLANA_TOKENS.USDT.mint,
@@ -1018,8 +1104,8 @@ bot.action('confirm_send', async (ctx) => {
 
       await ctx.reply(
         `✅ *Transfer Complete!*\n\n` +
-        `${formatNgn(amountNgn!)} sent to ${recipientAccountName}\n` +
-        `${recipientBankName} • \`${recipientAccountNumber}\`\n\n` +
+        `${formatNgn(amountNgn!)} sent to ${finalAccountName}\n` +
+        `${finalBankName} • \`${finalAccountNumber}\`\n\n` +
         `Reference: ${txId}\n` +
         `PAJ Ref: ${offRampRef}\n` +
         `Time: ~2 minutes`,
@@ -1047,6 +1133,80 @@ bot.action('cancel_send', async (ctx) => {
   setSession(userId, { state: ConversationState.IDLE });
   await ctx.editMessageText('❌ Cancelled.');
   await ctx.reply('What would you like to do?', mainMenu);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// NLP BANK SELECTION (when bank not detected in natural language)
+// ═════════════════════════════════════════════════════════════════════════════
+
+bot.action(/nlp_bank:(.+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+  const bankCode = ctx.match[1];
+
+  if (session.state !== ConversationState.AWAITING_BANK_DETAILS || !session.pendingTransaction) {
+    await ctx.editMessageText('❌ Session expired. Please start over.');
+    return;
+  }
+
+  const bank = NIGERIAN_BANKS.find(b => b.code === bankCode);
+  if (!bank) {
+    await ctx.editMessageText('❌ Invalid bank selected.');
+    return;
+  }
+
+  const { amountNgn, recipientName, recipientAccountNumber } = session.pendingTransaction;
+  const pajClient = await getPAJClient();
+  let rate = 1550;
+  try {
+    if (pajClient) {
+      const rateData = await pajClient.getRateByAmount(amountNgn!);
+      rate = rateData.rate.rate;
+    }
+  } catch (err) {
+    console.log('Using fallback rate for NLP bank select');
+  }
+
+  const usdtNeeded = amountNgn! / rate;
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  const walletAddress = user[0]?.walletAddress;
+  const hasGas = walletAddress ? await walletService.hasEnoughSolForGas(walletAddress, 0.001) : false;
+
+  session.pendingTransaction = {
+    amountNgn,
+    amountUsdt: usdtNeeded,
+    hasGas,
+    recipientName,
+    recipientAccountName: recipientName,
+    recipientBankName: bank.name,
+    recipientBankCode: bank.code,
+    recipientAccountNumber,
+  };
+  session.state = ConversationState.AWAITING_CONFIRMATION;
+  setSession(userId, session);
+
+  let msg = `📤 *Confirm Transfer*\n\n` +
+    `To: *${recipientName || 'Recipient'}*\n` +
+    `Bank: ${bank.name}\n` +
+    `Account: \`${recipientAccountNumber}\`\n` +
+    `Amount: ${formatNgn(amountNgn!)}\n` +
+    `You pay: *${usdtNeeded.toFixed(2)} USDT*\n` +
+    `Rate: ${formatNgn(rate)}/USDT\n\n`;
+
+  if (!hasGas) {
+    msg += `⚠️ You need SOL for gas. Send some SOL first.\n\n`;
+  }
+
+  msg += `Confirm?`;
+
+  await ctx.editMessageText(msg, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Confirm', 'confirm_send')],
+      [Markup.button.callback('❌ Cancel', 'cancel_send')],
+    ]),
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1192,6 +1352,36 @@ bot.action('settings_paj', async (ctx) => {
     `🔗 *Link PAJ Account*\n\n` +
     `Enter your email or phone (with country code):\n` +
     `Example: user@email.com or +2348012345678`
+  );
+
+  await ctx.reply('Waiting for your input...', cancelKeyboard);
+});
+
+bot.action('settings_email', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+
+  setSession(userId, { state: ConversationState.AWAITING_EMAIL });
+
+  await ctx.editMessageText(
+    `📧 *Add Email*\n\n` +
+    `Enter your email address:\n` +
+    `Example: user@email.com`
+  );
+
+  await ctx.reply('Waiting for your input...', cancelKeyboard);
+});
+
+bot.action('settings_pin', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+
+  setSession(userId, { state: ConversationState.AWAITING_PIN });
+
+  await ctx.editMessageText(
+    `🔢 *Set Transaction PIN*\n\n` +
+    `Enter a 4-digit PIN for transaction security:\n` +
+    `Example: 1234`
   );
 
   await ctx.reply('Waiting for your input...', cancelKeyboard);
