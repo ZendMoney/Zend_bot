@@ -119,6 +119,65 @@ function formatNgn(amount: number): string {
   return `₦${amount.toLocaleString('en-NG')}`;
 }
 
+// ─── Bank Verification ───
+// Cache PAJ bank list to map our bank codes ↔ PAJ bank IDs
+let _pajBankCache: Array<{ id: string; name: string; code: string }> | null = null;
+let _pajBankCacheTime = 0;
+
+async function getPAJBankList(sessionToken: string): Promise<Array<{ id: string; name: string; code: string }>> {
+  if (_pajBankCache && Date.now() - _pajBankCacheTime < 3600000) {
+    return _pajBankCache;
+  }
+  const pajClient = await getPAJClient();
+  if (!pajClient) return [];
+  try {
+    const banks = await pajClient.getBanks(sessionToken);
+    _pajBankCache = banks.map((b: any) => ({ id: b.id, name: b.name, code: b.code || '' }));
+    _pajBankCacheTime = Date.now();
+    return _pajBankCache || [];
+  } catch (err) {
+    console.error('[PAJ] Failed to fetch bank list:', err);
+    return _pajBankCache || [];
+  }
+}
+
+async function verifyBankAccount(
+  sessionToken: string,
+  ourBankCode: string,
+  accountNumber: string
+): Promise<{ verified: boolean; accountName?: string; error?: string }> {
+  const pajClient = await getPAJClient();
+  if (!pajClient) {
+    return { verified: false, error: 'PAJ not available' };
+  }
+
+  try {
+    // Get PAJ bank list and find matching bank
+    const pajBanks = await getPAJBankList(sessionToken);
+    const ourBank = NIGERIAN_BANKS.find(b => b.code === ourBankCode);
+    if (!ourBank) {
+      return { verified: false, error: 'Unknown bank code' };
+    }
+
+    // Find PAJ bank by name match
+    const pajBank = pajBanks.find(pb =>
+      pb.name.toLowerCase().includes(ourBank.name.toLowerCase()) ||
+      ourBank.name.toLowerCase().includes(pb.name.toLowerCase())
+    );
+
+    if (!pajBank) {
+      return { verified: false, error: `Bank "${ourBank.name}" not found on PAJ` };
+    }
+
+    // Call PAJ to resolve account
+    const result = await pajClient.resolveBankAccount(sessionToken, pajBank.id, accountNumber);
+    return { verified: true, accountName: result.accountName };
+  } catch (err: any) {
+    console.error('[PAJ] Bank verification failed:', err);
+    return { verified: false, error: err.message || 'Could not verify account' };
+  }
+}
+
 // ─── Keyboards ───
 const mainMenu = Markup.keyboard([
   ['💰 Balance', '📤 Send'],
@@ -634,18 +693,47 @@ bot.on(message('text'), async (ctx, next) => {
       return;
     }
 
+    // ─── Verify bank account with PAJ ───
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    let verifiedName = accountName;
+    let verifiedStatus: 'verified' | 'unverified' | 'no_paj' = 'unverified';
+
+    if (user[0]?.pajSessionToken) {
+      await ctx.reply('🔍 Verifying account details...');
+      const verification = await verifyBankAccount(user[0].pajSessionToken, bankCode, accountNumber);
+      if (verification.verified && verification.accountName) {
+        verifiedName = verification.accountName;
+        verifiedStatus = 'verified';
+      } else {
+        console.log('[Verify] Failed:', verification.error);
+        // Don't block — let user decide
+      }
+    } else {
+      verifiedStatus = 'no_paj';
+    }
+
     session.pendingTransaction!.recipientBankCode = bankCode;
     session.pendingTransaction!.recipientBankName = bank.name;
     session.pendingTransaction!.recipientAccountNumber = accountNumber;
-    session.pendingTransaction!.recipientAccountName = accountName;
+    session.pendingTransaction!.recipientAccountName = verifiedName;
     session.state = ConversationState.AWAITING_CONFIRMATION;
     setSession(userId, session);
 
     const { amountNgn, amountUsdt, hasGas } = session.pendingTransaction!;
 
-    let confirmMsg = `📤 *Confirm Transfer*\n\n` +
+    let confirmMsg = `📤 *Confirm Transfer*\n\n`;
+
+    if (verifiedStatus === 'verified') {
+      confirmMsg += `✅ *Account Verified by PAJ*\n`;
+    } else if (verifiedStatus === 'no_paj') {
+      confirmMsg += `⚠️ *Account Not Verified* (link PAJ in Settings to verify)\n`;
+    } else {
+      confirmMsg += `⚠️ *Could not verify account* — please double-check details\n`;
+    }
+
+    confirmMsg += `\n` +
       `Amount: *${formatNgn(amountNgn!)}*\n` +
-      `To: *${accountName}*\n` +
+      `To: *${verifiedName}*\n` +
       `Bank: *${bank.name}*\n` +
       `Account: \`${accountNumber}\`\n\n` +
       `You pay: *${amountUsdt!.toFixed(2)} USDT*\n`;
@@ -737,12 +825,28 @@ bot.on(message('text'), async (ctx, next) => {
         const walletAddress = user[0].walletAddress;
         const hasGas = walletAddress ? await walletService.hasEnoughSolForGas(walletAddress, 0.001) : false;
 
+        // ─── Verify bank account with PAJ ───
+        let verifiedName = parsed.recipientName;
+        let verifiedStatus: 'verified' | 'unverified' | 'no_paj' = 'unverified';
+
+        if (parsed.bankCode && parsed.accountNumber && user[0]?.pajSessionToken) {
+          const verification = await verifyBankAccount(user[0].pajSessionToken, parsed.bankCode, parsed.accountNumber);
+          if (verification.verified && verification.accountName) {
+            verifiedName = verification.accountName;
+            verifiedStatus = 'verified';
+          } else {
+            console.log('[Verify] NLP failed:', verification.error);
+          }
+        } else if (!user[0]?.pajSessionToken) {
+          verifiedStatus = 'no_paj';
+        }
+
         session.pendingTransaction = {
           amountNgn: parsed.amount,
           amountUsdt: usdtNeeded,
           hasGas,
-          recipientName: parsed.recipientName,
-          recipientAccountName: parsed.recipientName,
+          recipientName: verifiedName,
+          recipientAccountName: verifiedName,
           recipientBankName: parsed.bankName,
           recipientBankCode: parsed.bankCode,
           recipientAccountNumber: parsed.accountNumber,
@@ -751,8 +855,18 @@ bot.on(message('text'), async (ctx, next) => {
         session.state = ConversationState.AWAITING_CONFIRMATION;
         setSession(userId, session);
 
-        let msg = `📤 *Confirm Transfer*\n\n` +
-          `To: *${parsed.recipientName || 'Recipient'}*\n` +
+        let msg = `📤 *Confirm Transfer*\n\n`;
+
+        if (verifiedStatus === 'verified') {
+          msg += `✅ *Account Verified by PAJ*\n`;
+        } else if (verifiedStatus === 'no_paj') {
+          msg += `⚠️ *Account Not Verified* (link PAJ in Settings to verify)\n`;
+        } else {
+          msg += `⚠️ *Could not verify account* — please double-check details\n`;
+        }
+
+        msg += `\n` +
+          `To: *${verifiedName || 'Recipient'}*\n` +
           `Bank: ${parsed.bankName || 'Solana'}\n` +
           `Account: \`${parsed.accountNumber || parsed.walletAddress}\`\n` +
           `Amount: ${formatNgn(parsed.amount)}\n` +
@@ -1179,12 +1293,28 @@ bot.action(/nlp_bank:(.+)/, async (ctx) => {
   const walletAddress = user[0]?.walletAddress;
   const hasGas = walletAddress ? await walletService.hasEnoughSolForGas(walletAddress, 0.001) : false;
 
+  // ─── Verify bank account with PAJ ───
+  let verifiedName = recipientName;
+  let verifiedStatus: 'verified' | 'unverified' | 'no_paj' = 'unverified';
+
+  if (user[0]?.pajSessionToken) {
+    const verification = await verifyBankAccount(user[0].pajSessionToken, bankCode, recipientAccountNumber!);
+    if (verification.verified && verification.accountName) {
+      verifiedName = verification.accountName;
+      verifiedStatus = 'verified';
+    } else {
+      console.log('[Verify] nlp_bank failed:', verification.error);
+    }
+  } else {
+    verifiedStatus = 'no_paj';
+  }
+
   session.pendingTransaction = {
     amountNgn,
     amountUsdt: usdtNeeded,
     hasGas,
-    recipientName,
-    recipientAccountName: recipientName,
+    recipientName: verifiedName,
+    recipientAccountName: verifiedName,
     recipientBankName: bank.name,
     recipientBankCode: bank.code,
     recipientAccountNumber,
@@ -1192,8 +1322,18 @@ bot.action(/nlp_bank:(.+)/, async (ctx) => {
   session.state = ConversationState.AWAITING_CONFIRMATION;
   setSession(userId, session);
 
-  let msg = `📤 *Confirm Transfer*\n\n` +
-    `To: *${recipientName || 'Recipient'}*\n` +
+  let msg = `📤 *Confirm Transfer*\n\n`;
+
+  if (verifiedStatus === 'verified') {
+    msg += `✅ *Account Verified by PAJ*\n`;
+  } else if (verifiedStatus === 'no_paj') {
+    msg += `⚠️ *Account Not Verified* (link PAJ in Settings to verify)\n`;
+  } else {
+    msg += `⚠️ *Could not verify account* — please double-check details\n`;
+  }
+
+  msg += `\n` +
+    `To: *${verifiedName || 'Recipient'}*\n` +
     `Bank: ${bank.name}\n` +
     `Account: \`${recipientAccountNumber}\`\n` +
     `Amount: ${formatNgn(amountNgn!)}\n` +
