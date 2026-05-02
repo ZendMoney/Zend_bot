@@ -22,6 +22,16 @@ export const NIGERIAN_BANKS = [
   { code: 'FSD', name: 'FSDH Merchant Bank' },
   { code: 'RAN', name: 'Rand Merchant Bank' },
   { code: 'NOV', name: 'Nova Merchant Bank' },
+  // Fintechs / MMOs
+  { code: 'OPY', name: 'OPay' },
+  { code: 'MON', name: 'Moniepoint' },
+  { code: 'KUD', name: 'Kuda' },
+  { code: 'PAL', name: 'PalmPay' },
+  { code: 'PAG', name: 'Paga' },
+  { code: 'VFD', name: 'VFD Microfinance Bank' },
+  { code: 'CAR', name: 'Carbon' },
+  { code: 'FAI', name: 'FairMoney' },
+  { code: 'BRA', name: 'Branch' },
 ] as const;
 
 // Solana Token Mints (Mainnet)

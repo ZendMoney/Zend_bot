@@ -61,6 +61,16 @@ const BANK_ALIASES: Record<string, string[]> = {
   'FSD': ['fsdh', 'fsdh merchant bank'],
   'RAN': ['rand', 'rand merchant bank'],
   'NOV': ['nova', 'nova merchant bank'],
+  // Fintechs / MMOs
+  'OPY': ['opay', 'o pay'],
+  'MON': ['moniepoint', 'monie point'],
+  'KUD': ['kuda', 'kuda bank'],
+  'PAL': ['palmpay', 'palm pay'],
+  'PAG': ['paga', 'paga bank'],
+  'VFD': ['vfd', 'vfd microfinance', 'vfd bank'],
+  'CAR': ['carbon', 'carbon bank'],
+  'FAI': ['fairmoney', 'fair money'],
+  'BRA': ['branch', 'branch bank'],
 };
 
 // Build regex patterns from aliases
