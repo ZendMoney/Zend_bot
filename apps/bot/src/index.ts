@@ -119,6 +119,32 @@ function formatNgn(amount: number): string {
   return `₦${amount.toLocaleString('en-NG')}`;
 }
 
+// ─── Rate Cache ───
+let _pajRates: { onRampRate: number; offRampRate: number } | null = null;
+let _pajRatesTime = 0;
+
+async function getPAJRates(): Promise<{ onRampRate: number; offRampRate: number }> {
+  if (_pajRates && Date.now() - _pajRatesTime < 300000) { // 5 min cache
+    return _pajRates;
+  }
+  const pajClient = await getPAJClient();
+  if (!pajClient) {
+    return _pajRates || { onRampRate: 1550, offRampRate: 1550 };
+  }
+  try {
+    const rates = await pajClient.getAllRates();
+    _pajRates = {
+      onRampRate: rates.onRampRate.rate,
+      offRampRate: rates.offRampRate.rate,
+    };
+    _pajRatesTime = Date.now();
+    return _pajRates;
+  } catch (err) {
+    console.log('[PAJ] Rate fetch failed, using cache/fallback');
+    return _pajRates || { onRampRate: 1550, offRampRate: 1550 };
+  }
+}
+
 // ─── Bank Verification ───
 // Cache PAJ bank list to map our bank codes ↔ PAJ bank IDs
 let _pajBankCache: Array<{ id: string; name: string; code: string }> | null = null;
@@ -440,13 +466,12 @@ bot.on(message('text'), async (ctx, next) => {
       return;
     }
 
-    // Get rate for this amount
+    // Get on-ramp rate from PAJ
     let rate = 1550;
     let fee = 0;
     try {
-      const rateData = await pajClient.getRateByAmount(amount);
-      rate = rateData.rate.rate;
-      fee = rateData.fee || 0;
+      const rates = await getPAJRates();
+      rate = rates.onRampRate;
     } catch (err) {
       console.log('Using fallback rate for on-ramp');
     }
@@ -620,16 +645,11 @@ bot.on(message('text'), async (ctx, next) => {
       return;
     }
 
-    // Get real PAJ rate
+    // Get real PAJ off-ramp rate
     let rate = 1550;
-    let fee = 0;
     try {
-      const pajClient = await getPAJClient();
-      if (pajClient) {
-        const rateData = await pajClient.getRateByAmount(amount);
-        rate = rateData.rate.rate;
-        // fee is included in the rate calculation
-      }
+      const rates = await getPAJRates();
+      rate = rates.offRampRate;
     } catch (err) {
       console.log('Using fallback rate');
     }
@@ -810,13 +830,10 @@ bot.on(message('text'), async (ctx, next) => {
           return;
         }
 
-        const pajClient = await getPAJClient();
         let rate = 1550;
         try {
-          if (pajClient) {
-            const rateData = await pajClient.getRateByAmount(parsed.amount);
-            rate = rateData.rate.rate;
-          }
+          const rates = await getPAJRates();
+          rate = rates.offRampRate;
         } catch (err) {
           console.log('Using fallback rate for NLP send');
         }
@@ -1052,9 +1069,8 @@ async function showVirtualAccount(
   let _fee = fee || 0;
   if (!rate) {
     try {
-      const rateData = await pajClient.getRateByAmount(fiatAmount);
-      _rate = rateData.rate.rate;
-      _fee = rateData.fee || 0;
+      const rates = await getPAJRates();
+      _rate = rates.onRampRate;
     } catch (err) {
       console.log('Using fallback rate for VA display');
     }
@@ -1281,8 +1297,8 @@ bot.action(/nlp_bank:(.+)/, async (ctx) => {
   let rate = 1550;
   try {
     if (pajClient) {
-      const rateData = await pajClient.getRateByAmount(amountNgn!);
-      rate = rateData.rate.rate;
+      const rates = await getPAJRates();
+      rate = rates.offRampRate;
     }
   } catch (err) {
     console.log('Using fallback rate for NLP bank select');
