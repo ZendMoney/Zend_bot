@@ -23,33 +23,54 @@ export interface ParsedCommand {
 // ─── Local Parser (fast, no API cost) ───
 
 const AMOUNT_PATTERNS = [
+  // Check 'k' format FIRST (e.g., 50k, 100k)
+  /(?:send|transfer|pay)\s+(?:me\s+)?[₦N]?(\d+k)\b/i,
+  /[₦N]?(\d+k)\b/i,
+  // Then check regular numbers
   /(?:send|transfer|pay)\s+(?:me\s+)?[₦N]?(\d[\d,]*(?:\.\d+)?)\s*(?:naira|ngn)?/i,
-  /(?:send|transfer|pay)\s+(?:me\s+)?(\d+k)\b/i,
   /[₦N]?(\d[\d,]*(?:\.\d+)?)\s*(?:naira|ngn)/i,
-  /(\d+k)\b/i,
 ];
 
-const BANK_PATTERNS = Object.entries({
-  'GTB': ['gtb', 'gtbank', 'guaranty trust bank', 'guaranty trust'],
-  'FIRST': ['first bank', 'fbn', 'firstbank'],
+// ─── Bank Detection ───
+// Build patterns dynamically from NIGERIAN_BANKS + common aliases
+
+const BANK_ALIASES: Record<string, string[]> = {
+  'GTB': ['gtb', 'gtbank', 'guaranty trust bank', 'guaranty trust', 'gt bank'],
+  'FBN': ['first bank', 'fbn', 'firstbank', 'first'],
   'UBA': ['uba', 'united bank for africa'],
-  'ZENITH': ['zenith', 'zenith bank'],
-  'ACCESS': ['access', 'access bank'],
-  'ECOBANK': ['ecobank'],
-  'FIDELITY': ['fidelity', 'fidelity bank'],
-  'FCMB': ['fcmb', 'first city monument'],
-  'WEMA': ['wema', 'wema bank'],
-  'POLARIS': ['polaris', 'polaris bank', 'skye'],
+  'ZEN': ['zenith', 'zenith bank'],
+  'ACC': ['access', 'access bank'],
+  'ECO': ['ecobank', 'eco bank'],
+  'FID': ['fidelity', 'fidelity bank'],
+  'FCMB': ['fcmb', 'first city monument', 'first city'],
+  'WEM': ['wema', 'wema bank'],
+  'SKY': ['polaris', 'polaris bank', 'skye', 'skye bank'],
   'STERLING': ['sterling', 'sterling bank'],
   'UNITY': ['unity', 'unity bank'],
-  'JAIZ': ['jaiz', 'jaiz bank'],
-  'KEYSTONE': ['keystone', 'keystone bank'],
+  'JAB': ['jaiz', 'jaiz bank'],
+  'KEC': ['keystone', 'keystone bank'],
   'HERITAGE': ['heritage', 'heritage bank'],
-  'STANBIC': ['stanbic', 'stanbic ibtc'],
-  'UNION': ['union', 'union bank'],
-  'GTCO': ['gtco'],
-}).flatMap(([code, names]) =>
-  names.map(name => ({ code, name, regex: new RegExp(`\\b${name}\\b`, 'i') }))
+  'STA': ['stanbic', 'stanbic ibtc', 'stanbic bank'],
+  'UNI': ['union', 'union bank'],
+  'TIT': ['titan', 'titan trust', 'titan trust bank'],
+  'GLO': ['globus', 'globus bank'],
+  'PRO': ['providus', 'providus bank'],
+  'SUN': ['suntrust', 'suntrust bank', 'sun trust'],
+  'PAR': ['parallex', 'parallex bank'],
+  'COR': ['coronation', 'coronation merchant bank'],
+  'FSD': ['fsdh', 'fsdh merchant bank'],
+  'RAN': ['rand', 'rand merchant bank'],
+  'NOV': ['nova', 'nova merchant bank'],
+};
+
+// Build regex patterns from aliases
+const BANK_PATTERNS = Object.entries(BANK_ALIASES).flatMap(([code, names]) =>
+  names.map(name => ({
+    code,
+    name,
+    // Use word boundary OR space/punctuation before/after
+    regex: new RegExp(`(?:^|[\\s,;:-])${name}(?:[\\s,;:-]|$)`, 'i'),
+  }))
 );
 
 const ACCOUNT_NUMBER_PATTERN = /\b(\d{10})\b/;
@@ -78,11 +99,27 @@ function extractAmount(text: string): number | undefined {
 }
 
 function extractBank(text: string): { code: string; name: string } | undefined {
+  const lowerText = text.toLowerCase();
+
+  // Try strict regex patterns first
   for (const bank of BANK_PATTERNS) {
     if (bank.regex.test(text)) {
-      return { code: bank.code, name: bank.name };
+      // Return canonical name from NIGERIAN_BANKS
+      const canonical = NIGERIAN_BANKS.find(b => b.code === bank.code);
+      return { code: bank.code, name: canonical?.name || bank.name };
     }
   }
+
+  // Fallback: simple includes check for aliases
+  for (const [code, aliases] of Object.entries(BANK_ALIASES)) {
+    for (const alias of aliases) {
+      if (lowerText.includes(alias.toLowerCase())) {
+        const canonical = NIGERIAN_BANKS.find(b => b.code === code);
+        return { code, name: canonical?.name || alias };
+      }
+    }
+  }
+
   return undefined;
 }
 
@@ -97,18 +134,52 @@ function extractWalletAddress(text: string): string | undefined {
 }
 
 function extractRecipientName(text: string, bankName?: string, accountNumber?: string): string | undefined {
-  // Simple heuristic: look for a capitalized word before the bank name
   const lowerText = text.toLowerCase();
-  const bankIndex = bankName ? lowerText.indexOf(bankName.toLowerCase().split(' ')[0]) : -1;
-  
-  if (bankIndex > 0) {
-    const beforeBank = text.slice(0, bankIndex).trim();
-    const words = beforeBank.split(/\s+/);
-    // Look for a name pattern (capitalized word(s))
+  let anchorIndex = -1;
+
+  // Try to find position of bank name (full match first)
+  if (bankName) {
+    // Find the bank name in text, but check all aliases to find earliest match
+    const bankEntry = Object.entries(BANK_ALIASES).find(([code, aliases]) => {
+      const canonical = NIGERIAN_BANKS.find(b => b.code === code);
+      return canonical?.name === bankName || aliases.includes(bankName.toLowerCase());
+    });
+
+    if (bankEntry) {
+      for (const alias of bankEntry[1]) {
+        const idx = lowerText.indexOf(alias);
+        if (idx !== -1 && (anchorIndex === -1 || idx < anchorIndex)) {
+          anchorIndex = idx;
+        }
+      }
+    }
+
+    // Fallback to direct bank name match
+    if (anchorIndex === -1) {
+      anchorIndex = lowerText.indexOf(bankName.toLowerCase());
+    }
+    if (anchorIndex === -1) {
+      anchorIndex = lowerText.indexOf(bankName.toLowerCase().split(' ')[0]);
+    }
+  }
+
+  // Fallback: find position of account number
+  if (anchorIndex === -1 && accountNumber) {
+    anchorIndex = lowerText.indexOf(accountNumber);
+  }
+
+  if (anchorIndex > 0) {
+    const beforeAnchor = text.slice(0, anchorIndex).trim();
+    // Remove common prepositions at the end
+    const cleaned = beforeAnchor.replace(/\s+(to|for|at|into|towards)$/i, '').trim();
+    const words = cleaned.split(/\s+/);
+
+    // Look for capitalized name words at the end
     const nameWords: string[] = [];
     for (let i = words.length - 1; i >= 0; i--) {
-      if (/^[A-Z][a-z]+$/.test(words[i])) {
-        nameWords.unshift(words[i]);
+      const word = words[i].replace(/[^a-zA-Z]/g, '');
+      if (/^[A-Z][a-z]+$/.test(word) && !['Send', 'Transfer', 'Pay', 'Give'].includes(word)) {
+        nameWords.unshift(word);
       } else if (nameWords.length > 0) {
         break;
       }
@@ -117,7 +188,7 @@ function extractRecipientName(text: string, bankName?: string, accountNumber?: s
       return nameWords.join(' ');
     }
   }
-  
+
   return undefined;
 }
 
