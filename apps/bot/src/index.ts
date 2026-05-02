@@ -53,7 +53,7 @@ interface ZendSession {
     recipientAccountNumber: string;
     recipientAccountName: string;
     recipientWalletAddress: string;
-    hasGas?: boolean;
+    zendFeeUsdt?: number;
   }>;
   pajContact?: string; // email/phone pending OTP
   onrampAmount?: number; // pending on-ramp amount in NGN
@@ -672,30 +672,23 @@ bot.on(message('text'), async (ctx, next) => {
       console.log('Using fallback rate');
     }
 
-    const usdtNeeded = amount / rate;
-
-    // Check user has enough SOL for gas
-    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-    const walletAddress = user[0]?.walletAddress;
-    const hasGas = walletAddress ? await walletService.hasEnoughSolForGas(walletAddress, 0.001) : false;
+    const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
+    const zendFeeUsdt = (amount / rate) * (zendFeeBps / 10000);
+    const usdtNeeded = (amount / rate) + zendFeeUsdt;
 
     session.pendingTransaction = {
       amountNgn: amount,
       amountUsdt: usdtNeeded,
-      hasGas,
+      zendFeeUsdt,
     };
     session.state = ConversationState.AWAITING_SEND_RECIPIENT;
     setSession(userId, session);
 
     let msg = `📤 Send ${formatNgn(amount)}\n` +
-      `You pay: *${usdtNeeded.toFixed(2)} USDT*\n` +
-      `Rate: ${formatNgn(rate)}/USDT\n\n`;
-
-    if (!hasGas) {
-      msg += `⚠️ *Low SOL for gas.* You'll need ~0.001 SOL.\n\n`;
-    }
-
-    msg += `Who should receive it?\n\n` +
+      `Rate: ${formatNgn(rate)}/USDT\n` +
+      `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${zendFeeUsdt.toFixed(4)} USDT\n` +
+      `You pay: *${usdtNeeded.toFixed(2)} USDT*\n\n` +
+      `Who should receive it?\n\n` +
       `Type: "Name BankCode AccountNumber"\n` +
       `Example: "Tunde GTB 0123456789"`;
 
@@ -758,7 +751,7 @@ bot.on(message('text'), async (ctx, next) => {
     session.state = ConversationState.AWAITING_CONFIRMATION;
     setSession(userId, session);
 
-    const { amountNgn, amountUsdt, hasGas } = session.pendingTransaction!;
+    const { amountNgn, amountUsdt } = session.pendingTransaction!;
 
     let confirmMsg = `📤 *Confirm Transfer*\n\n`;
 
@@ -770,20 +763,20 @@ bot.on(message('text'), async (ctx, next) => {
       confirmMsg += `⚠️ *Could not verify account* — please double-check details\n`;
     }
 
+    const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
+    const feeLine = session.pendingTransaction?.zendFeeUsdt
+      ? `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${session.pendingTransaction.zendFeeUsdt.toFixed(4)} USDT\n`
+      : '';
+
     confirmMsg += `\n` +
       `Amount: *${formatNgn(amountNgn!)}*\n` +
       `To: *${verifiedName}*\n` +
       `Bank: *${bank.name}*\n` +
       `Account: \`${accountNumber}\`\n\n` +
-      `You pay: *${amountUsdt!.toFixed(2)} USDT*\n`;
-
-    if (!hasGas) {
-      confirmMsg += `⚠️ *Gas: ~0.001 SOL* (you pay)\n`;
-    } else {
-      confirmMsg += `⛽ *Gas: ~0.001 SOL* (you have enough)\n`;
-    }
-
-    confirmMsg += `\n━━━━━━━━━━━━━━━━━━━━`;
+      feeLine +
+      `You pay: *${amountUsdt!.toFixed(2)} USDT*\n` +
+      `💡 *Gas: ~0.001 SOL* (deducted from your wallet)\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━`;
 
     await ctx.reply(confirmMsg, {
       parse_mode: 'Markdown',
@@ -857,9 +850,9 @@ bot.on(message('text'), async (ctx, next) => {
           console.log('Using fallback rate for NLP send');
         }
 
-        const usdtNeeded = parsed.amount / rate;
-        const walletAddress = user[0].walletAddress;
-        const hasGas = walletAddress ? await walletService.hasEnoughSolForGas(walletAddress, 0.001) : false;
+        const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
+        const zendFeeUsdt = (parsed.amount / rate) * (zendFeeBps / 10000);
+        const usdtNeeded = (parsed.amount / rate) + zendFeeUsdt;
 
         // ─── Verify bank account with PAJ ───
         let verifiedName = parsed.recipientName;
@@ -880,7 +873,7 @@ bot.on(message('text'), async (ctx, next) => {
         session.pendingTransaction = {
           amountNgn: parsed.amount,
           amountUsdt: usdtNeeded,
-          hasGas,
+          zendFeeUsdt,
           recipientName: verifiedName,
           recipientAccountName: verifiedName,
           recipientBankName: parsed.bankName,
@@ -906,14 +899,11 @@ bot.on(message('text'), async (ctx, next) => {
           `Bank: ${parsed.bankName || 'Solana'}\n` +
           `Account: \`${parsed.accountNumber || parsed.walletAddress}\`\n` +
           `Amount: ${formatNgn(parsed.amount)}\n` +
+          `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${zendFeeUsdt.toFixed(4)} USDT\n` +
           `You pay: *${usdtNeeded.toFixed(2)} USDT*\n` +
-          `Rate: ${formatNgn(rate)}/USDT\n\n`;
-
-        if (!hasGas) {
-          msg += `⚠️ You need SOL for gas. Send some SOL first.\n\n`;
-        }
-
-        msg += `Confirm?`;
+          `Rate: ${formatNgn(rate)}/USDT\n\n` +
+          `💡 *Gas: ~0.001 SOL* (deducted from your wallet)\n\n` +
+          `Confirm?`;
 
         await ctx.reply(msg, {
           parse_mode: 'Markdown',
@@ -1324,12 +1314,12 @@ bot.action(/nlp_bank:(.+)/, async (ctx) => {
     console.log('Using fallback rate for NLP bank select');
   }
 
-  const usdtNeeded = amountNgn! / rate;
-  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-  const walletAddress = user[0]?.walletAddress;
-  const hasGas = walletAddress ? await walletService.hasEnoughSolForGas(walletAddress, 0.001) : false;
+  const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
+  const zendFeeUsdt = (amountNgn! / rate) * (zendFeeBps / 10000);
+  const usdtNeeded = (amountNgn! / rate) + zendFeeUsdt;
 
   // ─── Verify bank account with PAJ ───
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
   let verifiedName = recipientName;
   let verifiedStatus: 'verified' | 'unverified' | 'no_paj' = 'unverified';
 
@@ -1348,7 +1338,7 @@ bot.action(/nlp_bank:(.+)/, async (ctx) => {
   session.pendingTransaction = {
     amountNgn,
     amountUsdt: usdtNeeded,
-    hasGas,
+    zendFeeUsdt,
     recipientName: verifiedName,
     recipientAccountName: verifiedName,
     recipientBankName: bank.name,
@@ -1373,14 +1363,11 @@ bot.action(/nlp_bank:(.+)/, async (ctx) => {
     `Bank: ${bank.name}\n` +
     `Account: \`${recipientAccountNumber}\`\n` +
     `Amount: ${formatNgn(amountNgn!)}\n` +
+    `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${zendFeeUsdt.toFixed(4)} USDT\n` +
     `You pay: *${usdtNeeded.toFixed(2)} USDT*\n` +
-    `Rate: ${formatNgn(rate)}/USDT\n\n`;
-
-  if (!hasGas) {
-    msg += `⚠️ You need SOL for gas. Send some SOL first.\n\n`;
-  }
-
-  msg += `Confirm?`;
+    `Rate: ${formatNgn(rate)}/USDT\n\n` +
+    `💡 *Gas: ~0.001 SOL* (deducted from your wallet)\n\n` +
+    `Confirm?`;
 
   await ctx.editMessageText(msg, {
     parse_mode: 'Markdown',
