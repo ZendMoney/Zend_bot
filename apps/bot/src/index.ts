@@ -343,10 +343,16 @@ bot.hears('💵 Add Naira', async (ctx) => {
 });
 
 // Handle PAJ email/phone input
-bot.on(message('text'), async (ctx) => {
+bot.on(message('text'), async (ctx, next) => {
   const userId = ctx.from.id.toString();
   const text = ctx.message.text;
   const session = getSession(userId);
+
+  // ─── Pass menu buttons to bot.hears() handlers ───
+  const menuButtons = ['💰 Balance', '💵 Add Naira', '📤 Send', '💴 Cash Out', '📥 Receive', '🔄 Swap', '📋 History', '⚙️ Settings'];
+  if (menuButtons.includes(text)) {
+    return next();
+  }
 
   // Cancel
   if (text === '❌ Cancel') {
