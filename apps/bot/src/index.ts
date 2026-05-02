@@ -119,6 +119,22 @@ function formatNgn(amount: number): string {
   return `₦${amount.toLocaleString('en-NG')}`;
 }
 
+// ─── Loading UI Helper ───
+async function showLoading(ctx: ZendContext, text: string): Promise<{ message_id: number }> {
+  await ctx.replyWithChatAction('typing');
+  const msg = await ctx.reply(`⏳ ${text}`);
+  return msg;
+}
+
+async function updateLoading(ctx: ZendContext, messageId: number, text: string): Promise<void> {
+  await ctx.replyWithChatAction('typing');
+  await ctx.telegram.editMessageText(ctx.chat!.id, messageId, undefined, `⏳ ${text}`);
+}
+
+async function finishLoading(ctx: ZendContext, messageId: number, text: string, parseMode?: string): Promise<void> {
+  await ctx.telegram.editMessageText(ctx.chat!.id, messageId, undefined, text, parseMode ? { parse_mode: parseMode as any } : undefined);
+}
+
 // ─── Rate Cache ───
 let _pajRates: { onRampRate: number; offRampRate: number } | null = null;
 let _pajRatesTime = 0;
@@ -366,12 +382,12 @@ bot.hears('💰 Balance', async (ctx) => {
   }
 
   const walletAddress = user[0].walletAddress;
+  const loading = await showLoading(ctx, 'Fetching your balance...');
 
   try {
     const balances = await walletService.getAllBalances(walletAddress);
-    const pajClient = await getPAJClient();
-    const rates = pajClient ? await pajClient.getAllRates() : null;
-    const offRampRate = rates?.offRampRate?.rate || 1550;
+    const rates = await getPAJRates();
+    const offRampRate = rates.offRampRate;
 
     let msg = `💰 *Your Balance*\n\n`;
     let totalNgn = 0;
@@ -388,10 +404,12 @@ bot.hears('💰 Balance', async (ctx) => {
     msg += `\n━━━━━━━━━━━━━━━━━━━━\n`;
     msg += `💵 Total: ≈${formatNgn(totalNgn)}`;
 
-    await ctx.reply(msg, { parse_mode: 'Markdown', ...mainMenu });
+    await finishLoading(ctx, loading.message_id, msg, 'Markdown');
+    await ctx.reply('Menu:', mainMenu);
   } catch (err) {
     console.error('Balance error:', err);
-    await ctx.reply('❌ Could not fetch balance. Please try again.', mainMenu);
+    await finishLoading(ctx, loading.message_id, '❌ Could not fetch balance. Please try again.');
+    await ctx.reply('Menu:', mainMenu);
   }
 });
 
@@ -717,9 +735,10 @@ bot.on(message('text'), async (ctx, next) => {
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     let verifiedName = accountName;
     let verifiedStatus: 'verified' | 'unverified' | 'no_paj' = 'unverified';
+    let verifyMsg: { message_id: number } | undefined;
 
     if (user[0]?.pajSessionToken) {
-      await ctx.reply('🔍 Verifying account details...');
+      verifyMsg = await showLoading(ctx, 'Verifying account with PAJ...');
       const verification = await verifyBankAccount(user[0].pajSessionToken, bankCode, accountNumber);
       if (verification.verified && verification.accountName) {
         verifiedName = verification.accountName;
@@ -1005,7 +1024,7 @@ bot.on(message('voice'), async (ctx) => {
     return;
   }
 
-  await ctx.reply('🎙️ Transcribing your voice note...');
+  const loadingVoice = await showLoading(ctx, 'Transcribing voice note...');
 
   try {
     // Download voice file
@@ -1013,14 +1032,18 @@ bot.on(message('voice'), async (ctx) => {
     const response = await fetch(fileLink.toString());
     const audioBuffer = Buffer.from(await response.arrayBuffer());
 
+    await updateLoading(ctx, loadingVoice.message_id, 'Transcribing with AI...');
+
     // Transcribe
     const text = await transcribeVoice(audioBuffer, apiKey);
     console.log('[Voice] Transcribed:', text);
 
-    await ctx.reply(`📝 *You said:* "${text}"\n\nParsing...`, { parse_mode: 'Markdown' });
+    await updateLoading(ctx, loadingVoice.message_id, 'Parsing your command...');
 
     // Parse transcribed text
     const parsed = await parseCommand(text, true); // use Kimi for voice
+
+    await finishLoading(ctx, loadingVoice.message_id, `📝 *You said:* "${text}"`, 'Markdown');
 
     // Forward to text handler logic
     // Create a synthetic text message update
@@ -1032,11 +1055,8 @@ bot.on(message('voice'), async (ctx) => {
 
   } catch (err: any) {
     console.error('[Voice] Error:', err);
-    await ctx.reply(
-      '❌ Could not process voice note.\n\n' +
-      'Please type your command or use the menu below.',
-      mainMenu
-    );
+    await finishLoading(ctx, loadingVoice.message_id, '❌ Could not process voice note. Please type your command or use the menu below.');
+    await ctx.reply('Menu:', mainMenu);
   }
 });
 
@@ -1079,6 +1099,7 @@ async function showVirtualAccount(
 
   // Always create a fresh on-ramp order for the specific amount
   // (Don't reuse cached VAs since amounts may differ)
+  const loadingVA = await showLoading(ctx, 'Creating your virtual bank account...');
   let virtualAccount: any;
   try {
     const order = await pajClient.createOnramp({
@@ -1107,11 +1128,8 @@ async function showVirtualAccount(
     console.log('[PAJ] Virtual account created:', order.accountNumber, 'for ₦', fiatAmount);
   } catch (err: any) {
     console.error('[PAJ] createOnramp failed:', err);
-    await ctx.reply(
-      `❌ Could not create virtual account.\n` +
-      `Error: ${err.message || 'Unknown error'}`,
-      mainMenu
-    );
+    await finishLoading(ctx, loadingVA.message_id, `❌ Could not create virtual account.\nError: ${err.message || 'Unknown error'}`);
+    await ctx.reply('Menu:', mainMenu);
     return;
   }
 
@@ -1208,12 +1226,14 @@ bot.action('confirm_send', async (ctx) => {
   );
 
   try {
+    await ctx.replyWithChatAction('typing');
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     const walletAddress = user[0].walletAddress;
     let offRampRef = 'MOCK-' + Math.random().toString(36).substring(2, 8).toUpperCase();
 
     const pajClient = await getPAJClient();
     if (pajClient && user[0].pajSessionToken) {
+      await ctx.replyWithChatAction('typing');
       // Real PAJ off-ramp
       const order = await pajClient.createOfframp({
         bank: finalBankCode,
