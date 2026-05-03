@@ -119,6 +119,24 @@ function formatNgn(amount: number): string {
   return `₦${amount.toLocaleString('en-NG')}`;
 }
 
+// ─── SOL Price (CoinGecko) ───
+let _solPriceCache: { price: number; time: number } | null = null;
+
+async function getSolPriceInUsdt(): Promise<number> {
+  if (_solPriceCache && Date.now() - _solPriceCache.time < 120000) {
+    return _solPriceCache.price;
+  }
+  try {
+    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+    const data = await res.json();
+    const price = data?.solana?.usd || 140;
+    _solPriceCache = { price, time: Date.now() };
+    return price;
+  } catch {
+    return _solPriceCache?.price || 140;
+  }
+}
+
 // ─── Loading UI Helper ───
 async function showLoading(ctx: ZendContext, text: string): Promise<{ message_id: number }> {
   await ctx.replyWithChatAction('typing');
@@ -388,21 +406,26 @@ bot.hears('💰 Balance', async (ctx) => {
     const balances = await walletService.getAllBalances(walletAddress);
     const rates = await getPAJRates();
     const offRampRate = rates.offRampRate;
+    const solPrice = await getSolPriceInUsdt();
 
     let msg = `💰 *Your Balance*\n\n`;
     let totalNgn = 0;
 
     for (const bal of balances) {
-      const ngnEquiv = bal.symbol === 'SOL'
-        ? bal.amount * offRampRate * 0.0006 // rough SOL→USD→NGN
-        : bal.amount * offRampRate;
+      let ngnEquiv = 0;
+      if (bal.symbol === 'SOL') {
+        ngnEquiv = bal.amount * solPrice * offRampRate;
+      } else {
+        ngnEquiv = bal.amount * offRampRate;
+      }
       totalNgn += ngnEquiv;
       const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : '🟡';
       msg += `${emoji} *${bal.symbol}*  ${formatBalance(bal.amount, bal.symbol)}  (≈${formatNgn(ngnEquiv)})\n`;
     }
 
     msg += `\n━━━━━━━━━━━━━━━━━━━━\n`;
-    msg += `💵 Total: ≈${formatNgn(totalNgn)}`;
+    msg += `💵 Total: ≈${formatNgn(totalNgn)}\n`;
+    msg += `📈 SOL: $${solPrice.toFixed(2)}  ·  Rate: ${formatNgn(offRampRate)}/USDT`;
 
     await finishLoading(ctx, loading.message_id, msg, 'Markdown');
     await ctx.reply('Menu:', mainMenu);
@@ -940,21 +963,26 @@ bot.on(message('text'), async (ctx, next) => {
           const pajClient = await getPAJClient();
           const rates = pajClient ? await pajClient.getAllRates() : null;
           const offRampRate = rates?.offRampRate?.rate || 1550;
+          const solPrice = await getSolPriceInUsdt();
 
           let msg = `💰 *Your Balance*\n\n`;
           let totalNgn = 0;
 
           for (const bal of balances) {
-            const ngnEquiv = bal.symbol === 'SOL'
-              ? bal.amount * offRampRate * 0.0006
-              : bal.amount * offRampRate;
+            let ngnEquiv = 0;
+            if (bal.symbol === 'SOL') {
+              ngnEquiv = bal.amount * solPrice * offRampRate;
+            } else {
+              ngnEquiv = bal.amount * offRampRate;
+            }
             totalNgn += ngnEquiv;
             const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : '🟡';
             msg += `${emoji} *${bal.symbol}*  ${formatBalance(bal.amount, bal.symbol)}  (≈${formatNgn(ngnEquiv)})\n`;
           }
 
           msg += `\n━━━━━━━━━━━━━━━━━━━━\n`;
-          msg += `💵 Total: ≈${formatNgn(totalNgn)}`;
+          msg += `💵 Total: ≈${formatNgn(totalNgn)}\n`;
+          msg += `📈 SOL: $${solPrice.toFixed(2)}  ·  Rate: ${formatNgn(offRampRate)}/USDT`;
 
           await ctx.reply(msg, { parse_mode: 'Markdown', ...mainMenu });
         } catch (err) {
@@ -1417,21 +1445,34 @@ bot.hears('📥 Receive', async (ctx) => {
   }
 
   const walletAddress = user[0].walletAddress;
+  const virtualAccount = user[0].virtualAccount as any;
+  const hasVA = virtualAccount?.accountNumber;
 
-  await ctx.reply(
-    `📥 *Receive Money*\n\n` +
-    `Share your details to get paid:\n\n` +
-    `┌─ *Crypto (Solana)* ─────────────┐\n` +
-    `│ \`${walletAddress}\`\n` +
-    `│ [📋 Copy]\n` +
-    `└────────────────────────────────┘\n\n` +
-    `┌─ *Naira (Bank Transfer)* ──────┐\n` +
-    `│ Tap 💵 *Add Naira* to get your\n` +
-    `│ virtual bank account.\n` +
-    `└────────────────────────────────┘\n\n` +
-    `💡 Crypto arrives instantly. Naira arrives in 2-5 minutes.`,
-    { parse_mode: 'Markdown', ...mainMenu }
-  );
+  let msg = `📥 *Receive Money*\n\n`;
+  msg += `Choose how you want to get paid:\n\n`;
+
+  // Crypto section
+  msg += `*🪙 Crypto (Solana)*\n`;
+  msg += `Send SOL, USDT, or USDC to:\n`;
+  msg += `\`\`\`\n${walletAddress}\n\`\`\`\n\n`;
+
+  // Naira section
+  if (hasVA) {
+    msg += `*🇳🇬 Naira (Bank Transfer)*\n`;
+    msg += `Send NGN to your virtual account:\n\n`;
+    msg += `🏦 *Bank:* ${virtualAccount.bankName || 'Zend Bank'}\n`;
+    msg += `👤 *Name:* ${virtualAccount.accountName || user[0].firstName + ' ' + (user[0].lastName || '')}\n`;
+    msg += `🔢 *Number:* \`${virtualAccount.accountNumber}\`\n\n`;
+  } else {
+    msg += `*🇳🇬 Naira (Bank Transfer)*\n`;
+    msg += `You don't have a virtual account yet.\n`;
+    msg += `Tap 💵 *Add Naira* to create one.\n\n`;
+  }
+
+  msg += `💡 *Crypto arrives instantly*\n`;
+  msg += `⏱️ *Naira takes 2–5 minutes* after bank transfer`;
+
+  await ctx.reply(msg, { parse_mode: 'Markdown', ...mainMenu });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
