@@ -248,14 +248,61 @@ export function parseLocal(text: string): ParsedCommand {
   };
 }
 
-// ─── Kimi (Moonshot) API Parser ───
+// ─── Kimi Coding API (same pattern as snipey_v2) ───
 
 const KIMI_API_KEY = process.env.KIMI_API_KEY || process.env.OPENAI_API_KEY;
-const KIMI_BASE_URL = process.env.KIMI_BASE_URL || 'https://api.moonshot.cn/v1';
+const KIMI_BASE_URL = process.env.KIMI_BASE_URL || 'https://api.kimi.com/coding';
+const KIMI_MODEL = process.env.KIMI_MODEL || 'kimi-for-coding';
 
 if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
   console.warn('[NLP] ⚠️  KIMI_API_KEY not set — AI features disabled');
 }
+
+function getKimiResponse(data: any): string {
+  // Anthropic-style response: content[0].text
+  const text = data?.content?.[0]?.text;
+  if (text) return text;
+  // Fallback to OpenAI-style
+  return data?.choices?.[0]?.message?.content || '';
+}
+
+async function callKimi(systemPrompt: string, userPrompt: string, temperature: number, maxTokens: number): Promise<string | null> {
+  if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
+    return null;
+  }
+
+  try {
+    const response = await fetch(`${KIMI_BASE_URL}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${KIMI_API_KEY}`,
+        'User-Agent': 'claude-code/0.1.0',
+      },
+      body: JSON.stringify({
+        model: KIMI_MODEL,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: userPrompt }],
+        temperature,
+        max_tokens: maxTokens,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      console.error(`[Kimi] API error ${response.status}: ${errText.slice(0, 200)}`);
+      return null;
+    }
+
+    const data: any = await response.json();
+    return getKimiResponse(data) || null;
+  } catch (err) {
+    console.error('[Kimi] API call failed:', err);
+    return null;
+  }
+}
+
+// ─── Command Parser ───
 
 const SYSTEM_PROMPT = `You are a payment command parser for a Nigerian crypto wallet bot.
 Extract the following from user messages:
@@ -273,37 +320,13 @@ Respond ONLY with valid JSON. No markdown, no explanation.`;
  * Parse using Kimi API (for complex/voice transcribed text)
  */
 export async function parseWithKimi(text: string): Promise<ParsedCommand> {
-  if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
-    console.log('[NLP] No Kimi API key, falling back to local parser');
+  const content = await callKimi(SYSTEM_PROMPT, text, 0.1, 500);
+  if (!content) {
+    console.log('[NLP] No Kimi API key or call failed, falling back to local parser');
     return parseLocal(text);
   }
 
   try {
-    const response = await fetch(`${KIMI_BASE_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${KIMI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'moonshot-v1-8k',
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: text },
-        ],
-        temperature: 0.1,
-      }),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text().catch(() => '');
-      console.error(`[NLP] Kimi API error ${response.status}: ${errText.slice(0, 200)}`);
-      throw new Error(`Kimi API error: ${response.status}`);
-    }
-
-    const data: any = await response.json();
-    const content = data.choices[0]?.message?.content || '{}';
-    
     // Parse JSON from response
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
@@ -329,15 +352,12 @@ export async function parseWithKimi(text: string): Promise<ParsedCommand> {
  * Main parse function - tries local first, falls back to Kimi
  */
 export async function parseCommand(text: string, useKimi = false): Promise<ParsedCommand> {
-  // For voice or complex text, use Kimi
   if (useKimi) {
     return parseWithKimi(text);
   }
   
-  // Try local first
   const local = parseLocal(text);
   
-  // If local couldn't parse well, try Kimi
   if (local.intent === 'unknown' && KIMI_API_KEY && KIMI_API_KEY !== 'your_openai_key') {
     return parseWithKimi(text);
   }
@@ -380,44 +400,9 @@ export interface ChatReply {
  * Get a conversational reply from Kimi when the user's message is not a command.
  */
 export async function chatWithKimi(text: string): Promise<ChatReply | null> {
-  if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
-    return null;
-  }
-
-  try {
-    const response = await fetch(`${KIMI_BASE_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${KIMI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'moonshot-v1-8k',
-        messages: [
-          { role: 'system', content: CHAT_SYSTEM_PROMPT },
-          { role: 'user', content: text },
-        ],
-        temperature: 0.7,
-        max_tokens: 400,
-      }),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text().catch(() => '');
-      console.error(`[Chat] Kimi API error ${response.status}: ${errText.slice(0, 200)}`);
-      return null;
-    }
-
-    const data: any = await response.json();
-    const reply = data.choices[0]?.message?.content?.trim();
-    
-    if (!reply) return null;
-
-    return { reply };
-  } catch (err) {
-    console.error('[Chat] Kimi chat failed:', err);
-    return null;
-  }
+  const reply = await callKimi(CHAT_SYSTEM_PROMPT, text, 0.7, 400);
+  if (!reply) return null;
+  return { reply: reply.trim() };
 }
 
 // ─── Voice Transcription ───
