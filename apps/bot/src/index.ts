@@ -1595,7 +1595,7 @@ async function main() {
     console.warn('⚠️  PAJ not configured');
   }
 
-  bot.launch();
+  bot.launch({ dropPendingUpdates: true });
   console.log('🤖 Zend bot is running...');
 
   process.once('SIGINT', () => bot.stop('SIGINT'));

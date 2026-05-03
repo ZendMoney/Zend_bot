@@ -253,6 +253,10 @@ export function parseLocal(text: string): ParsedCommand {
 const KIMI_API_KEY = process.env.KIMI_API_KEY || process.env.OPENAI_API_KEY;
 const KIMI_BASE_URL = process.env.KIMI_BASE_URL || 'https://api.moonshot.cn/v1';
 
+if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
+  console.warn('[NLP] ⚠️  KIMI_API_KEY not set — AI features disabled');
+}
+
 const SYSTEM_PROMPT = `You are a payment command parser for a Nigerian crypto wallet bot.
 Extract the following from user messages:
 - intent: "send" | "add_naira" | "cash_out" | "balance" | "unknown"
@@ -292,6 +296,8 @@ export async function parseWithKimi(text: string): Promise<ParsedCommand> {
     });
 
     if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      console.error(`[NLP] Kimi API error ${response.status}: ${errText.slice(0, 200)}`);
       throw new Error(`Kimi API error: ${response.status}`);
     }
 
@@ -397,7 +403,8 @@ export async function chatWithKimi(text: string): Promise<ChatReply | null> {
     });
 
     if (!response.ok) {
-      console.error('[Chat] Kimi API error:', response.status);
+      const errText = await response.text().catch(() => '');
+      console.error(`[Chat] Kimi API error ${response.status}: ${errText.slice(0, 200)}`);
       return null;
     }
 
