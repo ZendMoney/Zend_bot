@@ -254,6 +254,15 @@ const KIMI_API_KEY = process.env.KIMI_API_KEY || process.env.OPENAI_API_KEY;
 const KIMI_BASE_URL = process.env.KIMI_BASE_URL || 'https://api.kimi.com/coding';
 const KIMI_MODEL = process.env.KIMI_MODEL || 'kimi-for-coding';
 
+// Normalize base URL — strip trailing /v1 if present so we don't get /v1/v1/messages
+function getKimiBaseUrl(): string {
+  let url = KIMI_BASE_URL;
+  if (url.endsWith('/v1')) {
+    url = url.slice(0, -3);
+  }
+  return url.replace(/\/$/, '');
+}
+
 if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
   console.warn('[NLP] ⚠️  KIMI_API_KEY not set — AI features disabled');
 }
@@ -272,7 +281,7 @@ async function callKimi(systemPrompt: string, userPrompt: string, temperature: n
   }
 
   try {
-    const response = await fetch(`${KIMI_BASE_URL}/v1/messages`, {
+    const response = await fetch(`${getKimiBaseUrl()}/v1/messages`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
