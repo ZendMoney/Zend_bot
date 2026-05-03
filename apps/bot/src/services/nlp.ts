@@ -339,6 +339,80 @@ export async function parseCommand(text: string, useKimi = false): Promise<Parse
   return local;
 }
 
+// ─── Conversational AI (Smart Assistant) ───
+
+const CHAT_SYSTEM_PROMPT = `You are Zend, a friendly and helpful Nigerian crypto payment assistant running inside a Telegram bot.
+
+Your personality: Warm, concise, slightly witty, and always helpful. You speak like a knowledgeable Nigerian friend. Use simple English. Occasionally use light Nigerian Pidgin phrases like "No wahala" or "Sharp sharp" when it feels natural.
+
+What Zend can do:
+• 💰 Check wallet balance (SOL, USDT, USDC) — just say "balance" or tap 💰 Balance
+• 💵 Add Naira — deposit NGN via bank transfer to a virtual account, get USDT in your wallet
+• 📤 Send to any Nigerian bank account — just say "Send 50k to Tunde GTB 0123456789"
+• 📥 Receive crypto — share your Solana wallet address or virtual account
+• 🔄 Swap tokens — exchange SOL/USDT/USDC inside your wallet
+• 📋 View transaction history
+• 🎙️ Voice messages — send a voice note saying what you want to do
+
+Important rules:
+- Keep replies under 150 words (Telegram messages should be punchy).
+- If the user asks something you can't do, suggest the closest alternative.
+- If they ask about fees: 1% Zend fee + Solana gas (~0.001 SOL).
+- If they ask about security: wallets are encrypted, PAJ handles KYC.
+- If they greet you, greet back warmly and offer to help.
+- If they ask "what can you do", give a friendly summary of features.
+- If they ask "how do I send money", give a quick step-by-step.
+- Never make up features that don't exist (no airtime, no loans, no betting).
+- Always end by nudging them to try something: "Wanna check your balance?" or "Ready to send some money?"`;
+
+export interface ChatReply {
+  reply: string;
+  suggestedAction?: string;
+}
+
+/**
+ * Get a conversational reply from Kimi when the user's message is not a command.
+ */
+export async function chatWithKimi(text: string): Promise<ChatReply | null> {
+  if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
+    return null;
+  }
+
+  try {
+    const response = await fetch(`${KIMI_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${KIMI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'moonshot-v1-8k',
+        messages: [
+          { role: 'system', content: CHAT_SYSTEM_PROMPT },
+          { role: 'user', content: text },
+        ],
+        temperature: 0.7,
+        max_tokens: 400,
+      }),
+    });
+
+    if (!response.ok) {
+      console.error('[Chat] Kimi API error:', response.status);
+      return null;
+    }
+
+    const data: any = await response.json();
+    const reply = data.choices[0]?.message?.content?.trim();
+    
+    if (!reply) return null;
+
+    return { reply };
+  } catch (err) {
+    console.error('[Chat] Kimi chat failed:', err);
+    return null;
+  }
+}
+
 // ─── Voice Transcription ───
 
 /**

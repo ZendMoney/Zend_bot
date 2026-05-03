@@ -13,7 +13,7 @@ import { db, checkConnection } from '@zend/db';
 import { users, transactions } from '@zend/db';
 import { eq } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
-import { parseCommand, transcribeVoice, type ParsedCommand } from './services/nlp.js';
+import { parseCommand, transcribeVoice, chatWithKimi, type ParsedCommand } from './services/nlp.js';
 import type { PAJClient } from '@zend/paj-client';
 import {
   ConversationState,
@@ -965,10 +965,16 @@ bot.on(message('text'), async (ctx, next) => {
       }
 
       default: {
-        await ctx.reply(
-          `I didn't understand that. Try using the menu below or type a command like "Send 50k to Tunde GTB 0123456789".`,
-          mainMenu
-        );
+        // Try conversational AI for unknown intents
+        const aiReply = await chatWithKimi(text);
+        if (aiReply) {
+          await ctx.reply(aiReply.reply, mainMenu);
+        } else {
+          await ctx.reply(
+            `I didn't understand that. Try using the menu below or type a command like "Send 50k to Tunde GTB 0123456789".`,
+            mainMenu
+          );
+        }
       }
     }
   }
