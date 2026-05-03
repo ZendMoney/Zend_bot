@@ -1,0 +1,8 @@
+[phases.build]
+cmds = ["pnpm install"]
+
+[phases.setup]
+nixPkgs = ["nodejs_20"]
+
+[start]
+cmd = "pnpm exec tsx apps/bot/src/index.ts"
