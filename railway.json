@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "pnpm exec tsx apps/bot/src/index.ts",
+    "startCommand": "pnpm db:migrate && pnpm exec tsx apps/bot/src/index.ts",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }

@@ -5,4 +5,4 @@ cmds = ["pnpm install"]
 nixPkgs = ["nodejs_20"]
 
 [start]
-cmd = "pnpm exec tsx apps/bot/src/index.ts"
+cmd = "pnpm db:migrate && pnpm exec tsx apps/bot/src/index.ts"
