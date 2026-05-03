@@ -6,6 +6,10 @@
   "dependencies": {
     "@zend/db": "workspace:*",
     "@zend/shared": "workspace:*",
-    "@zend/solana": "workspace:*"
+    "@zend/solana": "workspace:*",
+    "@zend/paj-client": "workspace:*",
+    "telegraf": "^4.16.3",
+    "dotenv": "^16.4.7",
+    "bs58": "^6.0.0"
   }
 }

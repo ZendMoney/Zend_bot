@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@zend/db": "workspace:*"
+    "@zend/db": "workspace:*",
+    "hono": "^4.7.5",
+    "@hono/node-server": "^1.14.0",
+    "dotenv": "^16.4.7"
   }
 }

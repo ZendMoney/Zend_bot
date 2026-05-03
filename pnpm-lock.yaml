@@ -54,21 +54,42 @@ importers:
 
   apps/api:
     dependencies:
+      '@hono/node-server':
+        specifier: ^1.14.0
+        version: 1.19.14(hono@4.12.15)
       '@zend/db':
         specifier: workspace:*
         version: link:../../packages/db
+      dotenv:
+        specifier: ^16.4.7
+        version: 16.6.1
+      hono:
+        specifier: ^4.7.5
+        version: 4.12.15
 
   apps/bot:
     dependencies:
       '@zend/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@zend/paj-client':
+        specifier: workspace:*
+        version: link:../../packages/paj-client
       '@zend/shared':
         specifier: workspace:*
         version: link:../../packages/shared
       '@zend/solana':
         specifier: workspace:*
         version: link:../../packages/solana
+      bs58:
+        specifier: ^6.0.0
+        version: 6.0.0
+      dotenv:
+        specifier: ^16.4.7
+        version: 16.6.1
+      telegraf:
+        specifier: ^4.16.3
+        version: 4.16.3
 
   packages/db: {}
 
