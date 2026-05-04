@@ -54,6 +54,7 @@ interface ZendSession {
     recipientAccountName: string;
     recipientWalletAddress: string;
     zendFeeUsdt?: number;
+    ngnRate?: number;
   }>;
   pajContact?: string; // email/phone pending OTP
   onrampAmount?: number; // pending on-ramp amount in NGN
@@ -1444,6 +1445,7 @@ async function executeSend(
   txData: {
     amountNgn: number;
     amountUsdt: number;
+    ngnRate?: number;
     recipientBankCode?: string;
     recipientBankName?: string;
     recipientAccountNumber?: string;
@@ -1463,7 +1465,9 @@ async function executeSend(
     type: 'ngn_send',
     status: 'processing',
     ngnAmount: txData.amountNgn.toString(),
-    ngnRate: '1550',
+    ngnRate: (txData.ngnRate || 1550).toString(),
+    fromAmount: txData.amountUsdt.toString(),
+    fromMint: SOLANA_TOKENS.USDT.mint,
     recipientBankCode: finalBankCode,
     recipientBankName: finalBankName,
     recipientAccountNumber: finalAccountNumber,
@@ -1476,14 +1480,20 @@ async function executeSend(
     `⏳ *Processing...*\n\n` +
     `Sending ${txData.amountUsdt.toFixed(2)} USDT\n` +
     `Estimated: 1-5 minutes\n\n` +
-    `Reference: ${txId}`,
+    `Reference: \`${txId}\``,
     { parse_mode: 'Markdown' }
   );
+
+  let offRampRef = 'MOCK-' + Math.random().toString(36).substring(2, 8).toUpperCase();
+  let solanaTxHash: string | undefined;
 
   try {
     await ctx.replyWithChatAction('typing');
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-    let offRampRef = 'MOCK-' + Math.random().toString(36).substring(2, 8).toUpperCase();
+
+    if (user.length === 0 || !user[0].walletEncryptedKey) {
+      throw new Error('User wallet not found');
+    }
 
     const pajClient = await getPAJClient();
     if (pajClient && user[0].pajSessionToken) {
@@ -1497,6 +1507,11 @@ async function executeSend(
       if (!pajBank) {
         throw new Error(`Bank "${ourBank?.name}" not found on PAJ`);
       }
+
+      // Create PAJ off-ramp order
+      const webhookUrl = process.env.WEBHOOK_BASE_URL
+        ? `${process.env.WEBHOOK_BASE_URL}/webhooks/paj`
+        : 'https://example.com/webhook';
       const order = await pajClient.createOfframp({
         bank: pajBank.id,
         accountNumber: finalAccountNumber,
@@ -1504,16 +1519,40 @@ async function executeSend(
         fiatAmount: txData.amountNgn,
         mint: SOLANA_TOKENS.USDT.mint,
         chain: Chain.SOLANA,
-      }, user[0].pajSessionToken);
+        webhookURL: webhookUrl,
+      } as any, user[0].pajSessionToken);
 
       offRampRef = order.id;
-      console.log('[PAJ] Off-ramp order created:', order.id);
+      console.log('[PAJ] Off-ramp order created:', order.id, 'deposit address:', order.address, 'amount:', order.amount);
+
+      // ─── Send USDT to PAJ deposit address ───
+      await ctx.replyWithChatAction('typing');
+      const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, 0.001);
+      if (!hasGas) {
+        throw new Error('Insufficient SOL for gas. Please deposit at least 0.001 SOL.');
+      }
+
+      const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
+      const keypair = Keypair.fromSecretKey(secretKey);
+
+      solanaTxHash = await walletService.sendUsdt(
+        keypair,
+        order.address,
+        order.amount
+      );
+      console.log('[Solana] USDT sent to PAJ:', solanaTxHash);
+
+      await db.update(transactions)
+        .set({ solanaTxHash, pajReference: offRampRef })
+        .where(eq(transactions.id, txId));
+    } else {
+      // No PAJ — just record mock
+      await db.update(transactions)
+        .set({ pajReference: offRampRef })
+        .where(eq(transactions.id, txId));
     }
 
-    await db.update(transactions)
-      .set({ pajReference: offRampRef })
-      .where(eq(transactions.id, txId));
-
+    // Simulate completion (in production, webhook updates this)
     setTimeout(async () => {
       await db.update(transactions)
         .set({ status: 'completed', completedAt: new Date() })
@@ -1523,8 +1562,9 @@ async function executeSend(
         `✅ *Transfer Complete!*\n\n` +
         `${formatNgn(txData.amountNgn)} sent to ${finalAccountName}\n` +
         `${finalBankName} • \`${finalAccountNumber}\`\n\n` +
-        `Reference: ${txId}\n` +
-        `PAJ Ref: ${offRampRef}\n` +
+        `Reference: \`${txId}\`\n` +
+        `PAJ Ref: \`${offRampRef}\`\n` +
+        (solanaTxHash ? `Tx: \`https://solscan.io/tx/${solanaTxHash}\`\n` : '') +
         `Time: ~2 minutes`,
         { parse_mode: 'Markdown', ...mainMenu }
       );
@@ -1555,12 +1595,13 @@ bot.action('confirm_send', async (ctx) => {
     return;
   }
 
-  const { amountNgn, amountUsdt, recipientBankCode, recipientBankName, recipientAccountNumber, recipientAccountName, recipientName } =
+  const { amountNgn, amountUsdt, ngnRate, recipientBankCode, recipientBankName, recipientAccountNumber, recipientAccountName, recipientName } =
     session.pendingTransaction;
 
   await executeSend(ctx, userId, {
     amountNgn: amountNgn!,
     amountUsdt: amountUsdt!,
+    ngnRate,
     recipientBankCode,
     recipientBankName,
     recipientAccountNumber,
@@ -1627,6 +1668,7 @@ async function prepareSendConfirmation(
     amountNgn,
     amountUsdt: usdtNeeded,
     zendFeeUsdt,
+    ngnRate: rate,
     recipientName: verifiedName,
     recipientAccountName: verifiedName,
     recipientBankName: bankName,
