@@ -1258,9 +1258,19 @@ bot.action('confirm_send', async (ctx) => {
     const pajClient = await getPAJClient();
     if (pajClient && user[0].pajSessionToken) {
       await ctx.replyWithChatAction('typing');
+      // Map our bank code → PAJ MongoDB bank ID
+      const pajBanks = await getPajBankList(user[0].pajSessionToken);
+      const ourBank = NIGERIAN_BANKS.find(b => b.code === finalBankCode);
+      const pajBank = pajBanks.find(pb =>
+        pb.name.toLowerCase().includes(ourBank?.name.toLowerCase() || '') ||
+        (ourBank?.name.toLowerCase() || '').includes(pb.name.toLowerCase())
+      );
+      if (!pajBank) {
+        throw new Error(`Bank "${ourBank?.name}" not found on PAJ`);
+      }
       // Real PAJ off-ramp
       const order = await pajClient.createOfframp({
-        bank: finalBankCode,
+        bank: pajBank.id,
         accountNumber: finalAccountNumber,
         currency: Currency.NGN,
         fiatAmount: amountNgn!,
@@ -1527,35 +1537,46 @@ bot.hears('📋 History', async (ctx) => {
 
 bot.hears('⚙️ Settings', async (ctx) => {
   const userId = ctx.from.id.toString();
-  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  const loading = await showLoading(ctx, 'Loading settings...');
 
-  if (user.length === 0) {
-    await ctx.reply('Please run /start first.', mainMenu);
-    return;
-  }
+  try {
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
 
-  const u = user[0];
+    if (user.length === 0) {
+      await finishLoading(ctx, loading.message_id, 'Please run /start first.');
+      await ctx.reply('Menu:', mainMenu);
+      return;
+    }
 
-  await ctx.reply(
-    `⚙️ *Settings*\n\n` +
-    `👤 *Profile*\n` +
-    `Name: ${u.firstName} ${u.lastName || ''}\n` +
-    `Wallet: \`${u.walletAddress.slice(0, 6)}...${u.walletAddress.slice(-4)}\`\n\n` +
-    `🔐 *Security*\n` +
-    `Email: ${u.email || 'Not set'} ${u.emailVerified ? '✓' : ''}\n` +
-    `PAJ: ${u.pajSessionToken ? '✅ Linked' : '❌ Not linked'}\n` +
-    `PIN: ${u.transactionPin ? 'Set' : 'Not set'}\n\n` +
-    `💰 *Preferences*\n` +
-    `Auto-save: ${u.autoSaveRateBps > 0 ? (u.autoSaveRateBps / 100).toFixed(0) + '%' : 'Off'}`,
-    {
+    const u = user[0];
+    const autoSave = (u.autoSaveRateBps || 0) > 0 ? (u.autoSaveRateBps / 100).toFixed(0) + '%' : 'Off';
+
+    const msg =
+      `⚙️ *Settings*\n\n` +
+      `👤 *Profile*\n` +
+      `Name: ${u.firstName} ${u.lastName || ''}\n` +
+      `Wallet: \`${u.walletAddress.slice(0, 6)}...${u.walletAddress.slice(-4)}\`\n\n` +
+      `🔐 *Security*\n` +
+      `Email: ${u.email || 'Not set'} ${u.emailVerified ? '✓' : ''}\n` +
+      `PAJ: ${u.pajSessionToken ? '✅ Linked' : '❌ Not linked'}\n` +
+      `PIN: ${u.transactionPin ? 'Set' : 'Not set'}\n\n` +
+      `💰 *Preferences*\n` +
+      `Auto-save: ${autoSave}`;
+
+    await finishLoading(ctx, loading.message_id, msg, 'Markdown');
+    await ctx.reply('Menu:', {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
         [Markup.button.callback('📧 Add Email', 'settings_email')],
         [Markup.button.callback('🔗 Link PAJ', 'settings_paj')],
         [Markup.button.callback('🔢 Set PIN', 'settings_pin')],
       ]),
-    }
-  );
+    });
+  } catch (err) {
+    console.error('Settings error:', err);
+    await finishLoading(ctx, loading.message_id, '❌ Could not load settings. Please try again.');
+    await ctx.reply('Menu:', mainMenu);
+  }
 });
 
 bot.action('settings_paj', async (ctx) => {
