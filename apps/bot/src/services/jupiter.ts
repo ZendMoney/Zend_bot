@@ -44,13 +44,12 @@ export async function getSwapQuote(
     url.searchParams.set('outputMint', outputMint);
     url.searchParams.set('amount', amount.toString());
     url.searchParams.set('slippageBps', slippageBps.toString());
-    url.searchParams.set('onlyDirectRoutes', 'false');
-    url.searchParams.set('asLegacyTransaction', 'false');
+    // Restricted params removed — may cause 400 on some Jupiter deployments
 
     const response = await fetch(url.toString());
     if (!response.ok) {
-      const error = await response.text();
-      console.error('[Jupiter] Quote failed:', error);
+      const errorText = await response.text().catch(() => '');
+      console.error(`[Jupiter] Quote failed: status=${response.status} body=${errorText.slice(0, 500)} url=${url.toString()}`);
       return null;
     }
 
@@ -106,13 +105,13 @@ export async function buildSwapTransaction(
 
     const response = await fetch(`${JUPITER_API}/swap`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'ZendBot/1.0' },
       body: JSON.stringify(body),
     });
 
     if (!response.ok) {
-      const error = await response.text();
-      console.error('[Jupiter] Build swap failed:', error);
+      const errorText = await response.text().catch(() => '');
+      console.error(`[Jupiter] Build swap failed: status=${response.status} body=${errorText.slice(0, 500)}`);
       return null;
     }
 

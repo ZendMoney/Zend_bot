@@ -12,6 +12,7 @@ export interface ParsedCommand {
   intent: 'send' | 'add_naira' | 'cash_out' | 'balance' | 'unknown';
   amount?: number;
   currency?: 'NGN' | 'USDT' | 'SOL';
+  fromToken?: 'USDT' | 'USDC' | 'SOL';
   recipientName?: string;
   bankName?: string;
   bankCode?: string;
@@ -232,6 +233,16 @@ function detectIntent(text: string): ParsedCommand['intent'] {
   return 'unknown';
 }
 
+function extractFromToken(text: string): ParsedCommand['fromToken'] {
+  const lower = text.toLowerCase();
+  if (/\b(from\s+usdc|using\s+usdc|with\s+usdc|usdc\s+bal|my\s+usdc)\b/.test(lower)) return 'USDC';
+  if (/\b(from\s+sol|using\s+sol|with\s+sol|sol\s+bal|my\s+sol)\b/.test(lower)) return 'SOL';
+  if (/\b(from\s+usdt|using\s+usdt|with\s+usdt|usdt\s+bal|my\s+usdt)\b/.test(lower)) return 'USDT';
+  // Generic mention of USDC without "from"
+  if (/\busdc\b/.test(lower) && !/\busdt\b/.test(lower)) return 'USDC';
+  return undefined;
+}
+
 /**
  * Parse natural language command locally (fast, no API call)
  */
@@ -242,11 +253,13 @@ export function parseLocal(text: string): ParsedCommand {
   const accountNumber = extractAccountNumber(text);
   const walletAddress = extractWalletAddress(text);
   const recipientName = extractRecipientName(text, bank?.name, accountNumber);
+  const fromToken = extractFromToken(text);
 
   return {
     intent,
     amount,
     currency: amount ? 'NGN' : undefined,
+    fromToken,
     recipientName,
     bankName: bank?.name,
     bankCode: bank?.code,
@@ -327,9 +340,10 @@ Extract the following from user messages:
 - amount: number (always in NGN, convert "50k" to 50000)
 - recipientName: person or business name
 - bankName: full bank name
-- bankCode: one of: GTB, FIRST, UBA, ZENITH, ACCESS, ECOBANK, FIDELITY, FCMB, WEMA, POLARIS, STERLING, UNITY, JAIZ, KEYSTONE, HERITAGE, STANBIC, UNION, OPAY, KUDA, PALMPAY, MONIEPOINT, PAGA, VFD, CARBON, FAIRMONEY, BRANCH
+- bankCode: one of: GTB, FIRST, UBA, ZENITH, ACCESS, ECOBANK, FIDELITY, FCMB, WEMA, POLARIS, STERLING, UNITY, JAIZ, KEYSTONE, HERITAGE, STANBIC, UNION, OPY, KUD, PAL, MON, PAG, VFD, CAR, FAI, BRA
 - accountNumber: 10 digit Nigerian bank account number
 - walletAddress: Solana wallet address (32-44 chars)
+- fromToken: "USDT" | "USDC" | "SOL" — the crypto token user wants to send FROM. Default USDT unless they mention USDC or SOL.
 
 Respond ONLY with valid JSON. No markdown, no explanation.`;
 
@@ -352,6 +366,7 @@ export async function parseWithKimi(text: string): Promise<ParsedCommand> {
       intent: parsed.intent || 'unknown',
       amount: parsed.amount ? Number(parsed.amount) : undefined,
       currency: parsed.currency || 'NGN',
+      fromToken: parsed.fromToken || extractFromToken(text),
       recipientName: parsed.recipientName,
       bankName: parsed.bankName,
       bankCode: parsed.bankCode,

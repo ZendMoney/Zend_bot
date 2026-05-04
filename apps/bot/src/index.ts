@@ -859,28 +859,107 @@ bot.on(message('text'), async (ctx, next) => {
     const parts = text.trim().split(/\s+/);
     if (parts.length < 3) {
       await ctx.reply(
-        '❌ Please use format: "Name BankCode AccountNumber"\n' +
-        'Example: "Tunde GTB 0123456789"',
+        '❌ Please use format: "Name Bank AccountNumber"\n' +
+        'Examples:\n"Tunde GTB 0123456789"\n"Amaka Opay 0123456789"',
         cancelKeyboard
       );
       return;
     }
 
-    const accountNumber = parts[parts.length - 1];
-    const bankCode = parts[parts.length - 2].toUpperCase();
-    const accountName = parts.slice(0, -2).join(' ');
+    // Smart parsing: find 10-digit account number and bank code anywhere in the input
+    let accountNumber: string | undefined;
+    let bankCode: string | undefined;
+    let accountName: string | undefined;
 
-    const bank = NIGERIAN_BANKS.find(b => b.code === bankCode);
-    if (!bank) {
+    // Try to find a 10-digit number
+    for (let i = 0; i < parts.length; i++) {
+      if (/^\d{10}$/.test(parts[i])) {
+        accountNumber = parts[i];
+        // Try the part before it as bank code
+        if (i > 0) {
+          const candidate = parts[i - 1].toUpperCase();
+          const bank = NIGERIAN_BANKS.find(b => b.code === candidate);
+          if (bank) {
+            bankCode = candidate;
+            accountName = parts.slice(0, i - 1).join(' ');
+            break;
+          }
+        }
+        // Try the part after it as bank code
+        if (i < parts.length - 1 && !bankCode) {
+          const candidate = parts[i + 1].toUpperCase();
+          const bank = NIGERIAN_BANKS.find(b => b.code === candidate);
+          if (bank) {
+            bankCode = candidate;
+            accountName = parts.slice(0, i).join(' ');
+            break;
+          }
+        }
+      }
+    }
+
+    // Fallback: try bank name/alias matching on any part
+    if (!bankCode) {
+      const BANK_NAME_ALIASES: Record<string, string[]> = {
+        'GTB': ['gtb', 'gtbank', 'guaranty trust bank'],
+        'FBN': ['first bank', 'fbn', 'firstbank'],
+        'UBA': ['uba'],
+        'ZEN': ['zenith', 'zenith bank'],
+        'ACC': ['access', 'access bank'],
+        'ECO': ['ecobank', 'eco bank'],
+        'WEM': ['wema', 'wema bank'],
+        'FID': ['fidelity', 'fidelity bank'],
+        'SKY': ['polaris', 'polaris bank', 'skye'],
+        'FCMB': ['fcmb', 'first city'],
+        'STERLING': ['sterling', 'sterling bank'],
+        'STA': ['stanbic', 'stanbic ibtc'],
+        'UNI': ['union', 'union bank'],
+        'KEC': ['keystone', 'keystone bank'],
+        'JAB': ['jaiz', 'jaiz bank'],
+        'OPY': ['opay', 'o pay'],
+        'MON': ['moniepoint', 'monie point'],
+        'KUD': ['kuda', 'kuda bank'],
+        'PAL': ['palmpay', 'palm pay'],
+        'PAG': ['paga', 'paga bank'],
+        'VFD': ['vfd'],
+        'CAR': ['carbon', 'carbon bank'],
+        'FAI': ['fairmoney', 'fair money'],
+        'BRA': ['branch', 'branch bank'],
+      };
+
+      for (let i = 0; i < parts.length; i++) {
+        const partLower = parts[i].toLowerCase();
+        for (const [code, aliases] of Object.entries(BANK_NAME_ALIASES)) {
+          if (aliases.includes(partLower) || partLower === code.toLowerCase()) {
+            bankCode = code;
+            // Find account number (10 digits) in remaining parts
+            for (let j = 0; j < parts.length; j++) {
+              if (j !== i && /^\d{10}$/.test(parts[j])) {
+                accountNumber = parts[j];
+                break;
+              }
+            }
+            // Name is everything except bank and account number
+            accountName = parts.filter((_, idx) => idx !== i && parts[idx] !== accountNumber).join(' ');
+            break;
+          }
+        }
+        if (bankCode) break;
+      }
+    }
+
+    if (!bankCode) {
       const bankList = NIGERIAN_BANKS.map(b => `${b.code} = ${b.name}`).join('\n');
-      await ctx.reply(`❌ Unknown bank code: ${bankCode}\n\nSupported banks:\n${bankList}`, cancelKeyboard);
+      await ctx.reply(`❌ Could not recognize the bank.\n\nPlease use a bank name or code:\n${bankList}`, cancelKeyboard);
       return;
     }
 
-    if (!/^\d{10}$/.test(accountNumber)) {
-      await ctx.reply('❌ Account number must be exactly 10 digits.', cancelKeyboard);
+    if (!accountNumber) {
+      await ctx.reply('❌ Could not find a 10-digit account number. Please check and try again.', cancelKeyboard);
       return;
     }
+
+    const bank = NIGERIAN_BANKS.find(b => b.code === bankCode)!;
 
     // ─── Verify bank account with PAJ ───
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
@@ -926,13 +1005,15 @@ bot.on(message('text'), async (ctx, next) => {
       ? `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${session.pendingTransaction.zendFeeUsdt.toFixed(4)} USDT\n`
       : '';
 
+    const menuFromMint = session.pendingTransaction?.fromMint || SOLANA_TOKENS.USDT.mint;
+    const menuFromToken = Object.values(SOLANA_TOKENS).find(t => t.mint === menuFromMint) || SOLANA_TOKENS.USDT;
     confirmMsg += `\n` +
       `Amount: *${formatNgn(amountNgn!)}*\n` +
       `To: *${verifiedName}*\n` +
       `Bank: *${bank.name}*\n` +
       `Account: \`${accountNumber}\`\n\n` +
       feeLine +
-      `You pay: *${amountUsdt!.toFixed(2)} USDT*\n` +
+      `You pay: *${amountUsdt!.toFixed(2)} ${menuFromToken.symbol}*\n` +
       `💡 *Gas: ~0.001 SOL* (deducted from your wallet)\n\n` +
       `━━━━━━━━━━━━━━━━━━━━`;
 
@@ -1058,10 +1139,16 @@ bot.on(message('text'), async (ctx, next) => {
           verifiedStatus = 'no_paj';
         }
 
+        const fromMint = parsed.fromToken === 'USDC' ? SOLANA_TOKENS.USDC.mint :
+                           parsed.fromToken === 'SOL' ? SOLANA_TOKENS.SOL.mint :
+                           SOLANA_TOKENS.USDT.mint;
+        const fromTokenInfo = Object.values(SOLANA_TOKENS).find(t => t.mint === fromMint) || SOLANA_TOKENS.USDT;
+
         session.pendingTransaction = {
           amountNgn: parsed.amount,
           amountUsdt: usdtNeeded,
           zendFeeUsdt,
+          fromMint,
           recipientName: verifiedName,
           recipientAccountName: verifiedName,
           recipientBankName: parsed.bankName,
@@ -1082,13 +1169,14 @@ bot.on(message('text'), async (ctx, next) => {
           msg += `⚠️ *Could not verify account* — please double-check details\n`;
         }
 
+        const fromSymbol = fromTokenInfo.symbol;
         msg += `\n` +
           `To: *${verifiedName || 'Recipient'}*\n` +
           `Bank: ${parsed.bankName || 'Solana'}\n` +
           `Account: \`${parsed.accountNumber || parsed.walletAddress}\`\n` +
           `Amount: ${formatNgn(parsed.amount)}\n` +
           `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${zendFeeUsdt.toFixed(4)} USDT\n` +
-          `You pay: *${usdtNeeded.toFixed(2)} USDT*\n` +
+          `You pay: *${usdtNeeded.toFixed(2)} ${fromSymbol}*\n` +
           `Rate: ${formatNgn(rate)}/USDT\n\n` +
           `💡 *Gas: ~0.001 SOL* (deducted from your wallet)\n\n` +
           `Confirm?`;
@@ -1352,7 +1440,8 @@ bot.on(message('voice'), async (ctx) => {
         await prepareSendConfirmation(
           ctx, userId, analysis.amount,
           analysis.accountNumber, bank.code, bank.name,
-          analysis.recipientName || undefined
+          analysis.recipientName || undefined,
+          undefined // voice flow defaults to USDT for now
         );
         return;
       }
@@ -1413,7 +1502,8 @@ bot.action('voice_confirm_yes', async (ctx) => {
       await prepareSendConfirmation(
         ctx, userId, va.amount,
         va.accountNumber, bank.code, bank.name,
-        va.recipientName || undefined
+        va.recipientName || undefined,
+        undefined // voice flow defaults to USDT for now
       );
       return;
     }
@@ -1587,6 +1677,7 @@ async function executeSend(
     amountUsdt: number;
     ngnRate?: number;
     zendFeeUsdt?: number;
+    fromMint?: string;
     recipientBankCode?: string;
     recipientBankName?: string;
     recipientAccountNumber?: string;
@@ -1594,6 +1685,9 @@ async function executeSend(
     recipientName?: string;
   }
 ) {
+  const fromMint = txData.fromMint || SOLANA_TOKENS.USDT.mint;
+  const fromToken = Object.values(SOLANA_TOKENS).find(t => t.mint === fromMint) || SOLANA_TOKENS.USDT;
+  const fromSymbol = fromToken.symbol;
   const finalAccountName = txData.recipientAccountName || txData.recipientName || 'Recipient';
   const finalBankName = txData.recipientBankName || 'Unknown';
   const finalBankCode = txData.recipientBankCode || 'UNKNOWN';
@@ -1609,7 +1703,7 @@ async function executeSend(
     ngnAmount: txData.amountNgn.toString(),
     ngnRate: (txData.ngnRate || 1550).toString(),
     fromAmount: txData.amountUsdt.toString(),
-    fromMint: SOLANA_TOKENS.USDT.mint,
+    fromMint: fromMint,
     zendFeeUsdt: feeUsdt.toString(),
     recipientBankCode: finalBankCode,
     recipientBankName: finalBankName,
@@ -1621,7 +1715,7 @@ async function executeSend(
 
   await ctx.editMessageText(
     `⏳ *Processing...*\n\n` +
-    `Sending ${txData.amountUsdt.toFixed(2)} USDT\n` +
+    `Sending ${txData.amountUsdt.toFixed(2)} ${fromSymbol}\n` +
     `Estimated: 1-5 minutes\n\n` +
     `Reference: \`${txId}\``,
     { parse_mode: 'Markdown' }
@@ -1660,7 +1754,7 @@ async function executeSend(
         accountNumber: finalAccountNumber,
         currency: Currency.NGN,
         fiatAmount: txData.amountNgn,
-        mint: SOLANA_TOKENS.USDT.mint,
+        mint: fromMint,
         chain: Chain.SOLANA,
         webhookURL: webhookUrl,
       } as any, user[0].pajSessionToken);
@@ -1668,18 +1762,18 @@ async function executeSend(
       offRampRef = order.id;
       console.log('[PAJ] Off-ramp order created:', order.id, 'deposit address:', order.address, 'amount:', order.amount);
 
-      // ─── Check user has enough USDT ───
+      // ─── Check user has enough of the selected token ───
       await ctx.replyWithChatAction('typing');
-      let usdtBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
+      let tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, fromMint);
 
-      // ─── Auto-swap USDC → USDT if needed ───
-      if (usdtBalance < order.amount) {
+      // ─── Auto-swap USDC → USDT if sending USDT but only have USDC ───
+      if (fromMint === SOLANA_TOKENS.USDT.mint && tokenBalance < order.amount) {
         const usdcBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDC.mint);
 
         if (usdcBalance >= order.amount) {
           await ctx.editMessageText(
             `⏳ *Processing...*\n\n` +
-            `You have ${usdcBalance.toFixed(2)} USDC but only ${usdtBalance.toFixed(2)} USDT.\n` +
+            `You have ${usdcBalance.toFixed(2)} USDC but only ${tokenBalance.toFixed(2)} USDT.\n` +
             `Swapping USDC → USDT via Jupiter...`,
             { parse_mode: 'Markdown' }
           );
@@ -1697,7 +1791,7 @@ async function executeSend(
           if (!quote) {
             throw new Error(
               `Insufficient USDT balance.\n\n` +
-              `You have: ${usdtBalance.toFixed(2)} USDT\n` +
+              `You have: ${tokenBalance.toFixed(2)} USDT\n` +
               `Required: ${order.amount.toFixed(2)} USDT\n\n` +
               `You also have ${usdcBalance.toFixed(2)} USDC, but the swap route is currently unavailable. ` +
               `Please deposit USDT or try again later.`
@@ -1739,16 +1833,16 @@ async function executeSend(
           });
 
           // Re-check USDT balance after swap
-          usdtBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
+          tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
         }
       }
 
-      if (usdtBalance < order.amount) {
+      if (tokenBalance < order.amount) {
         throw new Error(
-          `Insufficient USDT balance.\n\n` +
-          `You have: ${usdtBalance.toFixed(2)} USDT\n` +
-          `Required: ${order.amount.toFixed(2)} USDT\n\n` +
-          `Please deposit USDT to your wallet first.\n` +
+          `Insufficient ${fromSymbol} balance.\n\n` +
+          `You have: ${tokenBalance.toFixed(2)} ${fromSymbol}\n` +
+          `Required: ${order.amount.toFixed(2)} ${fromSymbol}\n\n` +
+          `Please deposit ${fromSymbol} to your wallet first.\n` +
           `Wallet: \`${user[0].walletAddress}\``
         );
       }
@@ -1762,20 +1856,22 @@ async function executeSend(
       const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
       const keypair = Keypair.fromSecretKey(secretKey);
 
-      solanaTxHash = await walletService.sendUsdt(
+      solanaTxHash = await walletService.sendSplToken(
         keypair,
         order.address,
-        order.amount
+        fromMint,
+        order.amount,
+        fromToken.decimals
       );
-      console.log('[Solana] USDT sent to PAJ:', solanaTxHash);
+      console.log(`[Solana] ${fromSymbol} sent to PAJ:`, solanaTxHash);
 
       // ─── Collect Zend fee ───
       const feeWallet = process.env.ZEND_FEE_WALLET;
       let feeTxHash: string | undefined;
       if (feeWallet && feeUsdt > 0) {
         try {
-          feeTxHash = await walletService.sendUsdt(keypair, feeWallet, feeUsdt);
-          console.log('[Solana] Zend fee collected:', feeUsdt, 'USDT →', feeWallet, 'tx:', feeTxHash);
+          feeTxHash = await walletService.sendSplToken(keypair, feeWallet, fromMint, feeUsdt, fromToken.decimals);
+          console.log(`[Solana] Zend fee collected:`, feeUsdt, `${fromSymbol} →`, feeWallet, 'tx:', feeTxHash);
         } catch (feeErr: any) {
           console.error('[Solana] Fee collection failed (non-critical):', feeErr.message);
         }
@@ -1834,7 +1930,7 @@ bot.action('confirm_send', async (ctx) => {
     return;
   }
 
-  const { amountNgn, amountUsdt, ngnRate, zendFeeUsdt, recipientBankCode, recipientBankName, recipientAccountNumber, recipientAccountName, recipientName } =
+  const { amountNgn, amountUsdt, ngnRate, zendFeeUsdt, fromMint, recipientBankCode, recipientBankName, recipientAccountNumber, recipientAccountName, recipientName } =
     session.pendingTransaction;
 
   await executeSend(ctx, userId, {
@@ -1842,6 +1938,7 @@ bot.action('confirm_send', async (ctx) => {
     amountUsdt: amountUsdt!,
     ngnRate,
     zendFeeUsdt,
+    fromMint,
     recipientBankCode,
     recipientBankName,
     recipientAccountNumber,
@@ -1869,8 +1966,12 @@ async function prepareSendConfirmation(
   recipientAccountNumber: string,
   bankCode: string,
   bankName: string,
-  recipientName?: string
+  recipientName?: string,
+  fromMint?: string
 ) {
+  const selectedMint = fromMint || SOLANA_TOKENS.USDT.mint;
+  const selectedToken = Object.values(SOLANA_TOKENS).find(t => t.mint === selectedMint) || SOLANA_TOKENS.USDT;
+  const selectedSymbol = selectedToken.symbol;
   const pajClient = await getPAJClient();
   let rate = 1550;
   try {
@@ -1909,6 +2010,7 @@ async function prepareSendConfirmation(
     amountUsdt: usdtNeeded,
     zendFeeUsdt,
     ngnRate: rate,
+    fromMint: selectedMint,
     recipientName: verifiedName,
     recipientAccountName: verifiedName,
     recipientBankName: bankName,
@@ -1934,7 +2036,7 @@ async function prepareSendConfirmation(
     `Account: \`${recipientAccountNumber}\`\n` +
     `Amount: ${formatNgn(amountNgn)}\n` +
     `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${zendFeeUsdt.toFixed(4)} USDT\n` +
-    `You pay: *${usdtNeeded.toFixed(2)} USDT*\n` +
+    `You pay: *${usdtNeeded.toFixed(2)} ${selectedSymbol}*\n` +
     `Rate: ${formatNgn(rate)}/USDT\n\n` +
     `💡 *Gas: ~0.001 SOL* (deducted from your wallet)\n\n` +
     `Confirm?`;
@@ -1969,8 +2071,8 @@ bot.action(/nlp_bank:(.+)/, async (ctx) => {
     return;
   }
 
-  const { amountNgn, recipientName, recipientAccountNumber } = session.pendingTransaction;
-  await prepareSendConfirmation(ctx, userId, amountNgn!, recipientAccountNumber!, bank.code, bank.name, recipientName || undefined);
+  const { amountNgn, recipientName, recipientAccountNumber, fromMint } = session.pendingTransaction;
+  await prepareSendConfirmation(ctx, userId, amountNgn!, recipientAccountNumber!, bank.code, bank.name, recipientName || undefined, fromMint);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
