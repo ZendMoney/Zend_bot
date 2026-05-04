@@ -5,7 +5,33 @@
 
 import { SOLANA_TOKENS } from '@zend/shared';
 
-const JUPITER_API = 'https://api.jup.ag/v6';
+const JUPITER_API_V1 = 'https://api.jup.ag/swap/v1';
+const JUPITER_API_V6 = 'https://api.jup.ag/v6';
+
+async function fetchJupiterQuote(
+  baseUrl: string,
+  inputMint: string,
+  outputMint: string,
+  amount: number,
+  slippageBps: number
+): Promise<any> {
+  const url = new URL(`${baseUrl}/quote`);
+  url.searchParams.set('inputMint', inputMint);
+  url.searchParams.set('outputMint', outputMint);
+  url.searchParams.set('amount', amount.toString());
+  url.searchParams.set('slippageBps', slippageBps.toString());
+
+  const response = await fetch(url.toString(), {
+    headers: { 'User-Agent': 'ZendBot/1.0' },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '');
+    throw new Error(`status=${response.status} body=${errorText.slice(0, 500)}`);
+  }
+
+  return response.json();
+}
 
 export interface SwapQuote {
   inputMint: string;
@@ -32,44 +58,45 @@ export interface SwapResult {
 /**
  * Get a swap quote from Jupiter
  */
+function normalizeQuote(data: any): SwapQuote {
+  return {
+    inputMint: data.inputMint,
+    outputMint: data.outputMint,
+    inAmount: Number(data.inAmount),
+    outAmount: Number(data.outAmount),
+    otherAmountThreshold: Number(data.otherAmountThreshold),
+    swapMode: data.swapMode,
+    slippageBps: data.slippageBps,
+    platformFee: data.platformFee ?? null,
+    priceImpactPct: Number(data.priceImpactPct),
+    routePlan: data.routePlan,
+    contextSlot: data.contextSlot,
+    timeTaken: data.timeTaken,
+  };
+}
+
 export async function getSwapQuote(
   inputMint: string,
   outputMint: string,
-  amount: number, // in base units (lamports for SOL, micro-tokens for USDT/USDC)
-  slippageBps: number = 50 // 0.5% default
+  amount: number,
+  slippageBps: number = 50
 ): Promise<SwapQuote | null> {
+  // Try v1 API first (current Jupiter recommendation)
   try {
-    const url = new URL(`${JUPITER_API}/quote`);
-    url.searchParams.set('inputMint', inputMint);
-    url.searchParams.set('outputMint', outputMint);
-    url.searchParams.set('amount', amount.toString());
-    url.searchParams.set('slippageBps', slippageBps.toString());
-    // Restricted params removed — may cause 400 on some Jupiter deployments
+    const data = await fetchJupiterQuote(JUPITER_API_V1, inputMint, outputMint, amount, slippageBps);
+    console.log('[Jupiter] v1 quote success:', data.outputMint, 'outAmount:', data.outAmount);
+    return normalizeQuote(data);
+  } catch (v1Err: any) {
+    console.log(`[Jupiter] v1 quote failed: ${v1Err.message}. Trying v6 fallback...`);
+  }
 
-    const response = await fetch(url.toString());
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => '');
-      console.error(`[Jupiter] Quote failed: status=${response.status} body=${errorText.slice(0, 500)} url=${url.toString()}`);
-      return null;
-    }
-
-    const data = await response.json() as any;
-    return {
-      inputMint: data.inputMint,
-      outputMint: data.outputMint,
-      inAmount: Number(data.inAmount),
-      outAmount: Number(data.outAmount),
-      otherAmountThreshold: Number(data.otherAmountThreshold),
-      swapMode: data.swapMode,
-      slippageBps: data.slippageBps,
-      platformFee: data.platformFee,
-      priceImpactPct: Number(data.priceImpactPct),
-      routePlan: data.routePlan,
-      contextSlot: data.contextSlot,
-      timeTaken: data.timeTaken,
-    };
-  } catch (err) {
-    console.error('[Jupiter] Quote error:', err);
+  // Fallback to v6 API
+  try {
+    const data = await fetchJupiterQuote(JUPITER_API_V6, inputMint, outputMint, amount, slippageBps);
+    console.log('[Jupiter] v6 quote success:', data.outputMint, 'outAmount:', data.outAmount);
+    return normalizeQuote(data);
+  } catch (v6Err: any) {
+    console.error(`[Jupiter] v6 quote also failed: ${v6Err.message}`);
     return null;
   }
 }
@@ -103,7 +130,8 @@ export async function buildSwapTransaction(
       body.feeAccount = feeAccount;
     }
 
-    const response = await fetch(`${JUPITER_API}/swap`, {
+    // Try v1 API first
+    let response = await fetch(`${JUPITER_API_V1}/swap`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'User-Agent': 'ZendBot/1.0' },
       body: JSON.stringify(body),
@@ -111,8 +139,20 @@ export async function buildSwapTransaction(
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => '');
-      console.error(`[Jupiter] Build swap failed: status=${response.status} body=${errorText.slice(0, 500)}`);
-      return null;
+      console.log(`[Jupiter] v1 build swap failed: status=${response.status} body=${errorText.slice(0, 500)}. Trying v6 fallback...`);
+
+      // Fallback to v6
+      response = await fetch(`${JUPITER_API_V6}/swap`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'ZendBot/1.0' },
+        body: JSON.stringify(body),
+      });
+
+      if (!response.ok) {
+        const v6ErrorText = await response.text().catch(() => '');
+        console.error(`[Jupiter] v6 build swap also failed: status=${response.status} body=${v6ErrorText.slice(0, 500)}`);
+        return null;
+      }
     }
 
     const data = await response.json() as any;
