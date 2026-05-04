@@ -4,12 +4,13 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@deepgram/sdk": "^5.1.0",
     "@zend/db": "workspace:*",
+    "@zend/paj-client": "workspace:*",
     "@zend/shared": "workspace:*",
     "@zend/solana": "workspace:*",
-    "@zend/paj-client": "workspace:*",
-    "telegraf": "^4.16.3",
+    "bs58": "^6.0.0",
     "dotenv": "^16.4.7",
-    "bs58": "^6.0.0"
+    "telegraf": "^4.16.3"
   }
 }

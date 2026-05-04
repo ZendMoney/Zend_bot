@@ -13,7 +13,7 @@ import { db, checkConnection } from '@zend/db';
 import { users, transactions } from '@zend/db';
 import { eq } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
-import { parseCommand, transcribeVoice, chatWithKimi, type ParsedCommand } from './services/nlp.js';
+import { parseCommand, transcribeVoice, chatWithKimi, analyzeVoiceWithKimi, type ParsedCommand } from './services/nlp.js';
 import type { PAJClient } from '@zend/paj-client';
 import {
   ConversationState,
@@ -57,6 +57,15 @@ interface ZendSession {
   }>;
   pajContact?: string; // email/phone pending OTP
   onrampAmount?: number; // pending on-ramp amount in NGN
+  voiceAnalysis?: {
+    text: string;
+    amount: number | null;
+    recipientName: string | null;
+    bankCode: string | null;
+    bankName: string | null;
+    accountNumber: string | null;
+    walletAddress: string | null;
+  };
 }
 
 interface ZendContext extends Context {
@@ -1038,50 +1047,124 @@ bot.on(message('voice'), async (ctx) => {
     return;
   }
 
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey || apiKey === 'your_openai_key') {
+  if (!process.env.DEEPGRAM_API_KEY || process.env.DEEPGRAM_API_KEY === 'your_deepgram_key') {
     await ctx.reply(
-      '❌ Voice messages are not configured yet.\n\n' +
-      'Please type your command or use the menu below.',
-      mainMenu
+      '🎙️ *Voice Notes*\n\n' +
+      'Voice messages need STT setup.\n' +
+      'For now, please type your command or use the menu below.',
+      { parse_mode: 'Markdown', ...mainMenu }
     );
     return;
   }
 
-  const loadingVoice = await showLoading(ctx, 'Transcribing voice note...');
+  const loadingVoice = await showLoading(ctx, 'Listening to your voice note...');
 
   try {
-    // Download voice file
+    // Download voice file from Telegram
     const fileLink = await ctx.telegram.getFileLink(ctx.message.voice.file_id);
     const response = await fetch(fileLink.toString());
     const audioBuffer = Buffer.from(await response.arrayBuffer());
 
-    await updateLoading(ctx, loadingVoice.message_id, 'Transcribing with AI...');
+    await updateLoading(ctx, loadingVoice.message_id, 'Transcribing with Deepgram...');
 
-    // Transcribe
-    const text = await transcribeVoice(audioBuffer, apiKey);
+    // Step 1: STT
+    const text = await transcribeVoice(audioBuffer);
     console.log('[Voice] Transcribed:', text);
+    if (!text.trim()) {
+      await finishLoading(ctx, loadingVoice.message_id, '❌ Could not hear anything. Please speak clearly and try again.');
+      await ctx.reply('Menu:', mainMenu);
+      return;
+    }
 
-    await updateLoading(ctx, loadingVoice.message_id, 'Parsing your command...');
+    await updateLoading(ctx, loadingVoice.message_id, 'Analyzing with Kimi...');
 
-    // Parse transcribed text
-    const parsed = await parseCommand(text, true); // use Kimi for voice
+    // Step 2: Kimi analysis + confirmation
+    const analysis = await analyzeVoiceWithKimi(text);
+
+    if (!analysis) {
+      await finishLoading(ctx, loadingVoice.message_id, `📝 *You said:* "${text}"\n\nI understood you, but I need a bit more info. Can you type it out?`, 'Markdown');
+      await ctx.reply('Menu:', mainMenu);
+      return;
+    }
 
     await finishLoading(ctx, loadingVoice.message_id, `📝 *You said:* "${text}"`, 'Markdown');
 
-    // Forward to text handler logic
-    // Create a synthetic text message update
-    (ctx as any).message.text = text;
-    (ctx as any).message.voice = undefined;
+    // If Kimi says it needs confirmation (send/cash_out with details)
+    if (analysis.needsConfirm && analysis.amount && (analysis.accountNumber || analysis.walletAddress)) {
+      // Store in session for confirm/cancel
+      const session = getSession(userId);
+      session.voiceAnalysis = {
+        text,
+        amount: analysis.amount,
+        recipientName: analysis.recipientName,
+        bankCode: analysis.bankCode,
+        bankName: analysis.bankName,
+        accountNumber: analysis.accountNumber,
+        walletAddress: analysis.walletAddress,
+      };
+      setSession(userId, session);
 
-    // Re-process as text
-    await bot.handleUpdate(ctx.update);
+      await ctx.reply(
+        `🧠 *Kimi understood:*\n\n${analysis.message}`,
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Yes, proceed', 'voice_confirm_yes')],
+            [Markup.button.callback('❌ No, cancel', 'voice_confirm_no')],
+          ]),
+        }
+      );
+      return;
+    }
+
+    // Otherwise just show Kimi's response (balance, add_naira, chat, missing details)
+    await ctx.reply(analysis.message, mainMenu);
 
   } catch (err: any) {
     console.error('[Voice] Error:', err);
     await finishLoading(ctx, loadingVoice.message_id, '❌ Could not process voice note. Please type your command or use the menu below.');
     await ctx.reply('Menu:', mainMenu);
   }
+});
+
+// Voice confirmation handlers
+bot.action('voice_confirm_yes', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+  const va = session.voiceAnalysis;
+
+  if (!va || !va.amount) {
+    await ctx.editMessageText('❌ Session expired. Please try again.');
+    return;
+  }
+
+  // Build a synthetic text command and process it
+  let syntheticText = `send ${va.amount}`;
+  if (va.recipientName) syntheticText += ` to ${va.recipientName}`;
+  if (va.bankName) syntheticText += ` ${va.bankName}`;
+  if (va.accountNumber) syntheticText += ` ${va.accountNumber}`;
+  if (va.walletAddress) syntheticText += ` ${va.walletAddress}`;
+
+  await ctx.editMessageText(`✅ Confirmed! Processing: "${syntheticText}"`);
+
+  // Clear voice analysis
+  session.voiceAnalysis = undefined;
+  setSession(userId, session);
+
+  // Forward to text handler
+  (ctx as any).message = { text: syntheticText };
+  await bot.handleUpdate(ctx.update);
+});
+
+bot.action('voice_confirm_no', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+  session.voiceAnalysis = undefined;
+  setSession(userId, session);
+  await ctx.editMessageText('❌ Cancelled. No action taken.');
+  await ctx.reply('Menu:', mainMenu);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════

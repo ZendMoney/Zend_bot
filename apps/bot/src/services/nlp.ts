@@ -416,42 +416,105 @@ export async function chatWithKimi(text: string): Promise<ChatReply | null> {
   return { reply: reply.trim() };
 }
 
-// ─── Voice Transcription ───
+// ─── Voice Transcription (Deepgram) ───
+
+import { createClient } from '@deepgram/sdk';
+
+const deepgram = process.env.DEEPGRAM_API_KEY && process.env.DEEPGRAM_API_KEY !== 'your_deepgram_key'
+  ? createClient(process.env.DEEPGRAM_API_KEY)
+  : null;
 
 /**
- * Transcribe audio using Kimi's audio API or OpenAI Whisper
- * Note: Kimi doesn't have native STT yet, so we use OpenAI Whisper
+ * Transcribe audio using Deepgram (local inference feel, cloud accuracy)
+ * Free tier: $200 credit — sign up at deepgram.com
  */
-export async function transcribeVoice(audioBuffer: Buffer, apiKey?: string): Promise<string> {
-  const key = apiKey || process.env.OPENAI_API_KEY;
-  
-  if (!key || key === 'your_openai_key') {
-    throw new Error('No API key for voice transcription. Set OPENAI_API_KEY in .env');
+export async function transcribeVoice(audioBuffer: Buffer): Promise<string> {
+  if (!deepgram) {
+    throw new Error('Deepgram not configured. Set DEEPGRAM_API_KEY in .env or Railway variables');
   }
 
   try {
-    const formData = new FormData();
-    const blob = new Blob([audioBuffer], { type: 'audio/ogg' });
-    formData.append('file', blob, 'voice.ogg');
-    formData.append('model', 'whisper-1');
-    formData.append('language', 'en');
-
-    const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${key}`,
-      },
-      body: formData,
-    });
-
-    if (!response.ok) {
-      throw new Error(`Transcription error: ${response.status}`);
-    }
-
-    const data: any = await response.json();
-    return data.text || '';
+    const { result } = await deepgram.listen.prerecorded.transcribeFile(
+      audioBuffer,
+      { model: 'nova-2', smart_format: true, language: 'en' }
+    );
+    const transcript = result?.results?.channels?.[0]?.alternatives?.[0]?.transcript || '';
+    return transcript;
   } catch (err) {
-    console.error('[NLP] Voice transcription failed:', err);
+    console.error('[STT] Deepgram transcription failed:', err);
     throw err;
+  }
+}
+
+// ─── Voice Confirmation AI ───
+
+const VOICE_CONFIRM_PROMPT = `You are Zend, a Nigerian crypto payment assistant. A user sent a voice note.
+
+Your job:
+1. Understand what they want to do (send money, check balance, add naira, etc.)
+2. If it's a SEND command, extract: amount (NGN), recipient name, bank, account number
+3. Respond in a friendly, conversational way. Confirm what you understood.
+4. If it's ambiguous, ask clarifying questions.
+5. If it's not a payment command, just chat normally.
+
+Response format — JSON only:
+{
+  "intent": "send" | "balance" | "add_naira" | "cash_out" | "chat",
+  "amount": number | null,
+  "recipientName": string | null,
+  "bankName": string | null,
+  "bankCode": string | null,
+  "accountNumber": string | null,
+  "walletAddress": string | null,
+  "message": "Your friendly confirmation message to the user. Ask them to confirm.",
+  "needsConfirm": true | false
+}
+
+Rules:
+- "needsConfirm": true ONLY for send/cash_out with full details
+- "message" should be warm and conversational
+- If missing details (no bank, no amount), set needsConfirm:false and ask for them
+- Never make up details. If unsure, ask.`;
+
+export interface VoiceAnalysis {
+  intent: string;
+  amount: number | null;
+  recipientName: string | null;
+  bankName: string | null;
+  bankCode: string | null;
+  accountNumber: string | null;
+  walletAddress: string | null;
+  message: string;
+  needsConfirm: boolean;
+}
+
+/**
+ * Analyze transcribed voice text with Kimi — returns confirmation message + extracted data
+ */
+export async function analyzeVoiceWithKimi(text: string): Promise<VoiceAnalysis | null> {
+  if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
+    return null;
+  }
+
+  const content = await callKimi(VOICE_CONFIRM_PROMPT, `User's voice note: "${text}"`, 0.3, 600);
+  if (!content) return null;
+
+  try {
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+    return {
+      intent: parsed.intent || 'chat',
+      amount: parsed.amount ? Number(parsed.amount) : null,
+      recipientName: parsed.recipientName || null,
+      bankName: parsed.bankName || null,
+      bankCode: parsed.bankCode || null,
+      accountNumber: parsed.accountNumber?.toString() || null,
+      walletAddress: parsed.walletAddress || null,
+      message: parsed.message || 'I heard you, but I\'m not sure what you want to do.',
+      needsConfirm: parsed.needsConfirm || false,
+    };
+  } catch (err) {
+    console.error('[Voice] Kimi analysis parse failed:', err);
+    return null;
   }
 }
