@@ -12,13 +12,20 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const WHISPER_DIR = resolve(__dirname, 'whisper.cpp');
 const MODELS_DIR = resolve(__dirname, 'models');
 const MODEL_PATH = resolve(MODELS_DIR, 'ggml-tiny.bin');
+const WHISPER_CLI = resolve(WHISPER_DIR, 'whisper-cli');
 const MAIN_BINARY = resolve(WHISPER_DIR, 'main');
+
+function getBinary(): string | null {
+  if (existsSync(WHISPER_CLI)) return WHISPER_CLI;
+  if (existsSync(MAIN_BINARY)) return MAIN_BINARY;
+  return null;
+}
 
 let _hasWhisper: boolean | null = null;
 
 export function hasWhisper(): boolean {
   if (_hasWhisper !== null) return _hasWhisper;
-  _hasWhisper = existsSync(MAIN_BINARY) && existsSync(MODEL_PATH);
+  _hasWhisper = !!getBinary() && existsSync(MODEL_PATH);
   if (!_hasWhisper) {
     console.warn('[whisper] whisper.cpp not found. Run: bash apps/bot/src/services/whisper/setup.sh');
   }
@@ -45,7 +52,8 @@ function convertToWav(inputPath: string, outputPath: string): void {
  * @returns Transcribed text
  */
 export async function transcribeWithWhisper(audioBuffer: Buffer): Promise<string> {
-  if (!hasWhisper()) {
+  const binary = getBinary();
+  if (!binary) {
     throw new Error(
       'whisper.cpp not set up. Run: bash apps/bot/src/services/whisper/setup.sh'
     );
@@ -63,8 +71,8 @@ export async function transcribeWithWhisper(audioBuffer: Buffer): Promise<string
   // Convert OGG → WAV (whisper.cpp expects WAV)
   convertToWav(oggPath, wavPath);
 
-  // Run whisper.cpp
-  const cmd = `"${MAIN_BINARY}" -m "${MODEL_PATH}" -f "${wavPath}" --no-timestamps -l en -np`;
+  // Run whisper.cpp (whisper-cli for newer versions, main for older)
+  const cmd = `"${binary}" -m "${MODEL_PATH}" -f "${wavPath}" --no-timestamps -l en -np`;
   const output = execSync(cmd, { encoding: 'utf-8', stdio: 'pipe' });
 
   // Cleanup

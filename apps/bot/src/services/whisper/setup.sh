@@ -24,26 +24,26 @@ if [ ! -f "$WHISPER_DIR/main" ]; then
   if command -v cmake >/dev/null 2>&1; then
     echo "[whisper] Trying cmake build..."
     if cmake -B build . >/dev/null 2>&1 && cmake --build build --config Release >/dev/null 2>&1; then
-      cp build/bin/main "$WHISPER_DIR/main" 2>/dev/null || cp build/main "$WHISPER_DIR/main" 2>/dev/null
+      cp build/bin/whisper-cli "$WHISPER_DIR/whisper-cli" 2>/dev/null || cp build/whisper-cli "$WHISPER_DIR/whisper-cli" 2>/dev/null || cp build/bin/main "$WHISPER_DIR/main" 2>/dev/null || cp build/main "$WHISPER_DIR/main" 2>/dev/null
       echo "[whisper] cmake build succeeded."
     fi
   fi
 
-  # Fallback: pure make (older whisper.cpp)
-  if [ ! -f "$WHISPER_DIR/main" ]; then
+  # Fallback: pure make
+  if [ ! -f "$WHISPER_DIR/whisper-cli" ] && [ ! -f "$WHISPER_DIR/main" ]; then
     echo "[whisper] Trying make build..."
-    if make main >/dev/null 2>&1; then
+    if make whisper-cli >/dev/null 2>&1 || make main >/dev/null 2>&1; then
       echo "[whisper] make build succeeded."
     fi
   fi
 
   # Fallback: direct g++ compile
-  if [ ! -f "$WHISPER_DIR/main" ]; then
+  if [ ! -f "$WHISPER_DIR/whisper-cli" ] && [ ! -f "$WHISPER_DIR/main" ]; then
     echo "[whisper] Trying direct g++ compile..."
     g++ -O3 -std=c++11 -I. examples/main.cpp whisper.cpp ggml/src/ggml.c ggml/src/ggml-alloc.c ggml/src/ggml-backend.c ggml/src/ggml-quants.c -o main -lm 2>/dev/null || true
   fi
 
-  if [ ! -f "$WHISPER_DIR/main" ]; then
+  if [ ! -f "$WHISPER_DIR/whisper-cli" ] && [ ! -f "$WHISPER_DIR/main" ]; then
     echo "[whisper] WARNING: Could not build whisper.cpp. Voice notes will be unavailable."
     exit 0  # Don't fail the build — bot works without voice
   fi

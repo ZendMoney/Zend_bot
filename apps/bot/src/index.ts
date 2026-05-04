@@ -1752,28 +1752,32 @@ async function main() {
     console.warn('⚠️  PAJ not configured');
   }
 
-  // Handle 409 conflict gracefully (Railway deploy overlap)
-  let launchAttempts = 0;
-  const MAX_LAUNCH_ATTEMPTS = 5;
-
-  bot.catch(async (err: any) => {
-    if (err?.response?.error_code === 409 && launchAttempts < MAX_LAUNCH_ATTEMPTS) {
-      launchAttempts++;
-      const delay = launchAttempts * 3000;
-      console.log(`[Bot] 409 conflict (attempt ${launchAttempts}/${MAX_LAUNCH_ATTEMPTS}), retrying in ${delay}ms...`);
-      bot.stop();
-      await new Promise(r => setTimeout(r, delay));
-      bot.launch({ dropPendingUpdates: true });
-    } else {
-      console.error('[Bot] Unhandled error:', err);
-    }
-  });
-
+  // Launch bot
   bot.launch({ dropPendingUpdates: true });
   console.log('🤖 Zend bot is running...');
 
-  process.once('SIGINT', () => bot.stop('SIGINT'));
-  process.once('SIGTERM', () => bot.stop('SIGTERM'));
+  // Handle 409 conflict from polling loop (Railway deploy overlap)
+  let retryTimeout: NodeJS.Timeout | null = null;
+  process.on('unhandledRejection', (reason: any) => {
+    if (reason?.response?.error_code === 409) {
+      console.log('[Bot] 409 conflict detected, stopping and retrying in 5s...');
+      bot.stop();
+      if (retryTimeout) clearTimeout(retryTimeout);
+      retryTimeout = setTimeout(() => {
+        console.log('[Bot] Retrying launch...');
+        bot.launch({ dropPendingUpdates: true });
+      }, 5000);
+    }
+  });
+
+  process.once('SIGINT', () => {
+    if (retryTimeout) clearTimeout(retryTimeout);
+    bot.stop('SIGINT');
+  });
+  process.once('SIGTERM', () => {
+    if (retryTimeout) clearTimeout(retryTimeout);
+    bot.stop('SIGTERM');
+  });
 }
 
 main();
