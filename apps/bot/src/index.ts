@@ -399,8 +399,8 @@ bot.action('export_key', async (ctx) => {
 // 💰 BALANCE
 // ═════════════════════════════════════════════════════════════════════════════
 
-bot.hears('💰 Balance', async (ctx) => {
-  const userId = ctx.from.id.toString();
+// Reusable balance handler
+async function handleBalance(ctx: ZendContext, userId: string) {
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
 
   if (user.length === 0) {
@@ -443,6 +443,10 @@ bot.hears('💰 Balance', async (ctx) => {
     await finishLoading(ctx, loading.message_id, '❌ Could not fetch balance. Please try again.');
     await ctx.reply('Menu:', mainMenu);
   }
+}
+
+bot.hears('💰 Balance', async (ctx) => {
+  await handleBalance(ctx, ctx.from.id.toString());
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1129,8 +1133,50 @@ bot.on(message('voice'), async (ctx) => {
       return;
     }
 
-    // Otherwise just show Kimi's response (balance, add_naira, chat, missing details)
-    await ctx.reply(analysis.message, mainMenu);
+    // Execute based on intent
+    switch (analysis.intent) {
+      case 'balance': {
+        await ctx.reply(analysis.message, mainMenu);
+        await handleBalance(ctx, userId);
+        return;
+      }
+      case 'add_naira': {
+        await ctx.reply(analysis.message, mainMenu);
+        // Simulate clicking Add Naira
+        const pajClient = await getPAJClient();
+        if (!pajClient) {
+          await ctx.reply('❌ PAJ service is not configured. Please contact support.', mainMenu);
+          return;
+        }
+        setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampAmount: analysis.amount || undefined });
+        await ctx.reply(
+          `💵 *Add Naira*\n\n` +
+          (analysis.amount
+            ? `Amount: ${formatNgn(analysis.amount)}\n\nHow much do you want to add? (Minimum ₦1,000)`
+            : `How much NGN do you want to add to your wallet?\n\nMinimum: ${formatNgn(PAJ_MIN_DEPOSIT_NGN)}\n\nEnter the amount (numbers only):`),
+          { parse_mode: 'Markdown', ...cancelKeyboard }
+        );
+        return;
+      }
+      case 'send':
+      case 'cash_out': {
+        if (!analysis.amount) {
+          await ctx.reply(analysis.message + '\n\nHow much do you want to send?', mainMenu);
+          return;
+        }
+        if (!analysis.accountNumber && !analysis.walletAddress) {
+          await ctx.reply(analysis.message + '\n\nPlease include the bank and account number.', mainMenu);
+          return;
+        }
+        // If we have amount + account but Kimi didn't set needsConfirm (maybe bank missing)
+        await ctx.reply(analysis.message, mainMenu);
+        return;
+      }
+      default: {
+        // chat / unknown — just reply conversationally
+        await ctx.reply(analysis.message, mainMenu);
+      }
+    }
 
   } catch (err: any) {
     console.error('[Voice] Error:', err);
