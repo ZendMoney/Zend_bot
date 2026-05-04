@@ -83,7 +83,15 @@ const BANK_PATTERNS = Object.entries(BANK_ALIASES).flatMap(([code, names]) =>
   }))
 );
 
-const ACCOUNT_NUMBER_PATTERN = /\b(\d{10})\b/;
+const ACCOUNT_NUMBER_PATTERN = /\b(\d[\d\s\-\.]{9,19}\d)\b/;
+
+// Strip non-digits from account numbers (Whisper adds dashes, spaces, dots)
+function sanitizeAccountNumber(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const digits = raw.replace(/\D/g, '');
+  // NUBAN is 10 digits, but allow 10-20 for safety (some users include country codes)
+  return digits.length >= 10 ? digits : null;
+}
 const WALLET_ADDRESS_PATTERN = /\b([A-Za-z0-9]{32,44})\b/;
 
 function parseAmountK(match: string): number {
@@ -135,7 +143,7 @@ function extractBank(text: string): { code: string; name: string } | undefined {
 
 function extractAccountNumber(text: string): string | undefined {
   const match = text.match(ACCOUNT_NUMBER_PATTERN);
-  return match ? match[1] : undefined;
+  return match ? sanitizeAccountNumber(match[1]) || undefined : undefined;
 }
 
 function extractWalletAddress(text: string): string | undefined {
@@ -347,7 +355,7 @@ export async function parseWithKimi(text: string): Promise<ParsedCommand> {
       recipientName: parsed.recipientName,
       bankName: parsed.bankName,
       bankCode: parsed.bankCode,
-      accountNumber: parsed.accountNumber?.toString(),
+      accountNumber: sanitizeAccountNumber(parsed.accountNumber) || undefined,
       walletAddress: parsed.walletAddress,
       raw: text,
     };
@@ -496,7 +504,7 @@ export async function analyzeVoiceWithKimi(text: string): Promise<VoiceAnalysis 
       recipientName: parsed.recipientName || null,
       bankName: parsed.bankName || null,
       bankCode: parsed.bankCode || null,
-      accountNumber: parsed.accountNumber?.toString() || null,
+      accountNumber: sanitizeAccountNumber(parsed.accountNumber),
       walletAddress: parsed.walletAddress || null,
       message: parsed.message || 'I heard you, but I\'m not sure what you want to do.',
       needsConfirm: parsed.needsConfirm || false,

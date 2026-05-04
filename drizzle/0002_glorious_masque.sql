@@ -1,0 +1,2 @@
+ALTER TABLE "saved_bank_accounts" ALTER COLUMN "account_number" SET DATA TYPE varchar(20);--> statement-breakpoint
+ALTER TABLE "transactions" ALTER COLUMN "recipient_account_number" SET DATA TYPE varchar(20);

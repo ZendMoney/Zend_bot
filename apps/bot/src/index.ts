@@ -128,6 +128,12 @@ function formatNgn(amount: number): string {
   return `₦${amount.toLocaleString('en-NG')}`;
 }
 
+// Strip non-digits from account numbers (Whisper adds dashes, spaces, dots)
+function sanitizeAccountNumber(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  return raw.replace(/\D/g, '');
+}
+
 // ─── SOL Price (CoinGecko) ───
 let _solPriceCache: { price: number; time: number } | null = null;
 
@@ -831,6 +837,11 @@ bot.on(message('text'), async (ctx, next) => {
 
     switch (parsed.intent) {
       case 'send': {
+        // Sanitize account numbers from NLP
+        if (parsed.accountNumber) {
+          parsed.accountNumber = sanitizeAccountNumber(parsed.accountNumber) || parsed.accountNumber;
+        }
+
         if (!parsed.amount) {
           await ctx.reply('❌ How much do you want to send? Example: "Send 5000 to Tunde"', cancelKeyboard);
           return;
@@ -1131,6 +1142,12 @@ bot.on(message('voice'), async (ctx) => {
       }
       case 'send':
       case 'cash_out': {
+        // Sanitize Whisper artifacts from account numbers
+        const cleanAccountNumber = sanitizeAccountNumber(analysis.accountNumber);
+        if (cleanAccountNumber) {
+          (analysis as any).accountNumber = cleanAccountNumber;
+        }
+
         if (!analysis.amount) {
           setSession(userId, { state: ConversationState.AWAITING_SEND_AMOUNT, pendingTransaction: {} });
           await ctx.reply(

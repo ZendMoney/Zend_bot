@@ -15,6 +15,13 @@
       "when": 1777469800656,
       "tag": "0001_futuristic_jigsaw",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1777896106338,
+      "tag": "0002_glorious_masque",
+      "breakpoints": true
     }
   ]
 }

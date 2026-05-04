@@ -43,7 +43,7 @@ export const savedBankAccounts = pgTable('saved_bank_accounts', {
   userId: varchar('user_id', { length: 50 }).notNull().references((): any => users.id),
   bankCode: varchar('bank_code', { length: 10 }).notNull(),
   bankName: varchar('bank_name', { length: 100 }).notNull(),
-  accountNumber: varchar('account_number', { length: 10 }).notNull(),
+  accountNumber: varchar('account_number', { length: 20 }).notNull(),
   accountName: varchar('account_name', { length: 100 }).notNull(),
   verified: boolean('verified').default(false).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
@@ -72,7 +72,7 @@ export const transactions = pgTable('transactions', {
   // Recipient
   recipientBankCode: varchar('recipient_bank_code', { length: 10 }),
   recipientBankName: varchar('recipient_bank_name', { length: 100 }),
-  recipientAccountNumber: varchar('recipient_account_number', { length: 10 }),
+  recipientAccountNumber: varchar('recipient_account_number', { length: 20 }),
   recipientAccountName: varchar('recipient_account_name', { length: 100 }),
   recipientWalletAddress: varchar('recipient_wallet_address', { length: 44 }),
   
