@@ -1752,6 +1752,23 @@ async function main() {
     console.warn('⚠️  PAJ not configured');
   }
 
+  // Handle 409 conflict gracefully (Railway deploy overlap)
+  let launchAttempts = 0;
+  const MAX_LAUNCH_ATTEMPTS = 5;
+
+  bot.catch(async (err: any) => {
+    if (err?.response?.error_code === 409 && launchAttempts < MAX_LAUNCH_ATTEMPTS) {
+      launchAttempts++;
+      const delay = launchAttempts * 3000;
+      console.log(`[Bot] 409 conflict (attempt ${launchAttempts}/${MAX_LAUNCH_ATTEMPTS}), retrying in ${delay}ms...`);
+      bot.stop();
+      await new Promise(r => setTimeout(r, delay));
+      bot.launch({ dropPendingUpdates: true });
+    } else {
+      console.error('[Bot] Unhandled error:', err);
+    }
+  });
+
   bot.launch({ dropPendingUpdates: true });
   console.log('🤖 Zend bot is running...');
 
