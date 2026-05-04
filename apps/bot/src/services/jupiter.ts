@@ -5,7 +5,7 @@
 
 import { SOLANA_TOKENS } from '@zend/shared';
 
-const JUPITER_API = 'https://quote-api.jup.ag/v6';
+const JUPITER_API = 'https://api.jup.ag/v6';
 
 export interface SwapQuote {
   inputMint: string;

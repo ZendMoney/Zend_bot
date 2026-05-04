@@ -15,6 +15,8 @@ import {
   getAccount,
   TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
+
+const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 import { SOLANA_TOKENS } from '../../shared/src/constants.js';
 
 export class WalletService {
@@ -159,7 +161,8 @@ export class WalletService {
       const pubkey = new PublicKey(address);
       const accountInfo = await this.connection.getAccountInfo(pubkey);
       if (!accountInfo) return false;
-      return accountInfo.owner.equals(TOKEN_PROGRAM_ID);
+      // Support both legacy SPL Token and Token-2022 programs
+      return accountInfo.owner.equals(TOKEN_PROGRAM_ID) || accountInfo.owner.equals(TOKEN_2022_PROGRAM_ID);
     } catch {
       return false;
     }

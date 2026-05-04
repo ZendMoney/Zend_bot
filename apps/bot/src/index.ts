@@ -1670,7 +1670,79 @@ async function executeSend(
 
       // ─── Check user has enough USDT ───
       await ctx.replyWithChatAction('typing');
-      const usdtBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
+      let usdtBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
+
+      // ─── Auto-swap USDC → USDT if needed ───
+      if (usdtBalance < order.amount) {
+        const usdcBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDC.mint);
+
+        if (usdcBalance >= order.amount) {
+          await ctx.editMessageText(
+            `⏳ *Processing...*\n\n` +
+            `You have ${usdcBalance.toFixed(2)} USDC but only ${usdtBalance.toFixed(2)} USDT.\n` +
+            `Swapping USDC → USDT via Jupiter...`,
+            { parse_mode: 'Markdown' }
+          );
+
+          const swapAmountUsdc = Math.min(usdcBalance, order.amount * 1.03);
+          const swapAmountBase = Math.round(swapAmountUsdc * Math.pow(10, SOLANA_TOKENS.USDC.decimals));
+
+          const quote = await getSwapQuote(
+            SOLANA_TOKENS.USDC.mint,
+            SOLANA_TOKENS.USDT.mint,
+            swapAmountBase,
+            100 // 1% slippage
+          );
+
+          if (!quote) {
+            throw new Error(
+              `Insufficient USDT balance.\n\n` +
+              `You have: ${usdtBalance.toFixed(2)} USDT\n` +
+              `Required: ${order.amount.toFixed(2)} USDT\n\n` +
+              `You also have ${usdcBalance.toFixed(2)} USDC, but the swap route is currently unavailable. ` +
+              `Please deposit USDT or try again later.`
+            );
+          }
+
+          const outAmountUsdt = Number(quote.outAmount) / Math.pow(10, SOLANA_TOKENS.USDT.decimals);
+          if (outAmountUsdt < order.amount) {
+            throw new Error(
+              `Swap would only give ${outAmountUsdt.toFixed(2)} USDT, but ${order.amount.toFixed(2)} USDT is needed. ` +
+              `Please deposit more USDC or USDT.`
+            );
+          }
+
+          const feeWallet = process.env.ZEND_FEE_WALLET;
+          const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true, feeWallet);
+          if (!serializedTx) {
+            throw new Error('Failed to build swap transaction. Please try again.');
+          }
+
+          const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
+          const keypair = Keypair.fromSecretKey(secretKey);
+
+          const swapTxHash = await walletService.signAndSendSerialized(keypair, serializedTx);
+          console.log('[Jupiter] Auto-swap USDC→USDT:', swapTxHash);
+
+          // Record swap in DB
+          const swapTxId = generateTxId();
+          await db.insert(transactions).values({
+            id: swapTxId,
+            userId,
+            type: 'swap',
+            status: 'completed',
+            fromMint: SOLANA_TOKENS.USDC.mint,
+            fromAmount: swapAmountUsdc.toString(),
+            toMint: SOLANA_TOKENS.USDT.mint,
+            toAmount: outAmountUsdt.toString(),
+            solanaTxHash: swapTxHash,
+          });
+
+          // Re-check USDT balance after swap
+          usdtBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
+        }
+      }
+
       if (usdtBalance < order.amount) {
         throw new Error(
           `Insufficient USDT balance.\n\n` +
