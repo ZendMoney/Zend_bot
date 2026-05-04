@@ -1,0 +1,1 @@
+ALTER TABLE "transactions" ADD COLUMN "zend_fee_usdt" numeric(20, 9);

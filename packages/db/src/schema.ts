@@ -68,6 +68,7 @@ export const transactions = pgTable('transactions', {
   ngnRate: decimal('ngn_rate', { precision: 20, scale: 4 }),
   pajFeeBps: integer('paj_fee_bps'),
   zendSpreadBps: integer('zend_spread_bps'),
+  zendFeeUsdt: decimal('zend_fee_usdt', { precision: 20, scale: 9 }),
   
   // Recipient
   recipientBankCode: varchar('recipient_bank_code', { length: 10 }),

@@ -1447,6 +1447,7 @@ async function executeSend(
     amountNgn: number;
     amountUsdt: number;
     ngnRate?: number;
+    zendFeeUsdt?: number;
     recipientBankCode?: string;
     recipientBankName?: string;
     recipientAccountNumber?: string;
@@ -1460,6 +1461,7 @@ async function executeSend(
   const finalAccountNumber = txData.recipientAccountNumber || '0000000000';
 
   const txId = generateTxId();
+  const feeUsdt = txData.zendFeeUsdt || 0;
   await db.insert(transactions).values({
     id: txId,
     userId,
@@ -1469,6 +1471,7 @@ async function executeSend(
     ngnRate: (txData.ngnRate || 1550).toString(),
     fromAmount: txData.amountUsdt.toString(),
     fromMint: SOLANA_TOKENS.USDT.mint,
+    zendFeeUsdt: feeUsdt.toString(),
     recipientBankCode: finalBankCode,
     recipientBankName: finalBankName,
     recipientAccountNumber: finalAccountNumber,
@@ -1543,6 +1546,18 @@ async function executeSend(
       );
       console.log('[Solana] USDT sent to PAJ:', solanaTxHash);
 
+      // ─── Collect Zend fee ───
+      const feeWallet = process.env.ZEND_FEE_WALLET;
+      let feeTxHash: string | undefined;
+      if (feeWallet && feeUsdt > 0) {
+        try {
+          feeTxHash = await walletService.sendUsdt(keypair, feeWallet, feeUsdt);
+          console.log('[Solana] Zend fee collected:', feeUsdt, 'USDT →', feeWallet, 'tx:', feeTxHash);
+        } catch (feeErr: any) {
+          console.error('[Solana] Fee collection failed (non-critical):', feeErr.message);
+        }
+      }
+
       await db.update(transactions)
         .set({ solanaTxHash, pajReference: offRampRef })
         .where(eq(transactions.id, txId));
@@ -1596,13 +1611,14 @@ bot.action('confirm_send', async (ctx) => {
     return;
   }
 
-  const { amountNgn, amountUsdt, ngnRate, recipientBankCode, recipientBankName, recipientAccountNumber, recipientAccountName, recipientName } =
+  const { amountNgn, amountUsdt, ngnRate, zendFeeUsdt, recipientBankCode, recipientBankName, recipientAccountNumber, recipientAccountName, recipientName } =
     session.pendingTransaction;
 
   await executeSend(ctx, userId, {
     amountNgn: amountNgn!,
     amountUsdt: amountUsdt!,
     ngnRate,
+    zendFeeUsdt,
     recipientBankCode,
     recipientBankName,
     recipientAccountNumber,
