@@ -14,7 +14,7 @@ import { db, checkConnection } from '@zend/db';
 import { users, transactions } from '@zend/db';
 import { eq } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
-import { parseCommand, transcribeVoice, chatWithKimi, analyzeVoiceWithKimi, type ParsedCommand } from './services/nlp.js';
+import { parseCommand, transcribeVoice, chatWithKimi, analyzeVoiceWithKimi, parseMenuInputWithAI, type ParsedCommand } from './services/nlp.js';
 import type { PAJClient } from '@zend/paj-client';
 import {
   ConversationState,
@@ -815,9 +815,28 @@ bot.on(message('text'), async (ctx, next) => {
 
   // ─── SEND: AWAITING_SEND_AMOUNT ───
   if (session.state === ConversationState.AWAITING_SEND_AMOUNT) {
-    const amount = parseInt(text.replace(/[^0-9]/g, ''), 10);
+    let amount: number | undefined;
+
+    // Try AI first for natural language amounts ("2k", "two thousand", "₦2000")
+    const aiParse = await parseMenuInputWithAI(text);
+    if (aiParse && aiParse.success && aiParse.amount && aiParse.amount >= 100) {
+      amount = aiParse.amount;
+      console.log('[AI] Parsed amount:', amount, 'from:', text);
+    } else {
+      // Fallback: strip non-digits
+      amount = parseInt(text.replace(/[^0-9]/g, ''), 10);
+      if (text.toLowerCase().includes('k')) {
+        const kMatch = text.match(/(\d+\.?\d*)k/i);
+        if (kMatch) amount = Math.round(parseFloat(kMatch[1]) * 1000);
+      }
+    }
+
     if (!amount || amount < 100) {
-      await ctx.reply('❌ Please enter a valid amount (minimum ₦100).', cancelKeyboard);
+      const aiMsg = aiParse?.message;
+      await ctx.reply(
+        aiMsg || 'Hmm, I didn\'t catch that amount. Try something like "2000", "2k", or "₦5000". Minimum is ₦100.',
+        cancelKeyboard
+      );
       return;
     }
 
@@ -847,119 +866,106 @@ bot.on(message('text'), async (ctx, next) => {
       `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${zendFeeUsdt.toFixed(4)} USDT\n` +
       `You pay: *${usdtNeeded.toFixed(2)} USDT*\n\n` +
       `Who should receive it?\n\n` +
-      `Type: "Name BankCode AccountNumber"\n` +
-      `Example: "Tunde GTB 0123456789"`;
+      `Just tell me naturally — e.g. "Mark OPay 7082406410" or "send to Amaka at GTB 0123456789"`;
 
     await ctx.reply(msg, { parse_mode: 'Markdown', ...cancelKeyboard });
     return;
   }
 
+
   // ─── SEND: AWAITING_SEND_RECIPIENT ───
   if (session.state === ConversationState.AWAITING_SEND_RECIPIENT) {
-    const parts = text.trim().split(/\s+/);
-    if (parts.length < 3) {
+    // ─── Try AI parser first ───
+    const aiParse = await parseMenuInputWithAI(text);
+
+    let accountNumber: string | undefined;
+    let bankCode: string | undefined;
+    let accountName: string | undefined;
+    let fromToken: string | undefined;
+
+    if (aiParse && aiParse.success) {
+      accountNumber = aiParse.accountNumber;
+      bankCode = aiParse.bankCode;
+      accountName = aiParse.recipientName;
+      fromToken = aiParse.fromToken;
+      console.log('[AI] Parsed recipient:', { bankCode, accountNumber, accountName, fromToken });
+    } else if (aiParse && aiParse.message) {
+      await ctx.reply(aiParse.message, cancelKeyboard);
+      return;
+    }
+
+    // ─── Fallback: local smart parser ───
+    if (!bankCode || !accountNumber) {
+      const parts = text.trim().split(/\s+/);
+      for (let i = 0; i < parts.length; i++) {
+        if (/^\d{10}$/.test(parts[i])) {
+          accountNumber = parts[i];
+          if (i > 0) {
+            const candidate = parts[i - 1].toUpperCase();
+            const bank = NIGERIAN_BANKS.find(b => b.code === candidate);
+            if (bank) { bankCode = candidate; accountName = parts.slice(0, i - 1).join(' '); break; }
+          }
+          if (i < parts.length - 1 && !bankCode) {
+            const candidate = parts[i + 1].toUpperCase();
+            const bank = NIGERIAN_BANKS.find(b => b.code === candidate);
+            if (bank) { bankCode = candidate; accountName = parts.slice(0, i).join(' '); break; }
+          }
+        }
+      }
+      if (!bankCode) {
+        const aliases: Record<string, string[]> = {
+          'GTB': ['gtb', 'gtbank'], 'FBN': ['first bank', 'fbn', 'firstbank'],
+          'UBA': ['uba'], 'ZEN': ['zenith', 'zenith bank'],
+          'ACC': ['access', 'access bank'], 'ECO': ['ecobank', 'eco bank'],
+          'WEM': ['wema', 'wema bank'], 'FID': ['fidelity', 'fidelity bank'],
+          'SKY': ['polaris', 'polaris bank', 'skye'], 'FCMB': ['fcmb', 'first city'],
+          'STERLING': ['sterling', 'sterling bank'], 'STA': ['stanbic', 'stanbic ibtc'],
+          'UNI': ['union', 'union bank'], 'KEC': ['keystone', 'keystone bank'],
+          'JAB': ['jaiz', 'jaiz bank'], 'OPY': ['opay', 'o pay'],
+          'MON': ['moniepoint', 'monie point'], 'KUD': ['kuda', 'kuda bank'],
+          'PAL': ['palmpay', 'palm pay'], 'PAG': ['paga', 'paga bank'],
+          'VFD': ['vfd'], 'CAR': ['carbon', 'carbon bank'],
+          'FAI': ['fairmoney', 'fair money'], 'BRA': ['branch', 'branch bank'],
+        };
+        for (let i = 0; i < parts.length; i++) {
+          const pl = parts[i].toLowerCase();
+          for (const [code, als] of Object.entries(aliases)) {
+            if (als.includes(pl) || pl === code.toLowerCase()) {
+              bankCode = code;
+              for (let j = 0; j < parts.length; j++) {
+                if (j !== i && /^\d{10}$/.test(parts[j])) { accountNumber = parts[j]; break; }
+              }
+              accountName = parts.filter((_, idx) => idx !== i && parts[idx] !== accountNumber).join(' ');
+              break;
+            }
+          }
+          if (bankCode) break;
+        }
+      }
+    }
+
+    if (!bankCode || !accountNumber) {
       await ctx.reply(
-        '❌ Please use format: "Name Bank AccountNumber"\n' +
-        'Examples:\n"Tunde GTB 0123456789"\n"Amaka Opay 0123456789"',
+        "I couldn't quite figure out the recipient details from that.\n\n" +
+        "Try something like:\n" +
+        '• "Mark OPay 7082406410"\n' +
+        '• "Amaka GTB 0123456789"\n' +
+        '• "send to Tunde at First Bank 0011223344"',
         cancelKeyboard
       );
       return;
     }
 
-    // Smart parsing: find 10-digit account number and bank code anywhere in the input
-    let accountNumber: string | undefined;
-    let bankCode: string | undefined;
-    let accountName: string | undefined;
-
-    // Try to find a 10-digit number
-    for (let i = 0; i < parts.length; i++) {
-      if (/^\d{10}$/.test(parts[i])) {
-        accountNumber = parts[i];
-        // Try the part before it as bank code
-        if (i > 0) {
-          const candidate = parts[i - 1].toUpperCase();
-          const bank = NIGERIAN_BANKS.find(b => b.code === candidate);
-          if (bank) {
-            bankCode = candidate;
-            accountName = parts.slice(0, i - 1).join(' ');
-            break;
-          }
-        }
-        // Try the part after it as bank code
-        if (i < parts.length - 1 && !bankCode) {
-          const candidate = parts[i + 1].toUpperCase();
-          const bank = NIGERIAN_BANKS.find(b => b.code === candidate);
-          if (bank) {
-            bankCode = candidate;
-            accountName = parts.slice(0, i).join(' ');
-            break;
-          }
-        }
-      }
-    }
-
-    // Fallback: try bank name/alias matching on any part
-    if (!bankCode) {
-      const BANK_NAME_ALIASES: Record<string, string[]> = {
-        'GTB': ['gtb', 'gtbank', 'guaranty trust bank'],
-        'FBN': ['first bank', 'fbn', 'firstbank'],
-        'UBA': ['uba'],
-        'ZEN': ['zenith', 'zenith bank'],
-        'ACC': ['access', 'access bank'],
-        'ECO': ['ecobank', 'eco bank'],
-        'WEM': ['wema', 'wema bank'],
-        'FID': ['fidelity', 'fidelity bank'],
-        'SKY': ['polaris', 'polaris bank', 'skye'],
-        'FCMB': ['fcmb', 'first city'],
-        'STERLING': ['sterling', 'sterling bank'],
-        'STA': ['stanbic', 'stanbic ibtc'],
-        'UNI': ['union', 'union bank'],
-        'KEC': ['keystone', 'keystone bank'],
-        'JAB': ['jaiz', 'jaiz bank'],
-        'OPY': ['opay', 'o pay'],
-        'MON': ['moniepoint', 'monie point'],
-        'KUD': ['kuda', 'kuda bank'],
-        'PAL': ['palmpay', 'palm pay'],
-        'PAG': ['paga', 'paga bank'],
-        'VFD': ['vfd'],
-        'CAR': ['carbon', 'carbon bank'],
-        'FAI': ['fairmoney', 'fair money'],
-        'BRA': ['branch', 'branch bank'],
-      };
-
-      for (let i = 0; i < parts.length; i++) {
-        const partLower = parts[i].toLowerCase();
-        for (const [code, aliases] of Object.entries(BANK_NAME_ALIASES)) {
-          if (aliases.includes(partLower) || partLower === code.toLowerCase()) {
-            bankCode = code;
-            // Find account number (10 digits) in remaining parts
-            for (let j = 0; j < parts.length; j++) {
-              if (j !== i && /^\d{10}$/.test(parts[j])) {
-                accountNumber = parts[j];
-                break;
-              }
-            }
-            // Name is everything except bank and account number
-            accountName = parts.filter((_, idx) => idx !== i && parts[idx] !== accountNumber).join(' ');
-            break;
-          }
-        }
-        if (bankCode) break;
-      }
-    }
-
-    if (!bankCode) {
-      const bankList = NIGERIAN_BANKS.map(b => `${b.code} = ${b.name}`).join('\n');
-      await ctx.reply(`❌ Could not recognize the bank.\n\nPlease use a bank name or code:\n${bankList}`, cancelKeyboard);
-      return;
-    }
-
-    if (!accountNumber) {
-      await ctx.reply('❌ Could not find a 10-digit account number. Please check and try again.', cancelKeyboard);
-      return;
-    }
-
     const bank = NIGERIAN_BANKS.find(b => b.code === bankCode)!;
+
+    if (!fromToken) {
+      const lt = text.toLowerCase();
+      if (/\busdc\b/.test(lt)) fromToken = 'USDC';
+      else if (/\bsol\b/.test(lt)) fromToken = 'SOL';
+    }
+    const fromMint = fromToken === 'USDC' ? SOLANA_TOKENS.USDC.mint :
+                     fromToken === 'SOL' ? SOLANA_TOKENS.SOL.mint :
+                     SOLANA_TOKENS.USDT.mint;
 
     // ─── Verify bank account with PAJ ───
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
@@ -975,12 +981,12 @@ bot.on(message('text'), async (ctx, next) => {
         verifiedStatus = 'verified';
       } else {
         console.log('[Verify] Failed:', verification.error);
-        // Don't block — let user decide
       }
     } else {
       verifiedStatus = 'no_paj';
     }
 
+    session.pendingTransaction!.fromMint = fromMint;
     session.pendingTransaction!.recipientBankCode = bankCode;
     session.pendingTransaction!.recipientBankName = bank.name;
     session.pendingTransaction!.recipientAccountNumber = accountNumber;

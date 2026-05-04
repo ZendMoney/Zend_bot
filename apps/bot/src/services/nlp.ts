@@ -397,9 +397,112 @@ export async function parseCommand(text: string, useKimi = false): Promise<Parse
   return local;
 }
 
+// ─── Menu Flow AI Parser ───
+// Parses free-text user input during menu-driven flows (send, cash out, etc.)
+
+export interface MenuParseResult {
+  success: boolean;
+  amount?: number;
+  recipientName?: string;
+  bankCode?: string;
+  bankName?: string;
+  accountNumber?: string;
+  fromToken?: 'USDT' | 'USDC' | 'SOL';
+  message?: string;
+}
+
+const MENU_PARSE_PROMPT = `You are an intelligent input parser for a Nigerian crypto payment bot.
+The user is in the middle of a send-money flow and just typed free text.
+
+Your job: extract structured data from their message. Be smart about Nigerian context.
+
+Supported banks and codes:
+GTB=GTBank, FIRST=FirstBank, UBA=UBA, ZENITH=Zenith, ACCESS=Access Bank,
+ECOBANK=Ecobank, FIDELITY=Fidelity, FCMB=FCMB, WEMA=Wema, POLARIS=Polaris,
+STERLING=Sterling, UNITY=Unity, JAIZ=Jaiz, KEYSTONE=Keystone, HERITAGE=Heritage,
+STANBIC=Stanbic IBTC, UNION=Union Bank, OPY=OPay, MON=Moniepoint, KUD=Kuda,
+PAL=PalmPay, PAG=Paga, VFD=VFD, CAR=Carbon, FAI=FairMoney, BRA=Branch
+
+Rules:
+- amount: convert "2k" to 2000, "50k" to 50000, "1.5k" to 1500, "two thousand" to 2000
+- bankCode: return the 2-4 letter code above, NEVER make up codes. If bank is unclear, leave null.
+- accountNumber: must be exactly 10 digits. Nigerian NUBAN format.
+- recipientName: the person's name. If only one word and it's a bank name, that's NOT a name.
+- fromToken: "USDC" if they mention USDC/usdc, "SOL" if SOL/sol, else "USDT"
+- If ANY field is missing or unclear, set success:false and write a friendly, conversational message asking for what's missing.
+
+Response format — JSON only:
+{
+  "success": true | false,
+  "amount": number | null,
+  "recipientName": string | null,
+  "bankCode": string | null,
+  "bankName": string | null,
+  "accountNumber": string | null,
+  "fromToken": "USDT" | "USDC" | "SOL" | null,
+  "message": "Your conversational response to the user."
+}
+
+If success is false, message should be warm and helpful, like a Nigerian friend. Use light Pidgin when natural. Never be robotic.`;
+
+export async function parseMenuInputWithAI(text: string): Promise<MenuParseResult | null> {
+  if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
+    return null;
+  }
+
+  const content = await callKimi(MENU_PARSE_PROMPT, text, 0.1, 600);
+  if (!content) return null;
+
+  try {
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+
+    let bankCode = parsed.bankCode || null;
+    let bankName = parsed.bankName || null;
+    if (bankCode) {
+      const bank = NIGERIAN_BANKS.find(b => b.code === bankCode);
+      if (bank) {
+        bankName = bank.name;
+      } else {
+        const fuzzy = NIGERIAN_BANKS.find(b =>
+          b.name.toLowerCase() === (bankName || '').toLowerCase() ||
+          b.name.toLowerCase().includes((bankName || '').toLowerCase())
+        );
+        if (fuzzy) {
+          bankCode = fuzzy.code;
+          bankName = fuzzy.name;
+        } else {
+          bankCode = null;
+          bankName = null;
+        }
+      }
+    }
+
+    let accountNumber = parsed.accountNumber || null;
+    if (accountNumber) {
+      const digits = accountNumber.replace(/\D/g, '');
+      accountNumber = digits.length === 10 ? digits : null;
+    }
+
+    return {
+      success: parsed.success === true,
+      amount: parsed.amount ? Number(parsed.amount) : undefined,
+      recipientName: parsed.recipientName || undefined,
+      bankCode: bankCode || undefined,
+      bankName: bankName || undefined,
+      accountNumber: accountNumber || undefined,
+      fromToken: parsed.fromToken || undefined,
+      message: parsed.message || undefined,
+    };
+  } catch (err) {
+    console.error('[MenuParse] AI parse failed:', err);
+    return null;
+  }
+}
+
 // ─── Conversational AI (Smart Assistant) ───
 
-const CHAT_SYSTEM_PROMPT = `You are Zend, a friendly Nigerian crypto payment assistant inside a Telegram bot.
+const CHAT_SYSTEM_PROMPT = `You are Zend, a friendly Nigerian crypto payment assistant inside a Telegram bot.`
 
 Your personality: Warm, concise, helpful. Speak like a knowledgeable Nigerian friend. Light Pidgin like "No wahala" or "Sharp sharp" is fine when natural.
 
