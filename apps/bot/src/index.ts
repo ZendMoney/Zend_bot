@@ -1668,11 +1668,23 @@ async function executeSend(
       offRampRef = order.id;
       console.log('[PAJ] Off-ramp order created:', order.id, 'deposit address:', order.address, 'amount:', order.amount);
 
-      // ─── Send USDT to PAJ deposit address ───
+      // ─── Check user has enough USDT ───
       await ctx.replyWithChatAction('typing');
-      const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, 0.001);
+      const usdtBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
+      if (usdtBalance < order.amount) {
+        throw new Error(
+          `Insufficient USDT balance.\n\n` +
+          `You have: ${usdtBalance.toFixed(2)} USDT\n` +
+          `Required: ${order.amount.toFixed(2)} USDT\n\n` +
+          `Please deposit USDT to your wallet first.\n` +
+          `Wallet: \`${user[0].walletAddress}\``
+        );
+      }
+
+      // ─── Check SOL for gas ───
+      const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, 0.003);
       if (!hasGas) {
-        throw new Error('Insufficient SOL for gas. Please deposit at least 0.001 SOL.');
+        throw new Error('Insufficient SOL for gas. Please deposit at least 0.003 SOL.');
       }
 
       const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);

@@ -13,6 +13,7 @@ import {
   createAssociatedTokenAccountIdempotentInstruction,
   createTransferInstruction,
   getAccount,
+  TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
 import { SOLANA_TOKENS } from '../../shared/src/constants.js';
 
@@ -152,6 +153,18 @@ export class WalletService {
     return signature;
   }
 
+  // Check if an address is already a token account (not a wallet)
+  private async isTokenAccount(address: string): Promise<boolean> {
+    try {
+      const pubkey = new PublicKey(address);
+      const accountInfo = await this.connection.getAccountInfo(pubkey);
+      if (!accountInfo) return false;
+      return accountInfo.owner.equals(TOKEN_PROGRAM_ID);
+    } catch {
+      return false;
+    }
+  }
+
   // Send SPL tokens (USDT, USDC) to a recipient
   // NOTE: User must have SOL for gas. Zend can optionally fund their wallet on first deposit.
   async sendSplToken(
@@ -164,26 +177,54 @@ export class WalletService {
     const mintPubkey = new PublicKey(mintAddress);
     const recipientPubkey = new PublicKey(recipientAddress);
     const senderTokenAccount = await getAssociatedTokenAddress(mintPubkey, userWallet.publicKey);
-    const recipientTokenAccount = await getAssociatedTokenAddress(mintPubkey, recipientPubkey);
+
+    // ─── Check sender has enough balance ───
+    let senderBalance = 0;
+    try {
+      const account = await getAccount(this.connection, senderTokenAccount);
+      senderBalance = Number(account.amount) / Math.pow(10, decimals);
+    } catch {
+      throw new Error(`You don't have a ${mintAddress.slice(0, 6)}... token account yet. Please deposit tokens first.`);
+    }
+
+    if (senderBalance < amount) {
+      throw new Error(`Insufficient balance. You have ${senderBalance.toFixed(decimals)} but need ${amount.toFixed(decimals)}.`);
+    }
 
     const rawAmount = BigInt(Math.round(amount * Math.pow(10, decimals)));
+    const instructions: TransactionInstruction[] = [];
 
-    const instructions: TransactionInstruction[] = [
-      // Ensure recipient token account exists (user pays for this ATA creation)
-      createAssociatedTokenAccountIdempotentInstruction(
-        userWallet.publicKey, // user pays
-        recipientTokenAccount,
-        recipientPubkey,
-        mintPubkey
-      ),
-      // Transfer tokens
-      createTransferInstruction(
-        senderTokenAccount,
-        recipientTokenAccount,
-        userWallet.publicKey,
-        rawAmount
-      ),
-    ];
+    // ─── Detect if recipient is a token account or wallet ───
+    const recipientIsTokenAccount = await this.isTokenAccount(recipientAddress);
+
+    if (recipientIsTokenAccount) {
+      // Recipient is already a token account — transfer directly
+      instructions.push(
+        createTransferInstruction(
+          senderTokenAccount,
+          recipientPubkey, // recipient is the token account itself
+          userWallet.publicKey,
+          rawAmount
+        )
+      );
+    } else {
+      // Recipient is a wallet — compute ATA and create if needed
+      const recipientTokenAccount = await getAssociatedTokenAddress(mintPubkey, recipientPubkey);
+      instructions.push(
+        createAssociatedTokenAccountIdempotentInstruction(
+          userWallet.publicKey,
+          recipientTokenAccount,
+          recipientPubkey,
+          mintPubkey
+        ),
+        createTransferInstruction(
+          senderTokenAccount,
+          recipientTokenAccount,
+          userWallet.publicKey,
+          rawAmount
+        )
+      );
+    }
 
     return this.signAndSend(userWallet, instructions);
   }
