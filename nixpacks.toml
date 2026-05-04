@@ -1,8 +1,11 @@
-[phases.build]
-cmds = ["pnpm install"]
-
 [phases.setup]
-nixPkgs = ["nodejs_20"]
+nixPkgs = ["nodejs_20", "ffmpeg", "gnumake", "gcc"]
+
+[phases.build]
+cmds = [
+  "pnpm install",
+  "bash apps/bot/src/services/whisper/setup.sh"
+]
 
 [start]
 cmd = "pnpm db:migrate && pnpm exec tsx apps/bot/src/index.ts"

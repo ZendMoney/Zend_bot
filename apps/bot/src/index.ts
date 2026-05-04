@@ -1047,11 +1047,23 @@ bot.on(message('voice'), async (ctx) => {
     return;
   }
 
-  if (!process.env.DEEPGRAM_API_KEY || process.env.DEEPGRAM_API_KEY === 'your_deepgram_key') {
+  // Check whisper.cpp is available
+  try {
+    const { hasWhisper } = await import('./services/whisper/index.js');
+    if (!hasWhisper()) {
+      await ctx.reply(
+        '🎙️ *Voice Notes*\n\n' +
+        'Voice transcription is being set up.\n' +
+        'For now, please type your command or use the menu below.',
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
+      return;
+    }
+  } catch {
     await ctx.reply(
       '🎙️ *Voice Notes*\n\n' +
-      'Voice messages need STT setup.\n' +
-      'For now, please type your command or use the menu below.',
+      'Voice transcription is not ready yet.\n' +
+      'Please type your command or use the menu below.',
       { parse_mode: 'Markdown', ...mainMenu }
     );
     return;

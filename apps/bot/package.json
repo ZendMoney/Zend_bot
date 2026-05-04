@@ -4,7 +4,6 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@deepgram/sdk": "^5.1.0",
     "@zend/db": "workspace:*",
     "@zend/paj-client": "workspace:*",
     "@zend/shared": "workspace:*",

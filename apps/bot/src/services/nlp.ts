@@ -416,34 +416,12 @@ export async function chatWithKimi(text: string): Promise<ChatReply | null> {
   return { reply: reply.trim() };
 }
 
-// ─── Voice Transcription (Deepgram) ───
+// ─── Voice Transcription (Local whisper.cpp — same as OpenClaw) ───
 
-import { createClient } from '@deepgram/sdk';
+import { transcribeWithWhisper } from './whisper/index.js';
 
-const deepgram = process.env.DEEPGRAM_API_KEY && process.env.DEEPGRAM_API_KEY !== 'your_deepgram_key'
-  ? createClient(process.env.DEEPGRAM_API_KEY)
-  : null;
-
-/**
- * Transcribe audio using Deepgram (local inference feel, cloud accuracy)
- * Free tier: $200 credit — sign up at deepgram.com
- */
 export async function transcribeVoice(audioBuffer: Buffer): Promise<string> {
-  if (!deepgram) {
-    throw new Error('Deepgram not configured. Set DEEPGRAM_API_KEY in .env or Railway variables');
-  }
-
-  try {
-    const { result } = await deepgram.listen.prerecorded.transcribeFile(
-      audioBuffer,
-      { model: 'nova-2', smart_format: true, language: 'en' }
-    );
-    const transcript = result?.results?.channels?.[0]?.alternatives?.[0]?.transcript || '';
-    return transcript;
-  } catch (err) {
-    console.error('[STT] Deepgram transcription failed:', err);
-    throw err;
-  }
+  return transcribeWithWhisper(audioBuffer);
 }
 
 // ─── Voice Confirmation AI ───
