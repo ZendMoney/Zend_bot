@@ -36,13 +36,13 @@ async function fetchJupiterQuote(
 export interface SwapQuote {
   inputMint: string;
   outputMint: string;
-  inAmount: number;
-  outAmount: number;
-  otherAmountThreshold: number;
+  inAmount: string;        // Jupiter returns/expects strings for amounts
+  outAmount: string;
+  otherAmountThreshold: string;
   swapMode: string;
   slippageBps: number;
   platformFee: number | null;
-  priceImpactPct: number;
+  priceImpactPct: string;  // Jupiter returns string like "0.01"
   routePlan: any[];
   contextSlot: number;
   timeTaken: number;
@@ -59,16 +59,17 @@ export interface SwapResult {
  * Get a swap quote from Jupiter
  */
 function normalizeQuote(data: any): SwapQuote {
+  // Keep amounts as strings — Jupiter's swap API expects them back as strings
   return {
     inputMint: data.inputMint,
     outputMint: data.outputMint,
-    inAmount: Number(data.inAmount),
-    outAmount: Number(data.outAmount),
-    otherAmountThreshold: Number(data.otherAmountThreshold),
+    inAmount: String(data.inAmount),
+    outAmount: String(data.outAmount),
+    otherAmountThreshold: String(data.otherAmountThreshold),
     swapMode: data.swapMode,
     slippageBps: data.slippageBps,
     platformFee: data.platformFee ?? null,
-    priceImpactPct: Number(data.priceImpactPct),
+    priceImpactPct: String(data.priceImpactPct),
     routePlan: data.routePlan,
     contextSlot: data.contextSlot,
     timeTaken: data.timeTaken,
