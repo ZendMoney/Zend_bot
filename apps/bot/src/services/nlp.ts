@@ -79,11 +79,11 @@ const BANK_PATTERNS = Object.entries(BANK_ALIASES).flatMap(([code, names]) =>
     code,
     name,
     // Use word boundary OR space/punctuation before/after
-    regex: new RegExp(`(?:^|[\\s,;:-])${name}(?:[\\s,;:-]|$)`, 'i'),
+    regex: new RegExp(`(?:^|[\\s,;:.!?-])${name}(?:[\\s,;:.!?-]|$)`, 'i'),
   }))
 );
 
-const ACCOUNT_NUMBER_PATTERN = /\b(\d[\d\s\-\.]{9,19}\d)\b/;
+const ACCOUNT_NUMBER_PATTERN = /\b(\d[\d\s\-\.]{8,18}\d)\b/;
 
 // Strip non-digits from account numbers (Whisper adds dashes, spaces, dots)
 function sanitizeAccountNumber(raw: string | null | undefined): string | null {
@@ -327,7 +327,7 @@ Extract the following from user messages:
 - amount: number (always in NGN, convert "50k" to 50000)
 - recipientName: person or business name
 - bankName: full bank name
-- bankCode: one of: GTB, FIRST, UBA, ZENITH, ACCESS, ECOBANK, FIDELITY, FCMB, WEMA, POLARIS, STERLING, UNITY, JAIZ, KEYSTONE, HERITAGE, STANBIC, UNION
+- bankCode: one of: GTB, FIRST, UBA, ZENITH, ACCESS, ECOBANK, FIDELITY, FCMB, WEMA, POLARIS, STERLING, UNITY, JAIZ, KEYSTONE, HERITAGE, STANBIC, UNION, OPAY, KUDA, PALMPAY, MONIEPOINT, PAGA, VFD, CARBON, FAIRMONEY, BRANCH
 - accountNumber: 10 digit Nigerian bank account number
 - walletAddress: Solana wallet address (32-44 chars)
 
