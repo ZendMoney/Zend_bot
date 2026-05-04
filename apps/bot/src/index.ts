@@ -26,7 +26,7 @@ import {
 import crypto from 'crypto';
 
 const BOT_TOKEN = process.env.BOT_TOKEN!;
-const SOLANA_RPC = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
+const SOLANA_RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
 
 // Lazy-load PAJ client to ensure .env is loaded first
 let _pajClient: PAJClient | null = null;
@@ -1836,7 +1836,7 @@ bot.hears('📥 Receive', async (ctx) => {
 // ═════════════════════════════════════════════════════════════════════════════
 
 import { getSwapQuote, buildSwapTransaction, SWAP_TOKENS, getTokenBySymbol, formatTokenAmount } from './services/jupiter.js';
-import { getChainRailsClient } from '@zend/chainrails-client';
+import { getChainRailsClient, TOKEN_ADDRESSES, CHAIN_NAMES } from '@zend/chainrails-client';
 
 async function showSwapMenu(ctx: ZendContext, userId: string) {
   await ctx.reply(
@@ -2053,13 +2053,24 @@ bot.action('confirm_swap', async (ctx) => {
 // 🌉 CHAINRAILS BRIDGE (Cross-chain Deposit)
 // ═════════════════════════════════════════════════════════════════════════════
 
+// Map shorthand chain names to ChainRails chain IDs
+const BRIDGE_CHAIN_MAP: Record<string, string> = {
+  ethereum: 'ETHEREUM_MAINNET',
+  base: 'BASE_MAINNET',
+  bsc: 'BSC_MAINNET',
+  arbitrum: 'ARBITRUM_MAINNET',
+  optimism: 'OPTIMISM_MAINNET',
+  polygon: 'POLYGON_MAINNET',
+  avalanche: 'AVALANCHE_MAINNET',
+};
+
 async function showBridgeMenu(ctx: ZendContext, userId: string) {
   const chainRails = await getChainRailsClient();
   if (!chainRails) {
     await ctx.reply(
       `🌉 *Cross-Chain Deposit*\n\n` +
       `Deposit crypto from any chain directly into your Zend Solana wallet.\n\n` +
-      `⚠️ *Coming soon* — ChainRails integration is being configured.\n\n` +
+      `⚠️ *ChainRails API key not configured.*\n\n` +
       `For now, use:\n` +
       `• 💵 *Add Naira* — NGN bank transfer → USDT\n` +
       `• 📥 *Receive* — Direct Solana deposit`,
@@ -2068,17 +2079,17 @@ async function showBridgeMenu(ctx: ZendContext, userId: string) {
     return;
   }
 
-  // Show supported chains (scaffold — would fetch from API)
   await ctx.reply(
     `🌉 *Cross-Chain Deposit*\n\n` +
-    `Send crypto from any chain and receive USDT in your Zend wallet.\n\n` +
+    `Send crypto from any EVM chain and receive USDT on Solana.\n\n` +
     `Select source chain:`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
         [Markup.button.callback('Ethereum (USDC)', 'bridge:ethereum:USDC')],
-        [Markup.button.callback('BSC (USDT)', 'bridge:bsc:USDT')],
         [Markup.button.callback('Base (USDC)', 'bridge:base:USDC')],
+        [Markup.button.callback('BSC (USDT)', 'bridge:bsc:USDT')],
+        [Markup.button.callback('Arbitrum (USDC)', 'bridge:arbitrum:USDC')],
         [Markup.button.callback('❌ Cancel', 'cancel_bridge')],
       ]),
     }
@@ -2092,12 +2103,18 @@ bot.command('bridge', async (ctx) => {
 bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from!.id.toString();
-  const chain = ctx.match[1];
+  const chainKey = ctx.match[1];
   const token = ctx.match[2];
 
   const chainRails = await getChainRailsClient();
   if (!chainRails) {
     await ctx.editMessageText('❌ ChainRails not configured.');
+    return;
+  }
+
+  const sourceChain = BRIDGE_CHAIN_MAP[chainKey];
+  if (!sourceChain) {
+    await ctx.editMessageText('❌ Unsupported chain.');
     return;
   }
 
@@ -2108,14 +2125,36 @@ bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
   }
 
   try {
-    await ctx.editMessageText('⏳ Generating deposit address...');
+    await ctx.editMessageText('⏳ Generating deposit address via ChainRails...');
 
-    const deposit = await chainRails.createDeposit({
-      fromChain: chain,
-      fromToken: token,
-      toChain: 'solana',
-      toToken: 'USDT',
-      toAddress: user[0].walletAddress,
+    const tokenIn = TOKEN_ADDRESSES[sourceChain]?.[token];
+    if (!tokenIn) {
+      throw new Error(`Token ${token} not supported on ${sourceChain}`);
+    }
+
+    // Get quote first (optional but good for fee transparency)
+    const quote = await chainRails.getBestQuote({
+      tokenIn,
+      tokenOut: TOKEN_ADDRESSES.SOLANA_MAINNET.USDT,
+      sourceChain,
+      destinationChain: 'SOLANA_MAINNET',
+      amount: '10000000', // 10 USDC/USDT for quote (will be replaced by actual amount)
+      amountSymbol: token,
+      recipient: user[0].walletAddress,
+    });
+
+    // Create intent — user will send to intent_address
+    const intent = await chainRails.createIntent({
+      amount: '0', // 0 = open amount, user can send any amount
+      amountSymbol: token,
+      tokenIn,
+      sourceChain,
+      destinationChain: 'SOLANA_MAINNET',
+      recipient: user[0].walletAddress,
+      metadata: {
+        userId,
+        telegramUserId: userId,
+      },
     });
 
     // Record in DB
@@ -2125,20 +2164,26 @@ bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
       userId,
       type: 'crypto_receive',
       status: 'pending',
-      pajReference: deposit.id,
+      pajReference: intent.intent_address,
       recipientWalletAddress: user[0].walletAddress,
+      fromAmount: '0',
+      fromMint: tokenIn,
+      toMint: TOKEN_ADDRESSES.SOLANA_MAINNET.USDT,
     });
 
+    const chainDisplay = CHAIN_NAMES[sourceChain] || sourceChain;
+
     await ctx.reply(
-      `🌉 *Deposit ${token} from ${chain.charAt(0).toUpperCase() + chain.slice(1)}*\n\n` +
-      `Send ${token} to this address:\n` +
-      `\`\`\`\n${deposit.depositAddress}\n\`\`\`\n\n` +
+      `🌉 *Deposit ${token} from ${chainDisplay}*\n\n` +
+      `Send ${token} to this ChainRails intent address:\n` +
+      `\`\`\`\n${intent.intent_address}\n\`\`\`\n\n` +
       `⚠️ *Important:*\n` +
-      `• Only send ${token} on ${chain}\n` +
-      `• Minimum: $10 equivalent\n` +
-      `• You'll receive USDT on Solana\n\n` +
+      `• Only send ${token} on ${chainDisplay}\n` +
+      `• You'll receive USDT on Solana\n` +
+      `• Estimated fee: ${quote.totalFeeFormatted} ${token}\n` +
+      `• Expires: ${new Date(intent.expires_at).toLocaleString()}\n\n` +
       `Reference: \`${txId}\`\n` +
-      `ChainRails ID: \`${deposit.id}\``, 
+      `Intent: \`${intent.intent_address}\``, 
       { parse_mode: 'Markdown', ...mainMenu }
     );
   } catch (err: any) {
@@ -2146,7 +2191,8 @@ bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
     await ctx.reply(
       `❌ *Bridge Error*\n\n` +
       `Could not generate deposit address.\n` +
-      `Error: ${err.message || 'Unknown error'}`,
+      `Error: ${err.message || 'Unknown error'}\n\n` +
+      `Note: ChainRails may not support Solana as a destination yet.`,
       { parse_mode: 'Markdown', ...mainMenu }
     );
   }
@@ -2385,26 +2431,32 @@ function startWebhookServer(botInstance: Telegraf<any>) {
       req.on('end', async () => {
         try {
           const event = JSON.parse(body);
-          console.log('📩 ChainRails Webhook:', event.type, event.id);
+          console.log('📩 ChainRails Webhook:', event.event || event.type, event.intent_address || event.id);
+
+          const intentAddress = event.intent_address || event.address || event.id;
+          const status = event.intent_status || event.status;
+          const amount = event.initialAmount || event.amount;
+          const token = event.asset_token_symbol || event.token;
 
           // Update transaction status
-          if (event.id) {
+          if (intentAddress) {
+            const txStatus = status === 'COMPLETED' ? 'completed' : status === 'FAILED' ? 'failed' : 'processing';
             await db.update(transactions)
               .set({
-                status: event.status === 'completed' ? 'completed' : event.status === 'failed' ? 'failed' : 'processing',
-                completedAt: event.status === 'completed' ? new Date() : undefined,
+                status: txStatus,
+                completedAt: txStatus === 'completed' ? new Date() : undefined,
               })
-              .where(eq(transactions.pajReference, event.id));
+              .where(eq(transactions.pajReference, intentAddress));
           }
 
-          // Notify user if we have their Telegram ID
-          if (event.userId && event.status === 'completed') {
+          // Notify user via Telegram
+          if (status === 'COMPLETED' && event.metadata?.telegramUserId) {
             try {
               await botInstance.telegram.sendMessage(
-                event.userId,
+                event.metadata.telegramUserId,
                 `✅ *Cross-Chain Deposit Complete!*\n\n` +
-                `${event.amount} ${event.token} has arrived in your Zend wallet.`,
-                { parse_mode: 'Markdown' }
+                `${amount} ${token} has arrived in your Zend Solana wallet.`,
+                { parse_mode: 'Markdown', ...mainMenu }
               );
             } catch (notifyErr) {
               console.log('[ChainRails] Could not notify user:', notifyErr);
