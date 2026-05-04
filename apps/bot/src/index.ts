@@ -193,7 +193,7 @@ async function getPAJRates(): Promise<{ onRampRate: number; offRampRate: number 
 let _pajBankCache: Array<{ id: string; name: string; code: string }> | null = null;
 let _pajBankCacheTime = 0;
 
-async function getPAJBankList(sessionToken: string): Promise<Array<{ id: string; name: string; code: string }>> {
+async function getPajBankList(sessionToken: string): Promise<Array<{ id: string; name: string; code: string }>> {
   if (_pajBankCache && Date.now() - _pajBankCacheTime < 3600000) {
     return _pajBankCache;
   }
@@ -222,7 +222,7 @@ async function verifyBankAccount(
 
   try {
     // Get PAJ bank list and find matching bank
-    const pajBanks = await getPAJBankList(sessionToken);
+    const pajBanks = await getPajBankList(sessionToken);
     const ourBank = NIGERIAN_BANKS.find(b => b.code === ourBankCode);
     if (!ourBank) {
       return { verified: false, error: 'Unknown bank code' };
@@ -1105,44 +1105,15 @@ bot.on(message('voice'), async (ctx) => {
 
     await finishLoading(ctx, loadingVoice.message_id, `📝 *You said:* "${text}"`, 'Markdown');
 
-    // If Kimi says it needs confirmation (send/cash_out with details)
-    if (analysis.needsConfirm && analysis.amount && (analysis.accountNumber || analysis.walletAddress)) {
-      // Store in session for confirm/cancel
-      const session = getSession(userId);
-      session.voiceAnalysis = {
-        text,
-        amount: analysis.amount,
-        recipientName: analysis.recipientName,
-        bankCode: analysis.bankCode,
-        bankName: analysis.bankName,
-        accountNumber: analysis.accountNumber,
-        walletAddress: analysis.walletAddress,
-      };
-      setSession(userId, session);
-
-      await ctx.reply(
-        `🧠 *Kimi understood:*\n\n${analysis.message}`,
-        {
-          parse_mode: 'Markdown',
-          ...Markup.inlineKeyboard([
-            [Markup.button.callback('✅ Yes, proceed', 'voice_confirm_yes')],
-            [Markup.button.callback('❌ No, cancel', 'voice_confirm_no')],
-          ]),
-        }
-      );
-      return;
-    }
-
     // Execute based on intent
     switch (analysis.intent) {
       case 'balance': {
-        await ctx.reply(analysis.message, mainMenu);
+        await ctx.reply(analysis.message || 'Checking your balance...', mainMenu);
         await handleBalance(ctx, userId);
         return;
       }
       case 'add_naira': {
-        await ctx.reply(analysis.message, mainMenu);
-        // Simulate clicking Add Naira
+        await ctx.reply(analysis.message || 'Starting Add Naira...', mainMenu);
         const pajClient = await getPAJClient();
         if (!pajClient) {
           await ctx.reply('❌ PAJ service is not configured. Please contact support.', mainMenu);
@@ -1151,8 +1122,8 @@ bot.on(message('voice'), async (ctx) => {
         setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampAmount: analysis.amount || undefined });
         await ctx.reply(
           `💵 *Add Naira*\n\n` +
-          (analysis.amount
-            ? `Amount: ${formatNgn(analysis.amount)}\n\nHow much do you want to add? (Minimum ₦1,000)`
+          (analysis.amount && analysis.amount >= PAJ_MIN_DEPOSIT_NGN
+            ? `Amount: ${formatNgn(analysis.amount)}\n\nConfirm or enter a different amount (Minimum ₦1,000):`
             : `How much NGN do you want to add to your wallet?\n\nMinimum: ${formatNgn(PAJ_MIN_DEPOSIT_NGN)}\n\nEnter the amount (numbers only):`),
           { parse_mode: 'Markdown', ...cancelKeyboard }
         );
@@ -1161,20 +1132,95 @@ bot.on(message('voice'), async (ctx) => {
       case 'send':
       case 'cash_out': {
         if (!analysis.amount) {
-          await ctx.reply(analysis.message + '\n\nHow much do you want to send?', mainMenu);
+          setSession(userId, { state: ConversationState.AWAITING_SEND_AMOUNT, pendingTransaction: {} });
+          await ctx.reply(
+            (analysis.message || 'Got it, you want to send money.') + '\n\nHow much do you want to send? (in Naira)',
+            { parse_mode: 'Markdown', ...cancelKeyboard }
+          );
           return;
         }
-        if (!analysis.accountNumber && !analysis.walletAddress) {
-          await ctx.reply(analysis.message + '\n\nPlease include the bank and account number.', mainMenu);
+        // Wallet send (crypto address)
+        if (analysis.walletAddress) {
+          await ctx.reply(
+            `📤 *Send to Wallet*\n\n` +
+            `Amount: ${formatNgn(analysis.amount)}\n` +
+            `Address: \`${analysis.walletAddress}\`\n\n` +
+            `Crypto wallet sends are not yet available. Please use bank transfer instead.`,
+            { parse_mode: 'Markdown', ...mainMenu }
+          );
           return;
         }
-        // If we have amount + account but Kimi didn't set needsConfirm (maybe bank missing)
-        await ctx.reply(analysis.message, mainMenu);
+        // Bank send — need account number + bank
+        if (!analysis.accountNumber) {
+          setSession(userId, {
+            state: ConversationState.AWAITING_SEND_RECIPIENT,
+            pendingTransaction: { amountNgn: analysis.amount || undefined, recipientName: analysis.recipientName || undefined },
+          });
+          await ctx.reply(
+            (analysis.message || `Send ${formatNgn(analysis.amount || 0)}`) + '\n\nPlease provide recipient details:\n"Name BankCode AccountNumber"\nExample: "Tunde GTB 0123456789"',
+            { parse_mode: 'Markdown', ...cancelKeyboard }
+          );
+          return;
+        }
+        if (!analysis.bankCode) {
+          const bankButtons = NIGERIAN_BANKS.map(b => Markup.button.callback(b.name, `nlp_bank:${b.code}`));
+          const rows: any[] = [];
+          for (let i = 0; i < bankButtons.length; i += 2) {
+            rows.push(bankButtons.slice(i, i + 2));
+          }
+          setSession(userId, {
+            state: ConversationState.AWAITING_BANK_DETAILS,
+            pendingTransaction: {
+              amountNgn: analysis.amount || undefined,
+              recipientAccountNumber: analysis.accountNumber,
+              recipientName: analysis.recipientName || undefined,
+            },
+          });
+          await ctx.reply(
+            `🏦 Which bank?\n\n` +
+            `Account number: \`${analysis.accountNumber}\`\n` +
+            `Amount: ${formatNgn(analysis.amount || 0)}\n\n` +
+            `Select a bank:`,
+            { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }
+          );
+          return;
+        }
+        // Full details — verify + show confirmation
+        const bank = NIGERIAN_BANKS.find(b => b.code === analysis.bankCode);
+        if (!bank) {
+          await ctx.reply('❌ Unknown bank code. Please try again.', mainMenu);
+          return;
+        }
+        await prepareSendConfirmation(
+          ctx, userId, analysis.amount,
+          analysis.accountNumber, bank.code, bank.name,
+          analysis.recipientName || undefined
+        );
+        return;
+      }
+      case 'receive': {
+        await ctx.reply(analysis.message || 'Here is how to receive money:', mainMenu);
+        await showReceive(ctx, userId);
+        return;
+      }
+      case 'history': {
+        await ctx.reply(analysis.message || 'Loading your history...', mainMenu);
+        await showHistory(ctx, userId);
+        return;
+      }
+      case 'settings': {
+        await ctx.reply(analysis.message || 'Opening settings...', mainMenu);
+        await showSettings(ctx, userId);
+        return;
+      }
+      case 'swap': {
+        await ctx.reply(analysis.message || 'Opening swap...', mainMenu);
+        await showSwap(ctx);
         return;
       }
       default: {
         // chat / unknown — just reply conversationally
-        await ctx.reply(analysis.message, mainMenu);
+        await ctx.reply(analysis.message || 'I\'m not sure what you mean. Try using the menu.', mainMenu);
       }
     }
 
@@ -1185,7 +1231,7 @@ bot.on(message('voice'), async (ctx) => {
   }
 });
 
-// Voice confirmation handlers
+// Voice confirmation handlers (legacy — new voice flow uses confirm_send/cancel_send directly)
 bot.action('voice_confirm_yes', async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from!.id.toString();
@@ -1197,22 +1243,50 @@ bot.action('voice_confirm_yes', async (ctx) => {
     return;
   }
 
-  // Build a synthetic text command and process it
-  let syntheticText = `send ${va.amount}`;
-  if (va.recipientName) syntheticText += ` to ${va.recipientName}`;
-  if (va.bankName) syntheticText += ` ${va.bankName}`;
-  if (va.accountNumber) syntheticText += ` ${va.accountNumber}`;
-  if (va.walletAddress) syntheticText += ` ${va.walletAddress}`;
-
-  await ctx.editMessageText(`✅ Confirmed! Processing: "${syntheticText}"`);
-
   // Clear voice analysis
   session.voiceAnalysis = undefined;
   setSession(userId, session);
 
-  // Forward to text handler
-  (ctx as any).message = { text: syntheticText };
-  await bot.handleUpdate(ctx.update);
+  // If we have enough info, prepare confirmation UI (same as direct voice flow)
+  if (va.accountNumber && va.bankCode) {
+    const bank = NIGERIAN_BANKS.find(b => b.code === va.bankCode);
+    if (bank) {
+      await ctx.editMessageText('✅ Got it! Preparing confirmation...');
+      await prepareSendConfirmation(
+        ctx, userId, va.amount,
+        va.accountNumber, bank.code, bank.name,
+        va.recipientName || undefined
+      );
+      return;
+    }
+  }
+
+  // Missing bank — show bank selection
+  if (va.accountNumber && va.amount) {
+    const bankButtons = NIGERIAN_BANKS.map(b => Markup.button.callback(b.name, `nlp_bank:${b.code}`));
+    const rows: any[] = [];
+    for (let i = 0; i < bankButtons.length; i += 2) {
+      rows.push(bankButtons.slice(i, i + 2));
+    }
+    setSession(userId, {
+      state: ConversationState.AWAITING_BANK_DETAILS,
+      pendingTransaction: {
+        amountNgn: va.amount,
+        recipientAccountNumber: va.accountNumber,
+        recipientName: va.recipientName || undefined,
+      },
+    });
+    await ctx.editMessageText('🏦 Which bank?');
+    await ctx.reply(
+      `Select the recipient's bank:`,
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }
+    );
+    return;
+  }
+
+  // Not enough info
+  await ctx.editMessageText('❌ Not enough details. Please use the menu to send.');
+  await ctx.reply('Menu:', mainMenu);
 });
 
 bot.action('voice_confirm_no', async (ctx) => {
@@ -1346,25 +1420,24 @@ bot.hears('📤 Send', async (ctx) => {
 // CONFIRM SEND
 // ═════════════════════════════════════════════════════════════════════════════
 
-bot.action('confirm_send', async (ctx) => {
-  await ctx.answerCbQuery();
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-
-  if (session.state !== ConversationState.AWAITING_CONFIRMATION || !session.pendingTransaction) {
-    await ctx.editMessageText('❌ Session expired. Please start over.');
-    await ctx.reply('Use the menu to start again.', mainMenu);
-    return;
+// Reusable send execution (used by confirm_send and voice_confirm_yes)
+async function executeSend(
+  ctx: ZendContext,
+  userId: string,
+  txData: {
+    amountNgn: number;
+    amountUsdt: number;
+    recipientBankCode?: string;
+    recipientBankName?: string;
+    recipientAccountNumber?: string;
+    recipientAccountName?: string;
+    recipientName?: string;
   }
-
-  const { amountNgn, amountUsdt, recipientBankCode, recipientBankName, recipientAccountNumber, recipientAccountName, recipientName } =
-    session.pendingTransaction;
-
-  // Use recipientName as fallback for recipientAccountName (from NLP)
-  const finalAccountName = recipientAccountName || recipientName || 'Recipient';
-  const finalBankName = recipientBankName || 'Unknown';
-  const finalBankCode = recipientBankCode || 'UNKNOWN';
-  const finalAccountNumber = recipientAccountNumber || '0000000000';
+) {
+  const finalAccountName = txData.recipientAccountName || txData.recipientName || 'Recipient';
+  const finalBankName = txData.recipientBankName || 'Unknown';
+  const finalBankCode = txData.recipientBankCode || 'UNKNOWN';
+  const finalAccountNumber = txData.recipientAccountNumber || '0000000000';
 
   const txId = generateTxId();
   await db.insert(transactions).values({
@@ -1372,7 +1445,7 @@ bot.action('confirm_send', async (ctx) => {
     userId,
     type: 'ngn_send',
     status: 'processing',
-    ngnAmount: amountNgn!.toString(),
+    ngnAmount: txData.amountNgn.toString(),
     ngnRate: '1550',
     recipientBankCode: finalBankCode,
     recipientBankName: finalBankName,
@@ -1384,7 +1457,7 @@ bot.action('confirm_send', async (ctx) => {
 
   await ctx.editMessageText(
     `⏳ *Processing...*\n\n` +
-    `Sending ${amountUsdt!.toFixed(2)} USDT\n` +
+    `Sending ${txData.amountUsdt.toFixed(2)} USDT\n` +
     `Estimated: 1-5 minutes\n\n` +
     `Reference: ${txId}`,
     { parse_mode: 'Markdown' }
@@ -1393,13 +1466,11 @@ bot.action('confirm_send', async (ctx) => {
   try {
     await ctx.replyWithChatAction('typing');
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-    const walletAddress = user[0].walletAddress;
     let offRampRef = 'MOCK-' + Math.random().toString(36).substring(2, 8).toUpperCase();
 
     const pajClient = await getPAJClient();
     if (pajClient && user[0].pajSessionToken) {
       await ctx.replyWithChatAction('typing');
-      // Map our bank code → PAJ MongoDB bank ID
       const pajBanks = await getPajBankList(user[0].pajSessionToken);
       const ourBank = NIGERIAN_BANKS.find(b => b.code === finalBankCode);
       const pajBank = pajBanks.find(pb =>
@@ -1409,12 +1480,11 @@ bot.action('confirm_send', async (ctx) => {
       if (!pajBank) {
         throw new Error(`Bank "${ourBank?.name}" not found on PAJ`);
       }
-      // Real PAJ off-ramp
       const order = await pajClient.createOfframp({
         bank: pajBank.id,
         accountNumber: finalAccountNumber,
         currency: Currency.NGN,
-        fiatAmount: amountNgn!,
+        fiatAmount: txData.amountNgn,
         mint: SOLANA_TOKENS.USDT.mint,
         chain: Chain.SOLANA,
       }, user[0].pajSessionToken);
@@ -1427,7 +1497,6 @@ bot.action('confirm_send', async (ctx) => {
       .set({ pajReference: offRampRef })
       .where(eq(transactions.id, txId));
 
-    // Simulate completion
     setTimeout(async () => {
       await db.update(transactions)
         .set({ status: 'completed', completedAt: new Date() })
@@ -1435,7 +1504,7 @@ bot.action('confirm_send', async (ctx) => {
 
       await ctx.reply(
         `✅ *Transfer Complete!*\n\n` +
-        `${formatNgn(amountNgn!)} sent to ${finalAccountName}\n` +
+        `${formatNgn(txData.amountNgn)} sent to ${finalAccountName}\n` +
         `${finalBankName} • \`${finalAccountNumber}\`\n\n` +
         `Reference: ${txId}\n` +
         `PAJ Ref: ${offRampRef}\n` +
@@ -1456,6 +1525,31 @@ bot.action('confirm_send', async (ctx) => {
       { parse_mode: 'Markdown', ...mainMenu }
     );
   }
+}
+
+bot.action('confirm_send', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+
+  if (session.state !== ConversationState.AWAITING_CONFIRMATION || !session.pendingTransaction) {
+    await ctx.editMessageText('❌ Session expired. Please start over.');
+    await ctx.reply('Use the menu to start again.', mainMenu);
+    return;
+  }
+
+  const { amountNgn, amountUsdt, recipientBankCode, recipientBankName, recipientAccountNumber, recipientAccountName, recipientName } =
+    session.pendingTransaction;
+
+  await executeSend(ctx, userId, {
+    amountNgn: amountNgn!,
+    amountUsdt: amountUsdt!,
+    recipientBankCode,
+    recipientBankName,
+    recipientAccountNumber,
+    recipientAccountName,
+    recipientName,
+  });
 });
 
 bot.action('cancel_send', async (ctx) => {
@@ -1465,6 +1559,95 @@ bot.action('cancel_send', async (ctx) => {
   await ctx.editMessageText('❌ Cancelled.');
   await ctx.reply('What would you like to do?', mainMenu);
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SHARED SEND CONFIRMATION HELPER (used by text + voice flows)
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function prepareSendConfirmation(
+  ctx: ZendContext,
+  userId: string,
+  amountNgn: number,
+  recipientAccountNumber: string,
+  bankCode: string,
+  bankName: string,
+  recipientName?: string
+) {
+  const pajClient = await getPAJClient();
+  let rate = 1550;
+  try {
+    if (pajClient) {
+      const rates = await getPAJRates();
+      rate = rates.offRampRate;
+    }
+  } catch (err) {
+    console.log('Using fallback rate for send confirmation');
+  }
+
+  const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
+  const zendFeeUsdt = (amountNgn / rate) * (zendFeeBps / 10000);
+  const usdtNeeded = (amountNgn / rate) + zendFeeUsdt;
+
+  // ─── Verify bank account with PAJ ───
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  let verifiedName = recipientName;
+  let verifiedStatus: 'verified' | 'unverified' | 'no_paj' = 'unverified';
+
+  if (user[0]?.pajSessionToken) {
+    const verification = await verifyBankAccount(user[0].pajSessionToken, bankCode, recipientAccountNumber);
+    if (verification.verified && verification.accountName) {
+      verifiedName = verification.accountName;
+      verifiedStatus = 'verified';
+    } else {
+      console.log('[Verify] prepareSend failed:', verification.error);
+    }
+  } else {
+    verifiedStatus = 'no_paj';
+  }
+
+  const session = getSession(userId);
+  session.pendingTransaction = {
+    amountNgn,
+    amountUsdt: usdtNeeded,
+    zendFeeUsdt,
+    recipientName: verifiedName,
+    recipientAccountName: verifiedName,
+    recipientBankName: bankName,
+    recipientBankCode: bankCode,
+    recipientAccountNumber,
+  };
+  session.state = ConversationState.AWAITING_CONFIRMATION;
+  setSession(userId, session);
+
+  let msg = `📤 *Confirm Transfer*\n\n`;
+
+  if (verifiedStatus === 'verified') {
+    msg += `✅ *Account Verified by PAJ*\n`;
+  } else if (verifiedStatus === 'no_paj') {
+    msg += `⚠️ *Account Not Verified* (link PAJ in Settings to verify)\n`;
+  } else {
+    msg += `⚠️ *Could not verify account* — please double-check details\n`;
+  }
+
+  msg += `\n` +
+    `To: *${verifiedName || 'Recipient'}*\n` +
+    `Bank: ${bankName}\n` +
+    `Account: \`${recipientAccountNumber}\`\n` +
+    `Amount: ${formatNgn(amountNgn)}\n` +
+    `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${zendFeeUsdt.toFixed(4)} USDT\n` +
+    `You pay: *${usdtNeeded.toFixed(2)} USDT*\n` +
+    `Rate: ${formatNgn(rate)}/USDT\n\n` +
+    `💡 *Gas: ~0.001 SOL* (deducted from your wallet)\n\n` +
+    `Confirm?`;
+
+  await ctx.reply(msg, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Confirm', 'confirm_send')],
+      [Markup.button.callback('❌ Cancel', 'cancel_send')],
+    ]),
+  });
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // NLP BANK SELECTION (when bank not detected in natural language)
@@ -1488,79 +1671,7 @@ bot.action(/nlp_bank:(.+)/, async (ctx) => {
   }
 
   const { amountNgn, recipientName, recipientAccountNumber } = session.pendingTransaction;
-  const pajClient = await getPAJClient();
-  let rate = 1550;
-  try {
-    if (pajClient) {
-      const rates = await getPAJRates();
-      rate = rates.offRampRate;
-    }
-  } catch (err) {
-    console.log('Using fallback rate for NLP bank select');
-  }
-
-  const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
-  const zendFeeUsdt = (amountNgn! / rate) * (zendFeeBps / 10000);
-  const usdtNeeded = (amountNgn! / rate) + zendFeeUsdt;
-
-  // ─── Verify bank account with PAJ ───
-  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-  let verifiedName = recipientName;
-  let verifiedStatus: 'verified' | 'unverified' | 'no_paj' = 'unverified';
-
-  if (user[0]?.pajSessionToken) {
-    const verification = await verifyBankAccount(user[0].pajSessionToken, bankCode, recipientAccountNumber!);
-    if (verification.verified && verification.accountName) {
-      verifiedName = verification.accountName;
-      verifiedStatus = 'verified';
-    } else {
-      console.log('[Verify] nlp_bank failed:', verification.error);
-    }
-  } else {
-    verifiedStatus = 'no_paj';
-  }
-
-  session.pendingTransaction = {
-    amountNgn,
-    amountUsdt: usdtNeeded,
-    zendFeeUsdt,
-    recipientName: verifiedName,
-    recipientAccountName: verifiedName,
-    recipientBankName: bank.name,
-    recipientBankCode: bank.code,
-    recipientAccountNumber,
-  };
-  session.state = ConversationState.AWAITING_CONFIRMATION;
-  setSession(userId, session);
-
-  let msg = `📤 *Confirm Transfer*\n\n`;
-
-  if (verifiedStatus === 'verified') {
-    msg += `✅ *Account Verified by PAJ*\n`;
-  } else if (verifiedStatus === 'no_paj') {
-    msg += `⚠️ *Account Not Verified* (link PAJ in Settings to verify)\n`;
-  } else {
-    msg += `⚠️ *Could not verify account* — please double-check details\n`;
-  }
-
-  msg += `\n` +
-    `To: *${verifiedName || 'Recipient'}*\n` +
-    `Bank: ${bank.name}\n` +
-    `Account: \`${recipientAccountNumber}\`\n` +
-    `Amount: ${formatNgn(amountNgn!)}\n` +
-    `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${zendFeeUsdt.toFixed(4)} USDT\n` +
-    `You pay: *${usdtNeeded.toFixed(2)} USDT*\n` +
-    `Rate: ${formatNgn(rate)}/USDT\n\n` +
-    `💡 *Gas: ~0.001 SOL* (deducted from your wallet)\n\n` +
-    `Confirm?`;
-
-  await ctx.editMessageText(msg, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([
-      [Markup.button.callback('✅ Confirm', 'confirm_send')],
-      [Markup.button.callback('❌ Cancel', 'cancel_send')],
-    ]),
-  });
+  await prepareSendConfirmation(ctx, userId, amountNgn!, recipientAccountNumber!, bank.code, bank.name, recipientName || undefined);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1586,8 +1697,7 @@ bot.hears('💴 Cash Out', async (ctx) => {
 // 📥 RECEIVE
 // ═════════════════════════════════════════════════════════════════════════════
 
-bot.hears('📥 Receive', async (ctx) => {
-  const userId = ctx.from.id.toString();
+async function showReceive(ctx: ZendContext, userId: string) {
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
 
   if (user.length === 0) {
@@ -1602,12 +1712,10 @@ bot.hears('📥 Receive', async (ctx) => {
   let msg = `📥 *Receive Money*\n\n`;
   msg += `Choose how you want to get paid:\n\n`;
 
-  // Crypto section
   msg += `*🪙 Crypto (Solana)*\n`;
   msg += `Send SOL, USDT, or USDC to:\n`;
   msg += `\`\`\`\n${walletAddress}\n\`\`\`\n\n`;
 
-  // Naira section
   if (hasVA) {
     msg += `*🇳🇬 Naira (Bank Transfer)*\n`;
     msg += `Send NGN to your virtual account:\n\n`;
@@ -1624,26 +1732,33 @@ bot.hears('📥 Receive', async (ctx) => {
   msg += `⏱️ *Naira takes 2–5 minutes* after bank transfer`;
 
   await ctx.reply(msg, { parse_mode: 'Markdown', ...mainMenu });
+}
+
+bot.hears('📥 Receive', async (ctx) => {
+  await showReceive(ctx, ctx.from.id.toString());
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 🔄 SWAP (placeholder)
 // ═════════════════════════════════════════════════════════════════════════════
 
-bot.hears('🔄 Swap', async (ctx) => {
+async function showSwap(ctx: ZendContext) {
   await ctx.reply(
     `🔄 *Swap Tokens*\n\n` +
     `Coming soon! You'll be able to swap SOL, USDC, and other tokens to USDT instantly.`,
     { parse_mode: 'Markdown', ...mainMenu }
   );
+}
+
+bot.hears('🔄 Swap', async (ctx) => {
+  await showSwap(ctx);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 📋 HISTORY
 // ═════════════════════════════════════════════════════════════════════════════
 
-bot.hears('📋 History', async (ctx) => {
-  const userId = ctx.from.id.toString();
+async function showHistory(ctx: ZendContext, userId: string) {
   const txs = await db.select().from(transactions)
     .where(eq(transactions.userId, userId))
     .orderBy(transactions.createdAt)
@@ -1670,14 +1785,17 @@ bot.hears('📋 History', async (ctx) => {
   }
 
   await ctx.reply(msg, { parse_mode: 'Markdown', ...mainMenu });
+}
+
+bot.hears('📋 History', async (ctx) => {
+  await showHistory(ctx, ctx.from.id.toString());
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
 // ⚙️ SETTINGS
 // ═════════════════════════════════════════════════════════════════════════════
 
-bot.hears('⚙️ Settings', async (ctx) => {
-  const userId = ctx.from.id.toString();
+async function showSettings(ctx: ZendContext, userId: string) {
   const loading = await showLoading(ctx, 'Loading settings...');
 
   try {
@@ -1718,6 +1836,10 @@ bot.hears('⚙️ Settings', async (ctx) => {
     await finishLoading(ctx, loading.message_id, '❌ Could not load settings. Please try again.');
     await ctx.reply('Menu:', mainMenu);
   }
+}
+
+bot.hears('⚙️ Settings', async (ctx) => {
+  await showSettings(ctx, ctx.from.id.toString());
 });
 
 bot.action('settings_paj', async (ctx) => {
