@@ -229,6 +229,59 @@ async function getPajBankList(sessionToken: string): Promise<Array<{ id: string;
   }
 }
 
+// Bank name aliases for fuzzy matching between our codes and PAJ names
+const BANK_NAME_ALIASES: Record<string, string[]> = {
+  'GTB': ['gtbank', 'guaranty trust bank', 'guaranty trust', 'gt bank', 'gtb'],
+  'UBA': ['uba', 'united bank for africa'],
+  'ACC': ['access', 'access bank'],
+  'ZEN': ['zenith', 'zenith bank'],
+  'FBN': ['first bank', 'firstbank'],
+  'ECO': ['ecobank', 'eco bank'],
+  'WEM': ['wema', 'wema bank'],
+  'FID': ['fidelity', 'fidelity bank'],
+  'SKY': ['polaris', 'polaris bank', 'skye', 'skye bank'],
+  'FCMB': ['fcmb', 'first city'],
+  'STERLING': ['sterling', 'sterling bank'],
+  'STA': ['stanbic', 'stanbic ibtc'],
+  'UNI': ['union', 'union bank'],
+  'KEC': ['keystone', 'keystone bank'],
+  'JAB': ['jaiz', 'jaiz bank'],
+  'OPY': ['opay'],
+  'MON': ['moniepoint'],
+  'KUD': ['kuda'],
+  'PAL': ['palmpay'],
+  'PAG': ['paga'],
+  'VFD': ['vfd'],
+  'CAR': ['carbon'],
+  'FAI': ['fairmoney'],
+  'BRA': ['branch'],
+};
+
+function scoreBankMatch(pajName: string, ourCode: string): number {
+  const ourBank = NIGERIAN_BANKS.find(b => b.code === ourCode);
+  if (!ourBank) return 0;
+
+  const p = pajName.toLowerCase();
+  const o = ourBank.name.toLowerCase();
+  const aliases = BANK_NAME_ALIASES[ourCode] || [];
+
+  // Exact match
+  if (p === o) return 100;
+  // Contains each other
+  if (p.includes(o) || o.includes(p)) return 80;
+  // Alias match
+  for (const alias of aliases) {
+    if (p.includes(alias.toLowerCase())) return 70;
+  }
+  // Word overlap
+  const pWords = p.split(/\s+/);
+  const oWords = o.split(/\s+/);
+  const overlap = pWords.filter(w => oWords.includes(w)).length;
+  if (overlap > 0) return overlap * 20;
+
+  return 0;
+}
+
 async function verifyBankAccount(
   sessionToken: string,
   ourBankCode: string,
@@ -240,25 +293,28 @@ async function verifyBankAccount(
   }
 
   try {
-    // Get PAJ bank list and find matching bank
     const pajBanks = await getPajBankList(sessionToken);
     const ourBank = NIGERIAN_BANKS.find(b => b.code === ourBankCode);
     if (!ourBank) {
       return { verified: false, error: 'Unknown bank code' };
     }
 
-    // Find PAJ bank by name match
-    const pajBank = pajBanks.find(pb =>
-      pb.name.toLowerCase().includes(ourBank.name.toLowerCase()) ||
-      ourBank.name.toLowerCase().includes(pb.name.toLowerCase())
-    );
+    // Score all banks and pick best match
+    let bestMatch: { bank: any; score: number } | null = null;
+    for (const pb of pajBanks) {
+      const score = scoreBankMatch(pb.name, ourBankCode);
+      if (score > 0 && (!bestMatch || score > bestMatch.score)) {
+        bestMatch = { bank: pb, score };
+      }
+    }
 
-    if (!pajBank) {
+    if (!bestMatch || bestMatch.score < 20) {
+      console.log('[PAJ] Available banks:', pajBanks.map(b => b.name).join(', '));
       return { verified: false, error: `Bank "${ourBank.name}" not found on PAJ` };
     }
 
-    // Call PAJ to resolve account
-    const result = await pajClient.resolveBankAccount(sessionToken, pajBank.id, accountNumber);
+    console.log(`[PAJ] Matched bank: ${ourBank.name} → ${bestMatch.bank.name} (score: ${bestMatch.score})`);
+    const result = await pajClient.resolveBankAccount(sessionToken, bestMatch.bank.id, accountNumber);
     return { verified: true, accountName: result.accountName };
   } catch (err: any) {
     console.error('[PAJ] Bank verification failed:', err);
@@ -608,11 +664,14 @@ bot.on(message('text'), async (ctx, next) => {
     }
 
     try {
+      // PAJ expects phone without + prefix, email as-is
+      const pajContact = isPhone && contact.startsWith('+') ? contact.slice(1) : contact;
+
       // Step 1: Initiate PAJ session (sends OTP)
-      const initiated = await pajClient.initiateSession(contact);
+      const initiated = await pajClient.initiateSession(pajContact);
       console.log('[PAJ] OTP sent to:', initiated.email || initiated.phone);
 
-      // Save pending contact
+      // Save pending contact (store original with + for verify)
       session.pajContact = contact;
       session.state = ConversationState.AWAITING_OTP;
       setSession(userId, session);
@@ -625,12 +684,34 @@ bot.on(message('text'), async (ctx, next) => {
       );
     } catch (err: any) {
       console.error('[PAJ] Initiate failed:', err);
-      await ctx.reply(
-        `❌ Could not send OTP.\n` +
-        `Error: ${err.message || 'Unknown error'}\n\n` +
-        `Please try again or contact support.`,
-        mainMenu
-      );
+      const errorMsg = err.message || '';
+
+      // User-friendly error messages
+      if (errorMsg.includes('No recipients defined') || errorMsg.includes('recipients')) {
+        await ctx.reply(
+          `❌ *PAJ Server Error*\n\n` +
+          `Could not send OTP. PAJ is experiencing issues with phone number processing.\n\n` +
+          `Try these options:\n` +
+          `1. Use your email instead of phone number\n` +
+          `2. Try again in a few minutes\n` +
+          `3. Contact PAJ support if the issue persists`,
+          { parse_mode: 'Markdown', ...mainMenu }
+        );
+      } else if (errorMsg.includes('Can\'t find business') || errorMsg.includes('business')) {
+        await ctx.reply(
+          `❌ *PAJ API Key Invalid*\n\n` +
+          `Your PAJ business API key is not recognized.\n` +
+          `Please check your PAJ dashboard and update the PAJ_BUSINESS_API_KEY environment variable.`,
+          mainMenu
+        );
+      } else {
+        await ctx.reply(
+          `❌ Could not send OTP.\n` +
+          `Error: ${errorMsg || 'Unknown error'}\n\n` +
+          `Please try again or contact support.`,
+          mainMenu
+        );
+      }
       setSession(userId, { state: ConversationState.IDLE });
     }
     return;
@@ -654,8 +735,11 @@ bot.on(message('text'), async (ctx, next) => {
     }
 
     try {
+      // PAJ verify also expects phone without + prefix
+      const pajContact = contact.startsWith('+') ? contact.slice(1) : contact;
+
       // Step 2: Verify OTP
-      const verified = await pajClient.verifySession(contact, otp, {
+      const verified = await pajClient.verifySession(pajContact, otp, {
         uuid: `zend-${userId}`,
         device: 'Telegram',
         os: 'Telegram Bot',
@@ -700,12 +784,31 @@ bot.on(message('text'), async (ctx, next) => {
       }
     } catch (err: any) {
       console.error('[PAJ] Verify failed:', err);
-      await ctx.reply(
-        `❌ Invalid OTP or verification failed.\n` +
-        `Error: ${err.message || 'Unknown error'}\n\n` +
-        `Please try again.`,
-        cancelKeyboard
-      );
+      const errorMsg = err.message || '';
+
+      if (errorMsg.includes('No recipients defined') || errorMsg.includes('recipients')) {
+        await ctx.reply(
+          `❌ *PAJ Server Error*\n\n` +
+          `The verification server is experiencing issues.\n\n` +
+          `Please try again in a few minutes or use email instead of phone number.`,
+          mainMenu
+        );
+        setSession(userId, { state: ConversationState.IDLE });
+      } else if (errorMsg.includes('Invalid') || errorMsg.includes('invalid')) {
+        await ctx.reply(
+          `❌ *Invalid OTP*\n\n` +
+          `The code you entered is incorrect or has expired.\n` +
+          `Please check your ${contact.includes('@') ? 'email' : 'SMS'} and try again.`,
+          cancelKeyboard
+        );
+      } else {
+        await ctx.reply(
+          `❌ Verification failed.\n` +
+          `Error: ${errorMsg || 'Unknown error'}\n\n` +
+          `Please try again.`,
+          cancelKeyboard
+        );
+      }
     }
     return;
   }
@@ -861,16 +964,35 @@ bot.on(message('text'), async (ctx, next) => {
           parsed.accountNumber = sanitizeAccountNumber(parsed.accountNumber) || parsed.accountNumber;
         }
 
+        // Use Kimi for conversational responses when details are missing
         if (!parsed.amount) {
-          await ctx.reply('❌ How much do you want to send? Example: "Send 5000 to Tunde"', cancelKeyboard);
+          const reply = await chatWithKimi(
+            `The user said: "${text}". They want to send money but didn't specify an amount. ` +
+            `Respond conversationally in Nigerian Pidgin style. Ask how much they want to send.`
+          );
+          await ctx.reply(reply || 'How much do you want to send?', { parse_mode: 'Markdown', ...cancelKeyboard });
+          setSession(userId, { state: ConversationState.AWAITING_SEND_AMOUNT, pendingTransaction: { recipientName: parsed.recipientName } });
           return;
         }
         if (parsed.amount < 100) {
-          await ctx.reply(`❌ Minimum send amount is ${formatNgn(100)}.`, cancelKeyboard);
+          const reply = await chatWithKimi(
+            `The user wants to send ${parsed.amount} Naira. Minimum is ₦100. ` +
+            `Respond in Nigerian Pidgin style telling them the minimum.`
+          );
+          await ctx.reply(reply || `Minimum send amount is ${formatNgn(100)}.`, cancelKeyboard);
           return;
         }
         if (!parsed.accountNumber && !parsed.walletAddress) {
-          await ctx.reply('❌ Please include account details. Example: "Send 5000 to Tunde GTB 0123456789"', cancelKeyboard);
+          // We have amount + recipient name but missing bank/account
+          const reply = await chatWithKimi(
+            `The user said: "${text}". I understood they want to send ${formatNgn(parsed.amount)} to ${parsed.recipientName || 'someone'}. ` +
+            `But I need the bank name and account number. Respond conversationally in Nigerian Pidgin style.`
+          );
+          await ctx.reply(reply || `I got that you want to send ${formatNgn(parsed.amount)}. What's the bank and account number?`, cancelKeyboard);
+          setSession(userId, {
+            state: ConversationState.AWAITING_SEND_RECIPIENT,
+            pendingTransaction: { amountNgn: parsed.amount, recipientName: parsed.recipientName },
+          });
           return;
         }
 
