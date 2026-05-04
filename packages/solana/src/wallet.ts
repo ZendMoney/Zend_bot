@@ -131,26 +131,16 @@ export class WalletService {
       Buffer.from(serializedTx, 'base64')
     );
 
-    // Re-fetch blockhash in case the original expired
-    const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+    // Jupiter already sets a valid blockhash in the serialized tx.
+    // Don't decompile/recompile — LUT-based transactions fail on decompile.
+    transaction.sign([userWallet]);
 
-    // Update blockhash
-    const message = TransactionMessage.decompile(transaction.message);
-    message.recentBlockhash = blockhash;
-    const newMessage = message.compileToV0Message();
-
-    const newTx = new VersionedTransaction(newMessage);
-    newTx.sign([userWallet]);
-
-    const signature = await this.connection.sendTransaction(newTx, {
+    const signature = await this.connection.sendTransaction(transaction, {
       maxRetries: 3,
       skipPreflight: false,
     });
 
-    await this.connection.confirmTransaction(
-      { signature, blockhash, lastValidBlockHeight },
-      'confirmed'
-    );
+    await this.connection.confirmTransaction(signature, 'confirmed');
 
     return signature;
   }
