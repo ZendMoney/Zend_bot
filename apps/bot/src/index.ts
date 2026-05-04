@@ -1812,8 +1812,7 @@ async function executeSend(
             );
           }
 
-          const feeWallet = process.env.ZEND_FEE_WALLET;
-          const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true, feeWallet);
+          const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
           if (!serializedTx) {
             throw new Error('Failed to build swap transaction. Please try again.');
           }
@@ -2314,8 +2313,7 @@ bot.action('confirm_swap', async (ctx) => {
     }
 
     // Build swap transaction
-    const feeWallet = process.env.ZEND_FEE_WALLET;
-    const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true, feeWallet);
+    const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
     if (!serializedTx) {
       throw new Error('Failed to build swap transaction');
     }

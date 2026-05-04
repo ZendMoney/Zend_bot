@@ -110,7 +110,6 @@ export async function buildSwapTransaction(
   quoteResponse: SwapQuote,
   userPublicKey: string,
   wrapUnwrapSOL: boolean = true,
-  feeAccount?: string // Zend fee wallet for platform fee
 ): Promise<string | null> {
   try {
     const body: any = {
@@ -126,10 +125,6 @@ export async function buildSwapTransaction(
         },
       },
     };
-
-    if (feeAccount) {
-      body.feeAccount = feeAccount;
-    }
 
     // Try v1 API first
     let response = await fetch(`${JUPITER_API_V1}/swap`, {
