@@ -56,6 +56,17 @@ interface ZendSession {
     recipientWalletAddress: string;
     zendFeeUsdt?: number;
     ngnRate?: number;
+    // Swap fields
+    fromMint?: string;
+    toMint?: string;
+    fromSymbol?: string;
+    toSymbol?: string;
+    fromDecimals?: number;
+    swapAmountBase?: number;
+    swapQuote?: any;
+    swapOutAmount?: number;
+    swapMinOut?: number;
+    swapPriceImpact?: number;
   }>;
   pajContact?: string; // email/phone pending OTP
   onrampAmount?: number; // pending on-ramp amount in NGN
@@ -832,6 +843,12 @@ bot.on(message('text'), async (ctx, next) => {
     return;
   }
 
+  // ─── SWAP: AWAITING_SWAP_AMOUNT ───
+  if (session.state === ConversationState.AWAITING_SWAP_AMOUNT) {
+    await handleSwapAmount(ctx, userId, text);
+    return;
+  }
+
   // ─── NLP: Parse natural language when IDLE ───
   if (session.state === ConversationState.IDLE) {
     const parsed = await parseCommand(text);
@@ -1234,7 +1251,7 @@ bot.on(message('voice'), async (ctx) => {
       }
       case 'swap': {
         await ctx.reply(analysis.message || 'Opening swap...', mainMenu);
-        await showSwap(ctx);
+        await showSwapMenu(ctx, userId);
         return;
       }
       default: {
@@ -1815,19 +1832,329 @@ bot.hears('📥 Receive', async (ctx) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 🔄 SWAP (placeholder)
+// 🔄 SWAP (Jupiter integration)
 // ═════════════════════════════════════════════════════════════════════════════
 
-async function showSwap(ctx: ZendContext) {
+import { getSwapQuote, buildSwapTransaction, SWAP_TOKENS, getTokenBySymbol, formatTokenAmount } from './services/jupiter.js';
+import { getChainRailsClient } from '@zend/chainrails-client';
+
+async function showSwapMenu(ctx: ZendContext, userId: string) {
   await ctx.reply(
     `🔄 *Swap Tokens*\n\n` +
-    `Coming soon! You'll be able to swap SOL, USDC, and other tokens to USDT instantly.`,
-    { parse_mode: 'Markdown', ...mainMenu }
+    `Convert tokens in your wallet instantly via Jupiter.\n\n` +
+    `Select a swap pair:`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('SOL → USDT', 'swap:SOL:USDT')],
+        [Markup.button.callback('USDC → USDT', 'swap:USDC:USDT')],
+        [Markup.button.callback('USDT → SOL', 'swap:USDT:SOL')],
+        [Markup.button.callback('❌ Cancel', 'cancel_swap')],
+      ]),
+    }
   );
 }
 
 bot.hears('🔄 Swap', async (ctx) => {
-  await showSwap(ctx);
+  const userId = ctx.from.id.toString();
+  await showSwapMenu(ctx, userId);
+});
+
+bot.action(/swap:([A-Z]+):([A-Z]+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const fromSymbol = ctx.match[1];
+  const toSymbol = ctx.match[2];
+
+  const fromToken = getTokenBySymbol(fromSymbol);
+  const toToken = getTokenBySymbol(toSymbol);
+  if (!fromToken || !toToken) {
+    await ctx.editMessageText('❌ Invalid token pair.');
+    return;
+  }
+
+  setSession(userId, {
+    state: ConversationState.AWAITING_SWAP_AMOUNT,
+    pendingTransaction: {
+      fromMint: fromToken.mint,
+      toMint: toToken.mint,
+      fromSymbol: fromToken.symbol,
+      toSymbol: toToken.symbol,
+      fromDecimals: fromToken.decimals,
+    },
+  });
+
+  await ctx.editMessageText(
+    `🔄 *Swap ${fromSymbol} → ${toSymbol}*\n\n` +
+    `How much ${fromSymbol} do you want to swap?\n\n` +
+    `Example: 0.1, 1, 10`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Cancel', 'cancel_swap')],
+      ]),
+    }
+  );
+});
+
+bot.action('cancel_swap', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  setSession(userId, { state: ConversationState.IDLE });
+  await ctx.editMessageText('❌ Swap cancelled.');
+  await ctx.reply('Menu:', mainMenu);
+});
+
+// Handle swap amount input
+async function handleSwapAmount(ctx: ZendContext, userId: string, text: string) {
+  const session = getSession(userId);
+  const pt = session.pendingTransaction;
+  if (!pt?.fromMint || !pt.toMint || !pt.fromSymbol || !pt.toSymbol || !pt.fromDecimals) {
+    await ctx.reply('❌ Swap session expired. Please start over.', mainMenu);
+    setSession(userId, { state: ConversationState.IDLE });
+    return;
+  }
+
+  const amount = parseFloat(text.trim());
+  if (isNaN(amount) || amount <= 0) {
+    await ctx.reply('❌ Please enter a valid amount. Example: 0.1, 1, 10', cancelKeyboard);
+    return;
+  }
+
+  // Convert to base units
+  const amountBase = Math.round(amount * Math.pow(10, pt.fromDecimals as number));
+
+  await ctx.replyWithChatAction('typing');
+  const quote = await getSwapQuote(pt.fromMint, pt.toMint, amountBase, 50);
+
+  if (!quote) {
+    await ctx.reply('❌ Could not get a swap quote. The route may not exist or liquidity is too low.', mainMenu);
+    setSession(userId, { state: ConversationState.IDLE });
+    return;
+  }
+
+  const fromToken = getTokenBySymbol(pt.fromSymbol as string)!;
+  const toToken = getTokenBySymbol(pt.toSymbol as string)!;
+
+  const outAmount = Number(quote.outAmount) / Math.pow(10, toToken.decimals);
+  const minOut = Number(quote.otherAmountThreshold) / Math.pow(10, toToken.decimals);
+  const priceImpact = quote.priceImpactPct;
+
+  // Store quote for confirmation
+  session.pendingTransaction = {
+    ...pt,
+    swapAmountBase: amountBase,
+    swapQuote: quote,
+    swapOutAmount: outAmount,
+    swapMinOut: minOut,
+    swapPriceImpact: priceImpact,
+  };
+  session.state = ConversationState.AWAITING_CONFIRMATION;
+  setSession(userId, session);
+
+  let msg = `🔄 *Swap Quote*\n\n`;
+  msg += `${formatTokenAmount(quote.inAmount, fromToken.decimals)} ${fromToken.symbol} → ${outAmount.toFixed(toToken.decimals === 9 ? 4 : 2)} ${toToken.symbol}\n`;
+  msg += `Minimum received: ${minOut.toFixed(toToken.decimals === 9 ? 4 : 2)} ${toToken.symbol}\n`;
+  msg += `Price impact: ${priceImpact < 0.01 ? '<0.01%' : priceImpact.toFixed(2) + '%'}\n`;
+  msg += `Slippage: 0.5%\n\n`;
+  msg += `💡 *Gas: ~0.001 SOL* (deducted from your wallet)\n\n`;
+  msg += `Confirm swap?`;
+
+  await ctx.reply(msg, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Confirm Swap', 'confirm_swap')],
+      [Markup.button.callback('❌ Cancel', 'cancel_swap')],
+    ]),
+  });
+}
+
+bot.action('confirm_swap', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+
+  if (session.state !== ConversationState.AWAITING_CONFIRMATION || !session.pendingTransaction?.swapQuote) {
+    await ctx.editMessageText('❌ Session expired. Please start over.');
+    return;
+  }
+
+  const pt = session.pendingTransaction;
+  const fromSymbol = pt.fromSymbol as string;
+  const toSymbol = pt.toSymbol as string;
+  const quote = pt.swapQuote as any;
+  const outAmount = pt.swapOutAmount as number;
+
+  await ctx.editMessageText('⏳ Executing swap via Jupiter...');
+
+  try {
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    if (user.length === 0 || !user[0].walletEncryptedKey) {
+      throw new Error('Wallet not found');
+    }
+
+    // Check SOL for gas
+    const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, 0.002);
+    if (!hasGas) {
+      throw new Error('Insufficient SOL for gas. Please deposit at least 0.002 SOL.');
+    }
+
+    // Build swap transaction
+    const feeWallet = process.env.ZEND_FEE_WALLET;
+    const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true, feeWallet);
+    if (!serializedTx) {
+      throw new Error('Failed to build swap transaction');
+    }
+
+    // Sign and send
+    const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
+    const keypair = Keypair.fromSecretKey(secretKey);
+
+    await ctx.replyWithChatAction('typing');
+    const txHash = await walletService.signAndSendSerialized(keypair, serializedTx);
+    console.log('[Jupiter] Swap executed:', txHash);
+
+    // Record in DB
+    const txId = generateTxId();
+    await db.insert(transactions).values({
+      id: txId,
+      userId,
+      type: 'swap',
+      status: 'completed',
+      fromMint: pt.fromMint,
+      fromAmount: (Number(quote.inAmount) / Math.pow(10, getTokenBySymbol(fromSymbol)!.decimals)).toString(),
+      toMint: pt.toMint,
+      toAmount: outAmount.toString(),
+      solanaTxHash: txHash,
+    });
+
+    setSession(userId, { state: ConversationState.IDLE });
+
+    await ctx.reply(
+      `✅ *Swap Complete!*\n\n` +
+      `${formatTokenAmount(quote.inAmount, getTokenBySymbol(fromSymbol)!.decimals)} ${fromSymbol} → ${outAmount.toFixed(2)} ${toSymbol}\n\n` +
+      `Tx: \`https://solscan.io/tx/${txHash}\`\n` +
+      `Reference: \`${txId}\``, 
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+  } catch (err: any) {
+    console.error('[Swap] Failed:', err);
+    setSession(userId, { state: ConversationState.IDLE });
+    await ctx.reply(
+      `❌ *Swap Failed*\n\n` +
+      `Error: ${err.message || 'Unknown error'}\n` +
+      `No funds were deducted.`,
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 🌉 CHAINRAILS BRIDGE (Cross-chain Deposit)
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function showBridgeMenu(ctx: ZendContext, userId: string) {
+  const chainRails = await getChainRailsClient();
+  if (!chainRails) {
+    await ctx.reply(
+      `🌉 *Cross-Chain Deposit*\n\n` +
+      `Deposit crypto from any chain directly into your Zend Solana wallet.\n\n` +
+      `⚠️ *Coming soon* — ChainRails integration is being configured.\n\n` +
+      `For now, use:\n` +
+      `• 💵 *Add Naira* — NGN bank transfer → USDT\n` +
+      `• 📥 *Receive* — Direct Solana deposit`,
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+    return;
+  }
+
+  // Show supported chains (scaffold — would fetch from API)
+  await ctx.reply(
+    `🌉 *Cross-Chain Deposit*\n\n` +
+    `Send crypto from any chain and receive USDT in your Zend wallet.\n\n` +
+    `Select source chain:`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('Ethereum (USDC)', 'bridge:ethereum:USDC')],
+        [Markup.button.callback('BSC (USDT)', 'bridge:bsc:USDT')],
+        [Markup.button.callback('Base (USDC)', 'bridge:base:USDC')],
+        [Markup.button.callback('❌ Cancel', 'cancel_bridge')],
+      ]),
+    }
+  );
+}
+
+bot.command('bridge', async (ctx) => {
+  await showBridgeMenu(ctx, ctx.from.id.toString());
+});
+
+bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const chain = ctx.match[1];
+  const token = ctx.match[2];
+
+  const chainRails = await getChainRailsClient();
+  if (!chainRails) {
+    await ctx.editMessageText('❌ ChainRails not configured.');
+    return;
+  }
+
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  if (user.length === 0) {
+    await ctx.editMessageText('❌ User not found. Run /start first.');
+    return;
+  }
+
+  try {
+    await ctx.editMessageText('⏳ Generating deposit address...');
+
+    const deposit = await chainRails.createDeposit({
+      fromChain: chain,
+      fromToken: token,
+      toChain: 'solana',
+      toToken: 'USDT',
+      toAddress: user[0].walletAddress,
+    });
+
+    // Record in DB
+    const txId = generateTxId();
+    await db.insert(transactions).values({
+      id: txId,
+      userId,
+      type: 'crypto_receive',
+      status: 'pending',
+      pajReference: deposit.id,
+      recipientWalletAddress: user[0].walletAddress,
+    });
+
+    await ctx.reply(
+      `🌉 *Deposit ${token} from ${chain.charAt(0).toUpperCase() + chain.slice(1)}*\n\n` +
+      `Send ${token} to this address:\n` +
+      `\`\`\`\n${deposit.depositAddress}\n\`\`\`\n\n` +
+      `⚠️ *Important:*\n` +
+      `• Only send ${token} on ${chain}\n` +
+      `• Minimum: $10 equivalent\n` +
+      `• You'll receive USDT on Solana\n\n` +
+      `Reference: \`${txId}\`\n` +
+      `ChainRails ID: \`${deposit.id}\``, 
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+  } catch (err: any) {
+    console.error('[Bridge] Failed:', err);
+    await ctx.reply(
+      `❌ *Bridge Error*\n\n` +
+      `Could not generate deposit address.\n` +
+      `Error: ${err.message || 'Unknown error'}`,
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+  }
+});
+
+bot.action('cancel_bridge', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText('❌ Bridge cancelled.');
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1980,7 +2307,7 @@ bot.catch((err, ctx) => {
 // WEBHOOK SERVER (runs alongside bot for PAJ callbacks)
 // ═════════════════════════════════════════════════════════════════════════════
 
-function startWebhookServer() {
+function startWebhookServer(botInstance: Telegraf<any>) {
   const port = parseInt(process.env.PORT || process.env.WEBHOOK_PORT || '3001');
 
   const server = createServer(async (req, res) => {
@@ -2051,14 +2378,46 @@ function startWebhookServer() {
       return;
     }
 
-    // ChainRails Webhooks (placeholder)
+    // ChainRails Webhooks
     if (url === '/webhooks/chain-rails' && method === 'POST') {
       let body = '';
       req.on('data', chunk => body += chunk);
-      req.on('end', () => {
-        console.log('📩 ChainRails Webhook:', body);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ received: true }));
+      req.on('end', async () => {
+        try {
+          const event = JSON.parse(body);
+          console.log('📩 ChainRails Webhook:', event.type, event.id);
+
+          // Update transaction status
+          if (event.id) {
+            await db.update(transactions)
+              .set({
+                status: event.status === 'completed' ? 'completed' : event.status === 'failed' ? 'failed' : 'processing',
+                completedAt: event.status === 'completed' ? new Date() : undefined,
+              })
+              .where(eq(transactions.pajReference, event.id));
+          }
+
+          // Notify user if we have their Telegram ID
+          if (event.userId && event.status === 'completed') {
+            try {
+              await botInstance.telegram.sendMessage(
+                event.userId,
+                `✅ *Cross-Chain Deposit Complete!*\n\n` +
+                `${event.amount} ${event.token} has arrived in your Zend wallet.`,
+                { parse_mode: 'Markdown' }
+              );
+            } catch (notifyErr) {
+              console.log('[ChainRails] Could not notify user:', notifyErr);
+            }
+          }
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ received: true }));
+        } catch (err: any) {
+          console.error('ChainRails webhook error:', err);
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: err.message }));
+        }
       });
       return;
     }
@@ -2072,6 +2431,7 @@ function startWebhookServer() {
     const host = process.env.RAILWAY_PUBLIC_DOMAIN || `localhost:${port}`;
     console.log(`🌐 Webhook server running on http://${host}`);
     console.log(`   PAJ webhook URL: https://${host}/webhooks/paj`);
+    console.log(`   ChainRails webhook URL: https://${host}/webhooks/chain-rails`);
   });
 
   return server;
@@ -2102,7 +2462,7 @@ async function main() {
   }
 
   // Start webhook server (runs alongside bot)
-  startWebhookServer();
+  startWebhookServer(bot);
 
   // Launch bot
   bot.launch({ dropPendingUpdates: true });

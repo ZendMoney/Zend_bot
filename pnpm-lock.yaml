@@ -69,6 +69,9 @@ importers:
 
   apps/bot:
     dependencies:
+      '@zend/chainrails-client':
+        specifier: workspace:*
+        version: link:../../packages/chainrails-client
       '@zend/db':
         specifier: workspace:*
         version: link:../../packages/db
@@ -90,6 +93,8 @@ importers:
       telegraf:
         specifier: ^4.16.3
         version: 4.16.3
+
+  packages/chainrails-client: {}
 
   packages/db: {}
 

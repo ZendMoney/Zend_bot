@@ -118,6 +118,40 @@ export class WalletService {
     return signature;
   }
 
+  // Sign and send a serialized VersionedTransaction (base64)
+  // Used for Jupiter swaps and other dApp integrations
+  async signAndSendSerialized(
+    userWallet: Keypair,
+    serializedTx: string
+  ): Promise<string> {
+    const transaction = VersionedTransaction.deserialize(
+      Buffer.from(serializedTx, 'base64')
+    );
+
+    // Re-fetch blockhash in case the original expired
+    const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+
+    // Update blockhash
+    const message = TransactionMessage.decompile(transaction.message);
+    message.recentBlockhash = blockhash;
+    const newMessage = message.compileToV0Message();
+
+    const newTx = new VersionedTransaction(newMessage);
+    newTx.sign([userWallet]);
+
+    const signature = await this.connection.sendTransaction(newTx, {
+      maxRetries: 3,
+      skipPreflight: false,
+    });
+
+    await this.connection.confirmTransaction(
+      { signature, blockhash, lastValidBlockHeight },
+      'confirmed'
+    );
+
+    return signature;
+  }
+
   // Send SPL tokens (USDT, USDC) to a recipient
   // NOTE: User must have SOL for gas. Zend can optionally fund their wallet on first deposit.
   async sendSplToken(

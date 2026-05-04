@@ -8,6 +8,7 @@
     "@zend/paj-client": "workspace:*",
     "@zend/shared": "workspace:*",
     "@zend/solana": "workspace:*",
+    "@zend/chainrails-client": "workspace:*",
     "bs58": "^6.0.0",
     "dotenv": "^16.4.7",
     "telegraf": "^4.16.3"
