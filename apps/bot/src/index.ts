@@ -2,6 +2,7 @@
 import { config } from 'dotenv';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { createServer } from 'http';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 config({ path: resolve(__dirname, '../../../.env') });
 
@@ -1959,6 +1960,111 @@ bot.catch((err, ctx) => {
 // LAUNCH
 // ═════════════════════════════════════════════════════════════════════════════
 
+// ═════════════════════════════════════════════════════════════════════════════
+// WEBHOOK SERVER (runs alongside bot for PAJ callbacks)
+// ═════════════════════════════════════════════════════════════════════════════
+
+function startWebhookServer() {
+  const port = parseInt(process.env.PORT || process.env.WEBHOOK_PORT || '3001');
+
+  const server = createServer(async (req, res) => {
+    const url = req.url || '/';
+    const method = req.method || 'GET';
+
+    // CORS
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    // Health check
+    if (url === '/health' && method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', time: new Date().toISOString() }));
+      return;
+    }
+
+    // PAJ Webhooks
+    if (url === '/webhooks/paj' && method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', async () => {
+        try {
+          const event = JSON.parse(body);
+          console.log('📩 PAJ Webhook:', event.type, event.reference);
+
+          switch (event.type) {
+            case 'onramp.deposit.confirmed': {
+              await db.update(transactions)
+                .set({ status: 'completed', completedAt: new Date() })
+                .where(eq(transactions.pajReference, event.reference));
+              break;
+            }
+            case 'onramp.deposit.failed': {
+              await db.update(transactions)
+                .set({ status: 'failed' })
+                .where(eq(transactions.pajReference, event.reference));
+              break;
+            }
+            case 'offramp.settlement.confirmed': {
+              await db.update(transactions)
+                .set({ status: 'completed', completedAt: new Date() })
+                .where(eq(transactions.pajReference, event.reference));
+              break;
+            }
+            case 'offramp.settlement.failed': {
+              await db.update(transactions)
+                .set({ status: 'failed' })
+                .where(eq(transactions.pajReference, event.reference));
+              break;
+            }
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ received: true }));
+        } catch (err: any) {
+          console.error('Webhook error:', err);
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: err.message }));
+        }
+      });
+      return;
+    }
+
+    // ChainRails Webhooks (placeholder)
+    if (url === '/webhooks/chain-rails' && method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', () => {
+        console.log('📩 ChainRails Webhook:', body);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ received: true }));
+      });
+      return;
+    }
+
+    // 404
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
+  });
+
+  server.listen(port, () => {
+    const host = process.env.RAILWAY_PUBLIC_DOMAIN || `localhost:${port}`;
+    console.log(`🌐 Webhook server running on http://${host}`);
+    console.log(`   PAJ webhook URL: https://${host}/webhooks/paj`);
+  });
+
+  return server;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// LAUNCH
+// ═════════════════════════════════════════════════════════════════════════════
+
 async function main() {
   const dbOk = await checkConnection();
   if (!dbOk) {
@@ -1978,6 +2084,9 @@ async function main() {
   } else {
     console.warn('⚠️  PAJ not configured');
   }
+
+  // Start webhook server (runs alongside bot)
+  startWebhookServer();
 
   // Launch bot
   bot.launch({ dropPendingUpdates: true });
