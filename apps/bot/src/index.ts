@@ -141,12 +141,16 @@ function hashPin(pin: string): string {
   return salt + ':' + hash;
 }
 
-function verifyPin(pin: string, stored: string): boolean {
+function verifyPin(pin: string, stored: string): { valid: boolean; isLegacy: boolean } {
+  // Legacy: plaintext PIN stored before hashing was introduced
+  if (!stored.includes(':')) {
+    return { valid: stored === pin, isLegacy: true };
+  }
   const parts = stored.split(':');
-  if (parts.length !== 2) return false;
+  if (parts.length !== 2) return { valid: false, isLegacy: false };
   const [salt, hash] = parts;
   const computed = crypto.pbkdf2Sync(pin, salt, 100000, 32, 'sha256').toString('hex');
-  return computed === hash;
+  return { valid: computed === hash, isLegacy: false };
 }
 
 function formatBalance(amount: number, symbol: string): string {
@@ -1341,10 +1345,18 @@ bot.on(message('text'), async (ctx, next) => {
       return;
     }
 
-    const valid = verifyPin(pin, user[0].transactionPin);
-    if (!valid) {
+    const result = verifyPin(pin, user[0].transactionPin);
+    if (!result.valid) {
       await ctx.reply('❌ Incorrect PIN. Please try again.', cancelKeyboard);
       return;
+    }
+
+    // Auto-migrate legacy plaintext PIN to hashed
+    if (result.isLegacy) {
+      await db.update(users)
+        .set({ transactionPin: hashPin(pin) })
+        .where(eq(users.id, userId));
+      console.log(`[PIN] Migrated plaintext PIN to hashed for user ${userId}`);
     }
 
     const action = session.pinVerifyAction;
