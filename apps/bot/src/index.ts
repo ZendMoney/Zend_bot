@@ -2731,8 +2731,9 @@ async function showSettings(ctx: ZendContext, userId: string) {
     const msg =
       `⚙️ *Settings*\n\n` +
       `👤 *Profile*\n` +
-      `Name: ${u.firstName} ${u.lastName || ''}\n` +
-      `Wallet: \`${u.walletAddress.slice(0, 6)}...${u.walletAddress.slice(-4)}\`\n\n` +
+      `Name: ${u.firstName} ${u.lastName || ''}\n\n` +
+      `*Wallet Address:*\n` +
+      `\`\`\`\n${u.walletAddress}\n\`\`\`\n\n` +
       `🔐 *Security*\n` +
       `Email: ${u.email || 'Not set'} ${u.emailVerified ? '✓' : ''}\n` +
       `PAJ: ${u.pajSessionToken ? '✅ Linked' : '❌ Not linked'}\n` +
