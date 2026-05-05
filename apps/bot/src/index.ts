@@ -3574,6 +3574,25 @@ function startWebhookServer(botInstance: Telegraf<any>) {
       return;
     }
 
+    // Telegram Bot Webhooks
+    if (url === '/webhook/telegram' && method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', async () => {
+        try {
+          const update = JSON.parse(body);
+          await botInstance.handleUpdate(update);
+          res.writeHead(200);
+          res.end('OK');
+        } catch (err: any) {
+          console.error('[Webhook] Telegram update error:', err);
+          res.writeHead(500);
+          res.end('Error');
+        }
+      });
+      return;
+    }
+
     // 404
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));
@@ -3584,6 +3603,7 @@ function startWebhookServer(botInstance: Telegraf<any>) {
     console.log(`🌐 Webhook server running on http://${host}`);
     console.log(`   PAJ webhook URL: https://${host}/webhooks/paj`);
     console.log(`   ChainRails webhook URL: https://${host}/webhooks/chain-rails`);
+    console.log(`   Telegram webhook URL: https://${host}/webhook/telegram`);
   });
 
   return server;
@@ -3724,26 +3744,69 @@ async function main() {
   // Start webhook server (runs alongside bot)
   startWebhookServer(bot);
 
-  // Launch bot
-  bot.launch({ dropPendingUpdates: true });
-  console.log('🤖 Zend bot is running...');
+  // Launch bot — prefer webhooks on Railway, fallback to polling locally
+  const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || process.env.RAILWAY_PUBLIC_DOMAIN;
+  let isWebhookMode = false;
+
+  if (webhookBaseUrl) {
+    const telegramWebhookUrl = `${webhookBaseUrl.replace(/\/$/, '')}/webhook/telegram`;
+    try {
+      await bot.telegram.setWebhook(telegramWebhookUrl, { drop_pending_updates: true });
+      console.log('🤖 Zend bot running in webhook mode');
+      console.log(`   Webhook URL: ${telegramWebhookUrl}`);
+      isWebhookMode = true;
+    } catch (webhookErr: any) {
+      console.error('[Bot] Failed to set webhook:', webhookErr.message);
+      console.log('🤖 Falling back to polling mode...');
+      bot.launch({ dropPendingUpdates: true });
+    }
+  } else {
+    bot.launch({ dropPendingUpdates: true });
+    console.log('🤖 Zend bot running in polling mode...');
+  }
 
   // Start scheduled transfer executor (every 60 seconds)
   setInterval(runScheduledTransfers, 60000);
   console.log('📅 Scheduled transfer executor started (every 60s)');
 
   // Handle 409 conflict from polling loop (Railway deploy overlap)
+  // Only relevant in polling mode; webhooks don't have 409s
   let retryTimeout: NodeJS.Timeout | null = null;
-  process.on('unhandledRejection', (reason: any) => {
-    if (reason?.response?.error_code === 409) {
-      console.log('[Bot] 409 conflict detected, stopping and retrying in 5s...');
-      bot.stop();
+  let retryCount = 0;
+  const MAX_409_RETRIES = 10;
+
+  process.on('unhandledRejection', async (reason: any) => {
+    // Only handle 409s in polling mode
+    if (!isWebhookMode && reason?.response?.error_code === 409) {
+      retryCount++;
+      const delay = Math.min(5000 * Math.pow(2, retryCount - 1), 60000);
+      console.log(`[Bot] 409 conflict (retry ${retryCount}/${MAX_409_RETRIES}), retrying in ${delay}ms...`);
+
+      try { await bot.stop(); } catch { /* may already be stopped */ }
       if (retryTimeout) clearTimeout(retryTimeout);
-      retryTimeout = setTimeout(() => {
-        console.log('[Bot] Retrying launch...');
-        bot.launch({ dropPendingUpdates: true });
-      }, 5000);
+
+      if (retryCount > MAX_409_RETRIES) {
+        console.error('[Bot] Max 409 retries exceeded. Exiting.');
+        process.exit(1);
+      }
+
+      retryTimeout = setTimeout(async () => {
+        console.log('[Bot] Retrying polling launch...');
+        try {
+          await bot.launch({ dropPendingUpdates: true });
+          retryCount = 0;
+          console.log('🤖 Bot polling restarted successfully');
+        } catch (err: any) {
+          console.error('[Bot] Polling relaunch failed:', err.message);
+        }
+      }, delay);
+      return;
     }
+
+    // Log non-409 unhandled rejections but don't swallow them
+    console.error('[UnhandledRejection]', reason);
+    // In webhook mode, the server keeps running even if a handler throws
+    // In polling mode, let Railway restart if things are truly broken
   });
 
   process.once('SIGINT', () => {
