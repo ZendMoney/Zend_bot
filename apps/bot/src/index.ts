@@ -1219,7 +1219,7 @@ bot.on(message('text'), async (ctx, next) => {
             `The user said: "${text}". They want to send money but didn't specify an amount. ` +
             `Respond conversationally in Nigerian Pidgin style. Ask how much they want to send.`
           );
-          await ctx.reply(reply || 'How much do you want to send?', { parse_mode: 'Markdown', ...cancelKeyboard });
+          await ctx.reply(reply?.reply || 'How much do you want to send?', { parse_mode: 'Markdown', ...cancelKeyboard });
           setSession(userId, { state: ConversationState.AWAITING_SEND_AMOUNT, pendingTransaction: { recipientName: parsed.recipientName } });
           return;
         }
@@ -1228,7 +1228,7 @@ bot.on(message('text'), async (ctx, next) => {
             `The user wants to send ${parsed.amount} Naira. Minimum is ₦100. ` +
             `Respond in Nigerian Pidgin style telling them the minimum.`
           );
-          await ctx.reply(reply || `Minimum send amount is ${formatNgn(100)}.`, cancelKeyboard);
+          await ctx.reply(reply?.reply || `Minimum send amount is ${formatNgn(100)}.`, cancelKeyboard);
           return;
         }
         if (!parsed.accountNumber && !parsed.walletAddress) {
@@ -1237,7 +1237,7 @@ bot.on(message('text'), async (ctx, next) => {
             `The user said: "${text}". I understood they want to send ${formatNgn(parsed.amount)} to ${parsed.recipientName || 'someone'}. ` +
             `But I need the bank name and account number. Respond conversationally in Nigerian Pidgin style.`
           );
-          await ctx.reply(reply || `I got that you want to send ${formatNgn(parsed.amount)}. What's the bank and account number?`, cancelKeyboard);
+          await ctx.reply(reply?.reply || `I got that you want to send ${formatNgn(parsed.amount)}. What's the bank and account number?`, cancelKeyboard);
           setSession(userId, {
             state: ConversationState.AWAITING_SEND_RECIPIENT,
             pendingTransaction: { amountNgn: parsed.amount, recipientName: parsed.recipientName },
