@@ -365,6 +365,62 @@ bot.use(async (ctx, next) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// GROUP CHAT: reply only when tagged
+// ═════════════════════════════════════════════════════════════════════════════
+
+bot.use(async (ctx, next) => {
+  const chatType = ctx.chat?.type;
+  if (chatType === 'group' || chatType === 'supergroup') {
+    const msg = ctx.message;
+    if (!msg || !('text' in msg)) {
+      return; // ignore non-text updates in groups
+    }
+
+    const text = msg.text;
+    const username = ctx.botInfo?.username;
+
+    // Check @mention
+    const isMentioned = username ? text.includes(`@${username}`) : false;
+    // Check reply to bot
+    const isReplyToBot = msg.reply_to_message?.from?.id === ctx.botInfo?.id;
+
+    if (!isMentioned && !isReplyToBot) {
+      return; // silently ignore in groups when not tagged
+    }
+
+    // Strip mention so handlers match correctly (e.g. "@Bot Balance" → "Balance")
+    if (username && isMentioned) {
+      msg.text = text.replace(new RegExp(`\\s?@${username}\\b`, 'g'), '').trim();
+    }
+  }
+  await next();
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GROUP CHAT HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
+
+function isGroupChat(ctx: ZendContext): boolean {
+  return ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup';
+}
+
+function getBotUsername(ctx: ZendContext): string {
+  return ctx.botInfo?.username || 'ZendBot';
+}
+
+async function promptPrivateChat(ctx: ZendContext, action: string) {
+  const name = ctx.from?.first_name || 'there';
+  const username = getBotUsername(ctx);
+  await ctx.reply(
+    `📩 ${name}, please use me in private chat to ${action}.\n\n` +
+    `Sensitive actions are only available in DMs for security.`,
+    Markup.inlineKeyboard([
+      [Markup.button.url('💬 Open Private Chat', `https://t.me/${username}`)],
+    ])
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // /START — Onboarding
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -431,17 +487,23 @@ bot.command('wallet', async (ctx) => {
   }
 
   const u = user[0];
-
-  await ctx.reply(
+  const msg =
     `👛 *Your Wallet*\n\n` +
     `*Solana Address:*\n` +
     `\`\`\`\n${u.walletAddress}\n\`\`\`\n\n` +
     `Tap the code block above to copy your address.\n\n` +
     `*Network:* Solana Mainnet\n` +
     `*Tokens:* SOL, USDT, USDC\n\n` +
-    `⚠️ To export your private key, go to *⚙️ Settings*.`,
-    { parse_mode: 'Markdown' }
-  );
+    `⚠️ To export your private key, go to *⚙️ Settings*.`;
+
+  if (isGroupChat(ctx)) {
+    const name = ctx.from?.first_name || 'there';
+    await ctx.reply(`📩 ${name}, check your DM for your wallet address.`);
+    await ctx.telegram.sendMessage(ctx.from!.id, msg, { parse_mode: 'Markdown' });
+    return;
+  }
+
+  await ctx.reply(msg, { parse_mode: 'Markdown' });
 });
 
 // ─── Export key helper (called after PIN is verified) ───
@@ -485,6 +547,12 @@ async function doExportKey(ctx: ZendContext, userId: string) {
 bot.action('export_key', async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from!.id.toString();
+
+  if (isGroupChat(ctx)) {
+    await promptPrivateChat(ctx, 'export your private key');
+    return;
+  }
+
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
 
   if (user.length === 0) {
@@ -521,17 +589,11 @@ bot.action('export_key', async (ctx) => {
 // ═════════════════════════════════════════════════════════════════════════════
 
 // Reusable balance handler
-async function handleBalance(ctx: ZendContext, userId: string) {
+async function buildBalanceMessage(userId: string): Promise<string | null> {
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-
-  if (user.length === 0) {
-    await ctx.reply('Please run /start first.', mainMenu);
-    return;
-  }
+  if (user.length === 0) return null;
 
   const walletAddress = user[0].walletAddress;
-  const loading = await showLoading(ctx, 'Fetching your balance...');
-
   try {
     const balances = await walletService.getAllBalances(walletAddress);
     const rates = await getPAJRates();
@@ -556,18 +618,42 @@ async function handleBalance(ctx: ZendContext, userId: string) {
     msg += `\n━━━━━━━━━━━━━━━━━━━━\n`;
     msg += `💵 Total: ≈${formatNgn(totalNgn)}\n`;
     msg += `📈 SOL: $${solPrice.toFixed(2)}  ·  Rate: ${formatNgn(offRampRate)}/USDT`;
-
-    await finishLoading(ctx, loading.message_id, msg, 'Markdown');
-    await ctx.reply('Menu:', mainMenu);
+    return msg;
   } catch (err) {
     console.error('Balance error:', err);
-    await finishLoading(ctx, loading.message_id, '❌ Could not fetch balance. Please try again.');
-    await ctx.reply('Menu:', mainMenu);
+    return null;
   }
 }
 
+async function handleBalance(ctx: ZendContext, userId: string) {
+  const loading = await showLoading(ctx, 'Fetching your balance...');
+
+  const msg = await buildBalanceMessage(userId);
+  if (!msg) {
+    await finishLoading(ctx, loading.message_id, '❌ Could not fetch balance. Please try again.');
+    await ctx.reply('Menu:', mainMenu);
+    return;
+  }
+
+  await finishLoading(ctx, loading.message_id, msg, 'Markdown');
+  await ctx.reply('Menu:', mainMenu);
+}
+
 bot.hears('💰 Balance', async (ctx) => {
-  await handleBalance(ctx, ctx.from.id.toString());
+  const userId = ctx.from.id.toString();
+  if (isGroupChat(ctx)) {
+    const name = ctx.from?.first_name || 'there';
+    await ctx.reply(`📩 ${name}, check your DM for your balance.`);
+    const msg = await buildBalanceMessage(userId);
+    if (msg) {
+      await ctx.telegram.sendMessage(ctx.from!.id, msg, { parse_mode: 'Markdown' });
+      await ctx.telegram.sendMessage(ctx.from!.id, 'Menu:', mainMenu);
+    } else {
+      await ctx.telegram.sendMessage(ctx.from!.id, '❌ Could not fetch balance. Please try again.', mainMenu);
+    }
+    return;
+  }
+  await handleBalance(ctx, userId);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -612,6 +698,11 @@ bot.on(message('text'), async (ctx, next) => {
   const menuButtons = ['💰 Balance', '💵 Add Naira', '📤 Send', '💴 Cash Out', '📥 Receive', '🔄 Swap', '📋 History', '⚙️ Settings'];
   if (menuButtons.includes(text)) {
     return next();
+  }
+
+  // ─── Ignore stateful flows in groups ───
+  if (isGroupChat(ctx) && session.state !== ConversationState.IDLE) {
+    return; // silently ignore — user should continue in DM
   }
 
   // Cancel
@@ -1770,6 +1861,11 @@ bot.hears('📤 Send', async (ctx) => {
     return;
   }
 
+  if (isGroupChat(ctx)) {
+    await promptPrivateChat(ctx, 'send money');
+    return;
+  }
+
   setSession(userId, {
     state: ConversationState.AWAITING_SEND_AMOUNT,
     pendingTransaction: {},
@@ -2126,6 +2222,12 @@ async function executeSwap(
 bot.action('confirm_send', async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from!.id.toString();
+
+  if (isGroupChat(ctx)) {
+    await promptPrivateChat(ctx, 'send money');
+    return;
+  }
+
   const session = getSession(userId);
 
   if (session.state !== ConversationState.AWAITING_CONFIRMATION || !session.pendingTransaction) {
@@ -2302,6 +2404,10 @@ bot.action(/nlp_bank:(.+)/, async (ctx) => {
 // ═════════════════════════════════════════════════════════════════════════════
 
 bot.hears('💴 Cash Out', async (ctx) => {
+  if (isGroupChat(ctx)) {
+    await promptPrivateChat(ctx, 'cash out');
+    return;
+  }
   await ctx.reply('💴 Cash Out uses the same flow as Send. Redirecting...');
   const userId = ctx.from.id.toString();
   setSession(userId, {
@@ -2386,6 +2492,10 @@ async function showSwapMenu(ctx: ZendContext, userId: string) {
 }
 
 bot.hears('🔄 Swap', async (ctx) => {
+  if (isGroupChat(ctx)) {
+    await promptPrivateChat(ctx, 'swap tokens');
+    return;
+  }
   const userId = ctx.from.id.toString();
   await showSwapMenu(ctx, userId);
 });
@@ -2502,6 +2612,12 @@ async function handleSwapAmount(ctx: ZendContext, userId: string, text: string) 
 bot.action('confirm_swap', async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from!.id.toString();
+
+  if (isGroupChat(ctx)) {
+    await promptPrivateChat(ctx, 'swap tokens');
+    return;
+  }
+
   const session = getSession(userId);
 
   if (session.state !== ConversationState.AWAITING_CONFIRMATION || !session.pendingTransaction?.swapQuote) {
@@ -2688,15 +2804,14 @@ bot.action('cancel_bridge', async (ctx) => {
 // 📋 HISTORY
 // ═════════════════════════════════════════════════════════════════════════════
 
-async function showHistory(ctx: ZendContext, userId: string) {
+async function buildHistoryMessage(userId: string): Promise<string | null> {
   const txs = await db.select().from(transactions)
     .where(eq(transactions.userId, userId))
     .orderBy(transactions.createdAt)
     .limit(10);
 
   if (txs.length === 0) {
-    await ctx.reply('📋 No transactions yet.\n\nSend or receive money to see your history here.', mainMenu);
-    return;
+    return '📋 No transactions yet.\n\nSend or receive money to see your history here.';
   }
 
   let msg = `📋 *Transaction History*\n\n`;
@@ -2714,11 +2829,28 @@ async function showHistory(ctx: ZendContext, userId: string) {
     msg += `   Ref: ${tx.id}\n\n`;
   }
 
-  await ctx.reply(msg, { parse_mode: 'Markdown', ...mainMenu });
+  return msg;
+}
+
+async function showHistory(ctx: ZendContext, userId: string) {
+  const msg = await buildHistoryMessage(userId);
+  if (msg) {
+    await ctx.reply(msg, { parse_mode: 'Markdown', ...mainMenu });
+  }
 }
 
 bot.hears('📋 History', async (ctx) => {
-  await showHistory(ctx, ctx.from.id.toString());
+  const userId = ctx.from.id.toString();
+  if (isGroupChat(ctx)) {
+    const name = ctx.from?.first_name || 'there';
+    await ctx.reply(`📩 ${name}, check your DM for your history.`);
+    const msg = await buildHistoryMessage(userId);
+    if (msg) {
+      await ctx.telegram.sendMessage(ctx.from!.id, msg, { parse_mode: 'Markdown', ...mainMenu });
+    }
+    return;
+  }
+  await showHistory(ctx, userId);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2781,6 +2913,10 @@ async function showSettings(ctx: ZendContext, userId: string) {
 }
 
 bot.hears('⚙️ Settings', async (ctx) => {
+  if (isGroupChat(ctx)) {
+    await promptPrivateChat(ctx, 'access Settings');
+    return;
+  }
   await showSettings(ctx, ctx.from.id.toString());
 });
 
