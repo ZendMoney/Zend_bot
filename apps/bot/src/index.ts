@@ -1852,10 +1852,16 @@ async function executeSend(
         );
       }
 
-      // ─── Check SOL for gas ───
-      const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, 0.003);
+      // ─── Check SOL for gas + ATA rent ───
+      const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, 0.005);
       if (!hasGas) {
-        throw new Error('Insufficient SOL for gas. Please deposit at least 0.003 SOL.');
+        throw new Error(
+          'Insufficient SOL for gas and account creation.\n\n' +
+          'Swaps need ~0.005 SOL to cover:\n' +
+          '• Transaction gas (~0.001 SOL)\n' +
+          '• Token account rent (~0.002 SOL) if you don\'t have a USDT account yet\n\n' +
+          'Please deposit at least 0.005 SOL to your wallet.'
+        );
       }
 
       const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
@@ -2306,10 +2312,16 @@ bot.action('confirm_swap', async (ctx) => {
       throw new Error('Wallet not found');
     }
 
-    // Check SOL for gas
-    const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, 0.002);
+    // Check SOL for gas + ATA rent
+    const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, 0.005);
     if (!hasGas) {
-      throw new Error('Insufficient SOL for gas. Please deposit at least 0.002 SOL.');
+      throw new Error(
+        'Insufficient SOL for gas and account creation.\n\n' +
+        'Swaps need ~0.005 SOL to cover:\n' +
+        '• Transaction gas (~0.001 SOL)\n' +
+        '• Token account rent (~0.002 SOL) if you don\'t have a USDT account yet\n\n' +
+        'Please deposit at least 0.005 SOL to your wallet.'
+      );
     }
 
     // Build swap transaction
