@@ -68,7 +68,7 @@ interface ZendSession {
     swapMinOut?: number;
     swapPriceImpact?: number;
   }>;
-  pinVerifyAction?: 'send' | 'swap' | 'export';
+  pinVerifyAction?: 'send' | 'swap' | 'export' | 'schedule';
   pajContact?: string; // email/phone pending OTP
   onrampAmount?: number; // pending on-ramp amount in NGN
   voiceAnalysis?: {
@@ -402,6 +402,21 @@ bot.use(async (ctx, next) => {
     if (username && isMentioned) {
       msg.text = text.replace(new RegExp(`\\s?@${username}\\b`, 'g'), '').trim();
     }
+  }
+  await next();
+});
+
+// ─── Strip reply keyboards in groups (keep inline keyboards) ───
+bot.use(async (ctx, next) => {
+  if (isGroupChat(ctx)) {
+    const originalReply = ctx.reply.bind(ctx);
+    ctx.reply = async (text: any, extra?: any) => {
+      if (extra && extra.reply_markup && 'keyboard' in extra.reply_markup) {
+        const { reply_markup, ...cleaned } = extra;
+        return originalReply(text, cleaned);
+      }
+      return originalReply(text, extra);
+    };
   }
   await next();
 });
@@ -1491,6 +1506,24 @@ bot.on(message('text'), async (ctx, next) => {
       await executeSwap(ctx, userId, pt);
     } else if (action === 'export') {
       await doExportKey(ctx, userId);
+    } else if (action === 'schedule') {
+      const sd = session.scheduleData;
+      if (!sd || !sd.startAt) {
+        await ctx.reply('❌ Session expired. Please start over.', mainMenu);
+        return;
+      }
+      await saveScheduledTransfer(userId, sd, sd.startAt);
+      await ctx.reply(
+        `✅ *Scheduled Transfer Created!*\n\n` +
+        `To: ${sd.recipientName}\n` +
+        `Bank: ${sd.bankName}\n` +
+        `Account: \`${sd.accountNumber}\`\n` +
+        `Amount: ${formatNgn(sd.amountNgn!)}\n` +
+        `Frequency: ${sd.frequency}\n` +
+        `Starts: ${sd.startAt.toLocaleDateString('en-NG')}\n\n` +
+        `Use *📅 Schedule* to view or cancel.`,
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
     } else {
       await ctx.reply('✅ PIN verified.', mainMenu);
     }
@@ -1564,28 +1597,20 @@ bot.on(message('text'), async (ctx, next) => {
     const sd = session.scheduleData!;
     sd.startAt = startAt;
 
-    // Calculate nextRunAt
-    let nextRunAt = new Date(startAt);
-    const freq = sd.frequency!;
-    if (freq === 'daily') {
-      nextRunAt.setDate(nextRunAt.getDate() + 1);
-    } else if (freq === 'weekly') {
-      nextRunAt.setDate(nextRunAt.getDate() + 7);
-    } else if (freq === 'monthly') {
-      nextRunAt.setMonth(nextRunAt.getMonth() + 1);
+    // Check if PIN is required
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    if (user.length > 0 && user[0].transactionPin) {
+      setSession(userId, { ...session, state: ConversationState.AWAITING_PIN_VERIFY, pinVerifyAction: 'schedule' });
+      await ctx.reply(
+        `🔐 *Security Check*\n\n` +
+        `Enter your 4-digit PIN to confirm this scheduled transfer:`,
+        cancelKeyboard
+      );
+      return;
     }
 
-    // Save to DB
-    await db.insert(scheduledTransfers).values({
-      userId,
-      recipientBankAccountId: sd.recipientBankAccountId!,
-      amountNgn: sd.amountNgn!.toString(),
-      frequency: freq,
-      startAt,
-      nextRunAt,
-      isActive: true,
-    });
-
+    // No PIN — save directly
+    await saveScheduledTransfer(userId, sd, startAt);
     setSession(userId, { state: ConversationState.IDLE });
 
     await ctx.reply(
@@ -1594,7 +1619,7 @@ bot.on(message('text'), async (ctx, next) => {
       `Bank: ${sd.bankName}\n` +
       `Account: \`${sd.accountNumber}\`\n` +
       `Amount: ${formatNgn(sd.amountNgn!)}\n` +
-      `Frequency: ${freq}\n` +
+      `Frequency: ${sd.frequency}\n` +
       `Starts: ${startAt.toLocaleDateString('en-NG')}\n\n` +
       `Use *📅 Schedule* to view or cancel.`,
       { parse_mode: 'Markdown', ...mainMenu }
@@ -1602,6 +1627,25 @@ bot.on(message('text'), async (ctx, next) => {
     return;
   }
 });
+
+// Helper to save scheduled transfer
+async function saveScheduledTransfer(userId: string, sd: NonNullable<ZendSession['scheduleData']>, startAt: Date) {
+  let nextRunAt = new Date(startAt);
+  const freq = sd.frequency!;
+  if (freq === 'daily') nextRunAt.setDate(nextRunAt.getDate() + 1);
+  else if (freq === 'weekly') nextRunAt.setDate(nextRunAt.getDate() + 7);
+  else if (freq === 'monthly') nextRunAt.setMonth(nextRunAt.getMonth() + 1);
+
+  await db.insert(scheduledTransfers).values({
+    userId,
+    recipientBankAccountId: sd.recipientBankAccountId!,
+    amountNgn: sd.amountNgn!.toString(),
+    frequency: freq,
+    startAt,
+    nextRunAt,
+    isActive: true,
+  });
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 🎙️ VOICE MESSAGES — Transcribe & Parse
@@ -1998,9 +2042,8 @@ bot.hears('📤 Send', async (ctx) => {
 // CONFIRM SEND
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Reusable send execution (used by confirm_send and voice_confirm_yes)
-async function executeSend(
-  ctx: ZendContext,
+// Core send logic — no Telegram UI (used by executeSend and scheduled executor)
+async function executeSendCore(
   userId: string,
   txData: {
     amountNgn: number;
@@ -2014,7 +2057,7 @@ async function executeSend(
     recipientAccountName?: string;
     recipientName?: string;
   }
-) {
+): Promise<{ success: boolean; txId: string; solanaTxHash?: string; offRampRef?: string; error?: string }> {
   const fromMint = txData.fromMint || SOLANA_TOKENS.USDT.mint;
   const fromToken = Object.values(SOLANA_TOKENS).find(t => t.mint === fromMint) || SOLANA_TOKENS.USDT;
   const fromSymbol = fromToken.symbol;
@@ -2041,35 +2084,17 @@ async function executeSend(
     recipientAccountName: finalAccountName,
   });
 
-  setSession(userId, { state: ConversationState.IDLE });
-
-  const processingText =
-    `⏳ *Processing...*\n\n` +
-    `Sending ${txData.amountUsdt.toFixed(2)} ${fromSymbol}\n` +
-    `Estimated: 1-5 minutes\n\n` +
-    `Reference: \`${txId}\``;
-
-  // editMessageText only works when called from callback query context
-  if (ctx.callbackQuery) {
-    await ctx.editMessageText(processingText, { parse_mode: 'Markdown' });
-  } else {
-    await ctx.reply(processingText, { parse_mode: 'Markdown' });
-  }
-
   let offRampRef = 'MOCK-' + Math.random().toString(36).substring(2, 8).toUpperCase();
   let solanaTxHash: string | undefined;
 
   try {
-    await ctx.replyWithChatAction('typing');
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-
     if (user.length === 0 || !user[0].walletEncryptedKey) {
       throw new Error('User wallet not found');
     }
 
     const pajClient = await getPAJClient();
     if (pajClient && user[0].pajSessionToken) {
-      await ctx.replyWithChatAction('typing');
       const pajBanks = await getPajBankList(user[0].pajSessionToken);
       const ourBank = NIGERIAN_BANKS.find(b => b.code === finalBankCode);
       const pajBank = pajBanks.find(pb =>
@@ -2080,7 +2105,6 @@ async function executeSend(
         throw new Error(`Bank "${ourBank?.name}" not found on PAJ`);
       }
 
-      // Create PAJ off-ramp order
       const webhookUrl = process.env.WEBHOOK_BASE_URL
         ? `${process.env.WEBHOOK_BASE_URL}/webhooks/paj`
         : 'https://example.com/webhook';
@@ -2097,124 +2121,57 @@ async function executeSend(
       offRampRef = order.id;
       console.log('[PAJ] Off-ramp order created:', order.id, 'deposit address:', order.address, 'amount:', order.amount);
 
-      // ─── Check user has enough of the selected token ───
-      await ctx.replyWithChatAction('typing');
       let tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, fromMint);
 
-      // ─── Auto-swap USDC → USDT if sending USDT but only have USDC ───
+      // Auto-swap USDC → USDT if needed
       if (fromMint === SOLANA_TOKENS.USDT.mint && tokenBalance < order.amount) {
         const usdcBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDC.mint);
-
         if (usdcBalance >= order.amount) {
-          const swapStatusText =
-            `⏳ *Processing...*\n\n` +
-            `You have ${usdcBalance.toFixed(2)} USDC but only ${tokenBalance.toFixed(2)} USDT.\n` +
-            `Swapping USDC → USDT via Jupiter...`;
-          if (ctx.callbackQuery) {
-            await ctx.editMessageText(swapStatusText, { parse_mode: 'Markdown' });
-          } else {
-            await ctx.reply(swapStatusText, { parse_mode: 'Markdown' });
-          }
-
           const swapAmountUsdc = Math.min(usdcBalance, order.amount * 1.03);
           const swapAmountBase = Math.round(swapAmountUsdc * Math.pow(10, SOLANA_TOKENS.USDC.decimals));
-
-          const quote = await getSwapQuote(
-            SOLANA_TOKENS.USDC.mint,
-            SOLANA_TOKENS.USDT.mint,
-            swapAmountBase,
-            100 // 1% slippage
-          );
-
+          const quote = await getSwapQuote(SOLANA_TOKENS.USDC.mint, SOLANA_TOKENS.USDT.mint, swapAmountBase, 100);
           if (!quote) {
-            throw new Error(
-              `Insufficient USDT balance.\n\n` +
-              `You have: ${tokenBalance.toFixed(2)} USDT\n` +
-              `Required: ${order.amount.toFixed(2)} USDT\n\n` +
-              `You also have ${usdcBalance.toFixed(2)} USDC, but the swap route is currently unavailable. ` +
-              `Please deposit USDT or try again later.`
-            );
+            throw new Error('Swap route unavailable. Please deposit USDT.');
           }
-
           const outAmountUsdt = Number(quote.outAmount) / Math.pow(10, SOLANA_TOKENS.USDT.decimals);
           if (outAmountUsdt < order.amount) {
-            throw new Error(
-              `Swap would only give ${outAmountUsdt.toFixed(2)} USDT, but ${order.amount.toFixed(2)} USDT is needed. ` +
-              `Please deposit more USDC or USDT.`
-            );
+            throw new Error(`Swap would only give ${outAmountUsdt.toFixed(2)} USDT. Deposit more.`);
           }
-
           const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
-          if (!serializedTx) {
-            throw new Error('Failed to build swap transaction. Please try again.');
-          }
-
+          if (!serializedTx) throw new Error('Failed to build swap transaction.');
           const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
           const keypair = Keypair.fromSecretKey(secretKey);
-
           const swapTxHash = await walletService.signAndSendSerialized(keypair, serializedTx);
           console.log('[Jupiter] Auto-swap USDC→USDT:', swapTxHash);
-
-          // Record swap in DB
           const swapTxId = generateTxId();
           await db.insert(transactions).values({
-            id: swapTxId,
-            userId,
-            type: 'swap',
-            status: 'completed',
-            fromMint: SOLANA_TOKENS.USDC.mint,
-            fromAmount: swapAmountUsdc.toString(),
-            toMint: SOLANA_TOKENS.USDT.mint,
-            toAmount: outAmountUsdt.toString(),
+            id: swapTxId, userId, type: 'swap', status: 'completed',
+            fromMint: SOLANA_TOKENS.USDC.mint, fromAmount: swapAmountUsdc.toString(),
+            toMint: SOLANA_TOKENS.USDT.mint, toAmount: outAmountUsdt.toString(),
             solanaTxHash: swapTxHash,
           });
-
-          // Re-check USDT balance after swap
           tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
         }
       }
 
       if (tokenBalance < order.amount) {
-        throw new Error(
-          `Insufficient ${fromSymbol} balance.\n\n` +
-          `You have: ${tokenBalance.toFixed(2)} ${fromSymbol}\n` +
-          `Required: ${order.amount.toFixed(2)} ${fromSymbol}\n\n` +
-          `Please deposit ${fromSymbol} to your wallet first.\n` +
-          `Wallet: \`${user[0].walletAddress}\``
-        );
+        throw new Error(`Insufficient ${fromSymbol} balance. You have: ${tokenBalance.toFixed(2)}, need: ${order.amount.toFixed(2)}`);
       }
 
-      // ─── Check SOL for gas + ATA rent ───
       const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, 0.005);
       if (!hasGas) {
-        throw new Error(
-          'Insufficient SOL for gas and account creation.\n\n' +
-          'Swaps need ~0.005 SOL to cover:\n' +
-          '• Transaction gas (~0.001 SOL)\n' +
-          '• Token account rent (~0.002 SOL) if you don\'t have a USDT account yet\n\n' +
-          'Please deposit at least 0.005 SOL to your wallet.'
-        );
+        throw new Error('Insufficient SOL for gas. Please deposit at least 0.005 SOL.');
       }
 
       const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
       const keypair = Keypair.fromSecretKey(secretKey);
-
-      solanaTxHash = await walletService.sendSplToken(
-        keypair,
-        order.address,
-        fromMint,
-        order.amount,
-        fromToken.decimals
-      );
+      solanaTxHash = await walletService.sendSplToken(keypair, order.address, fromMint, order.amount, fromToken.decimals);
       console.log(`[Solana] ${fromSymbol} sent to PAJ:`, solanaTxHash);
 
-      // ─── Collect Zend fee ───
       const feeWallet = process.env.ZEND_FEE_WALLET;
-      let feeTxHash: string | undefined;
       if (feeWallet && feeUsdt > 0) {
         try {
-          feeTxHash = await walletService.sendSplToken(keypair, feeWallet, fromMint, feeUsdt, fromToken.decimals);
-          console.log(`[Solana] Zend fee collected:`, feeUsdt, `${fromSymbol} →`, feeWallet, 'tx:', feeTxHash);
+          await walletService.sendSplToken(keypair, feeWallet, fromMint, feeUsdt, fromToken.decimals);
         } catch (feeErr: any) {
           console.error('[Solana] Fee collection failed (non-critical):', feeErr.message);
         }
@@ -2224,22 +2181,70 @@ async function executeSend(
         .set({ solanaTxHash, pajReference: offRampRef })
         .where(eq(transactions.id, txId));
     } else {
-      // No PAJ — just record mock
       await db.update(transactions)
         .set({ pajReference: offRampRef })
         .where(eq(transactions.id, txId));
     }
 
-    // Simulate completion (in production, webhook updates this)
     setTimeout(async () => {
       await db.update(transactions)
         .set({ status: 'completed', completedAt: new Date() })
         .where(eq(transactions.id, txId));
+    }, 3000);
 
+    return { success: true, txId, solanaTxHash, offRampRef };
+  } catch (err: any) {
+    console.error('Off-ramp failed:', err);
+    await db.update(transactions)
+      .set({ status: 'failed' })
+      .where(eq(transactions.id, txId));
+    return { success: false, txId, error: err.message || 'Unknown error' };
+  }
+}
+
+// Reusable send execution (used by confirm_send and voice_confirm_yes)
+async function executeSend(
+  ctx: ZendContext,
+  userId: string,
+  txData: {
+    amountNgn: number;
+    amountUsdt: number;
+    ngnRate?: number;
+    zendFeeUsdt?: number;
+    fromMint?: string;
+    recipientBankCode?: string;
+    recipientBankName?: string;
+    recipientAccountNumber?: string;
+    recipientAccountName?: string;
+    recipientName?: string;
+  }
+) {
+  const fromToken = Object.values(SOLANA_TOKENS).find(t => t.mint === (txData.fromMint || SOLANA_TOKENS.USDT.mint)) || SOLANA_TOKENS.USDT;
+  const processingText =
+    `⏳ *Processing...*\n\n` +
+    `Sending ${txData.amountUsdt.toFixed(2)} ${fromToken.symbol}\n` +
+    `Estimated: 1-5 minutes`;
+
+  if (ctx.callbackQuery) {
+    await ctx.editMessageText(processingText, { parse_mode: 'Markdown' });
+  } else {
+    await ctx.reply(processingText, { parse_mode: 'Markdown' });
+  }
+
+  setSession(userId, { state: ConversationState.IDLE });
+  const result = await executeSendCore(userId, txData);
+
+  if (result.success) {
+    const { txId, solanaTxHash, offRampRef } = result;
+    const finalName = txData.recipientAccountName || txData.recipientName || 'Recipient';
+    const finalBank = txData.recipientBankName || 'Unknown';
+    const finalAccount = txData.recipientAccountNumber || '0000000000';
+
+    setTimeout(async () => {
       await ctx.reply(
         `✅ *Transfer Complete!*\n\n` +
-        `${formatNgn(txData.amountNgn)} sent to ${finalAccountName}\n` +
-        `${finalBankName} • \`${finalAccountNumber}\`\n\n` +
+        `${formatNgn(txData.amountNgn)} sent to ${finalName}\n` +
+        `${finalBank} • \`${finalAccount}\`\n\n` +
         `Reference: \`${txId}\`\n` +
         `PAJ Ref: \`${offRampRef}\`\n` +
         (solanaTxHash ? `Tx: \`https://solscan.io/tx/${solanaTxHash}\`\n` : '') +
@@ -2247,15 +2252,10 @@ async function executeSend(
         { parse_mode: 'Markdown', ...mainMenu }
       );
     }, 3000);
-  } catch (err: any) {
-    console.error('Off-ramp failed:', err);
-    await db.update(transactions)
-      .set({ status: 'failed' })
-      .where(eq(transactions.id, txId));
-
+  } else {
     await ctx.reply(
       `❌ *Transfer Failed*\n\n` +
-      `Error: ${err.message || 'Unknown error'}\n` +
+      `Error: ${result.error}\n` +
       `No funds were deducted.`,
       { parse_mode: 'Markdown', ...mainMenu }
     );
@@ -3505,14 +3505,20 @@ async function runScheduledTransfers() {
 
         const acc = accounts[0];
 
-        // Create a transaction record
-        const txId = generateTxId();
-        await db.insert(transactions).values({
-          id: txId,
-          userId: s.userId,
-          type: 'scheduled',
-          status: 'pending',
-          ngnAmount: s.amountNgn.toString(),
+        // Get rate for USDT calculation
+        let rate = 1550;
+        try {
+          const rates = await getPAJRates();
+          rate = rates.offRampRate;
+        } catch (e) { /* use fallback */ }
+
+        const amountUsdt = Number(s.amountNgn) / rate;
+
+        // Auto-execute the transfer
+        const result = await executeSendCore(s.userId, {
+          amountNgn: Number(s.amountNgn),
+          amountUsdt,
+          ngnRate: rate,
           recipientBankCode: acc.bankCode,
           recipientBankName: acc.bankName,
           recipientAccountNumber: acc.accountNumber,
@@ -3521,16 +3527,30 @@ async function runScheduledTransfers() {
 
         // Notify user
         try {
-          await bot.telegram.sendMessage(
-            s.userId,
-            `📅 *Scheduled Transfer Due*\n\n` +
-            `Amount: ${formatNgn(Number(s.amountNgn))}\n` +
-            `To: ${acc.accountName}\n` +
-            `Bank: ${acc.bankName} • \`${acc.accountNumber}\`\n\n` +
-            `Reference: \`${txId}\`\n\n` +
-            `Please open the bot and confirm to complete this transfer.`,
-            { parse_mode: 'Markdown', ...mainMenu }
-          );
+          if (result.success) {
+            await bot.telegram.sendMessage(
+              s.userId,
+              `✅ *Scheduled Transfer Executed*\n\n` +
+              `Amount: ${formatNgn(Number(s.amountNgn))}\n` +
+              `To: ${acc.accountName}\n` +
+              `Bank: ${acc.bankName} • \`${acc.accountNumber}\`\n\n` +
+              `Reference: \`${result.txId}\`\n` +
+              (result.solanaTxHash ? `Tx: \`https://solscan.io/tx/${result.solanaTxHash}\`\n` : '') +
+              `Time: ~2 minutes`,
+              { parse_mode: 'Markdown', ...mainMenu }
+            );
+          } else {
+            await bot.telegram.sendMessage(
+              s.userId,
+              `❌ *Scheduled Transfer Failed*\n\n` +
+              `Amount: ${formatNgn(Number(s.amountNgn))}\n` +
+              `To: ${acc.accountName}\n` +
+              `Bank: ${acc.bankName} • \`${acc.accountNumber}\`\n\n` +
+              `Error: ${result.error || 'Unknown error'}\n` +
+              `No funds were deducted.`,
+              { parse_mode: 'Markdown', ...mainMenu }
+            );
+          }
         } catch (notifyErr) {
           console.log('[Schedule] Could not notify user:', notifyErr);
         }
@@ -3560,7 +3580,7 @@ async function runScheduledTransfers() {
           .set(updates)
           .where(eq(scheduledTransfers.id, s.id));
 
-        console.log(`[Schedule] Processed #${s.id} for user ${s.userId}`);
+        console.log(`[Schedule] Executed #${s.id} for user ${s.userId}`);
       } catch (err) {
         console.error(`[Schedule] Error processing #${s.id}:`, err);
       }
