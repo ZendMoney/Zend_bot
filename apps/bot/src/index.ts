@@ -68,6 +68,7 @@ interface ZendSession {
     swapMinOut?: number;
     swapPriceImpact?: number;
   }>;
+  pinVerifyAction?: 'send' | 'swap' | 'export';
   pajContact?: string; // email/phone pending OTP
   onrampAmount?: number; // pending on-ramp amount in NGN
   voiceAnalysis?: {
@@ -131,6 +132,21 @@ function decryptPrivateKey(encryptedKey: string): Uint8Array {
   decipher.setAuthTag(authTag);
   const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
   return new Uint8Array(decrypted);
+}
+
+// ─── PIN hashing ───
+function hashPin(pin: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(pin, salt, 100000, 32, 'sha256').toString('hex');
+  return salt + ':' + hash;
+}
+
+function verifyPin(pin: string, stored: string): boolean {
+  const parts = stored.split(':');
+  if (parts.length !== 2) return false;
+  const [salt, hash] = parts;
+  const computed = crypto.pbkdf2Sync(pin, salt, 100000, 32, 'sha256').toString('hex');
+  return computed === hash;
 }
 
 function formatBalance(amount: number, symbol: string): string {
@@ -398,7 +414,7 @@ bot.command('start', async (ctx) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// /WALLET — View Address & Export Private Key
+// /WALLET — View Address
 // ═════════════════════════════════════════════════════════════════════════════
 
 bot.command('wallet', async (ctx) => {
@@ -415,25 +431,18 @@ bot.command('wallet', async (ctx) => {
   await ctx.reply(
     `👛 *Your Wallet*\n\n` +
     `*Solana Address:*\n` +
-    `\`${u.walletAddress}\`\n\n` +
-    `Tap to copy the address above.\n\n` +
-    `*Network:* Solana Devnet\n` +
+    `\`\`\`\n${u.walletAddress}\n\`\`\`\n\n` +
+    `Tap the code block above to copy your address.\n\n` +
+    `*Network:* Solana Mainnet\n` +
     `*Tokens:* SOL, USDT, USDC\n\n` +
-    `⚠️ To export your private key, tap the button below.`,
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('🔑 Export Private Key', 'export_key')],
-      ]),
-    }
+    `⚠️ To export your private key, go to *⚙️ Settings*.`,
+    { parse_mode: 'Markdown' }
   );
 });
 
-bot.action('export_key', async (ctx) => {
-  await ctx.answerCbQuery();
-  const userId = ctx.from!.id.toString();
+// ─── Export key helper (called after PIN is verified) ───
+async function doExportKey(ctx: ZendContext, userId: string) {
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-
   if (user.length === 0) {
     await ctx.reply('Please run /start first.', mainMenu);
     return;
@@ -441,9 +450,8 @@ bot.action('export_key', async (ctx) => {
 
   try {
     const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
-    const keypair = Keypair.fromSecretKey(secretKey);
 
-    await ctx.editMessageText(
+    const msg = await ctx.reply(
       `🔑 *Private Key Export*\n\n` +
       `⚠️ *SECURITY WARNING*\n` +
       `Never share this with anyone. Zend will NEVER ask for it.\n\n` +
@@ -459,7 +467,7 @@ bot.action('export_key', async (ctx) => {
     // Auto-delete after 60 seconds for security
     setTimeout(async () => {
       try {
-        await ctx.deleteMessage();
+        await ctx.telegram.deleteMessage(msg.chat.id, msg.message_id);
       } catch (err) {
         // Message may already be deleted
       }
@@ -468,6 +476,40 @@ bot.action('export_key', async (ctx) => {
     console.error('Export key error:', err);
     await ctx.reply('❌ Could not export private key. Please contact support.', mainMenu);
   }
+}
+
+bot.action('export_key', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+
+  if (user.length === 0) {
+    await ctx.reply('Please run /start first.', mainMenu);
+    return;
+  }
+
+  const u = user[0];
+
+  // If PIN is set, require it first
+  if (u.transactionPin) {
+    setSession(userId, { state: ConversationState.AWAITING_PIN_VERIFY, pinVerifyAction: 'export' });
+    await ctx.editMessageText(
+      `🔐 *Security Check*\n\n` +
+      `Enter your 4-digit PIN to export your private key:`,
+      { parse_mode: 'Markdown' }
+    );
+    await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    return;
+  }
+
+  // No PIN set — proceed directly (but warn)
+  await ctx.editMessageText(
+    `⚠️ *No PIN Set*\n\n` +
+    `For security, we recommend setting a PIN in Settings before exporting your private key.\n\n` +
+    `Proceeding anyway...`,
+    { parse_mode: 'Markdown' }
+  );
+  await doExportKey(ctx, userId);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1274,12 +1316,71 @@ bot.on(message('text'), async (ctx, next) => {
       return;
     }
 
+    const hashed = hashPin(pin);
     await db.update(users)
-      .set({ transactionPin: pin })
+      .set({ transactionPin: hashed })
       .where(eq(users.id, userId));
 
     setSession(userId, { state: ConversationState.IDLE });
     await ctx.reply('✅ PIN set successfully.', mainMenu);
+    return;
+  }
+
+  // ─── PIN VERIFY: AWAITING_PIN_VERIFY ───
+  if (session.state === ConversationState.AWAITING_PIN_VERIFY) {
+    const pin = text.trim();
+    if (!/^\d{4}$/.test(pin)) {
+      await ctx.reply('❌ Please enter a valid 4-digit PIN.', cancelKeyboard);
+      return;
+    }
+
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    if (user.length === 0 || !user[0].transactionPin) {
+      setSession(userId, { state: ConversationState.IDLE });
+      await ctx.reply('❌ PIN not set. Please set a PIN in Settings.', mainMenu);
+      return;
+    }
+
+    const valid = verifyPin(pin, user[0].transactionPin);
+    if (!valid) {
+      await ctx.reply('❌ Incorrect PIN. Please try again.', cancelKeyboard);
+      return;
+    }
+
+    const action = session.pinVerifyAction;
+    setSession(userId, { state: ConversationState.IDLE });
+
+    if (action === 'send') {
+      const pt = session.pendingTransaction;
+      if (!pt) {
+        await ctx.reply('❌ Session expired. Please start over.', mainMenu);
+        return;
+      }
+      await executeSend(ctx, userId, {
+        amountNgn: pt.amountNgn!,
+        amountUsdt: pt.amountUsdt!,
+        ngnRate: pt.ngnRate,
+        zendFeeUsdt: pt.zendFeeUsdt,
+        fromMint: pt.fromMint,
+        recipientBankCode: pt.recipientBankCode,
+        recipientBankName: pt.recipientBankName,
+        recipientAccountNumber: pt.recipientAccountNumber,
+        recipientAccountName: pt.recipientAccountName,
+        recipientName: pt.recipientName,
+      });
+    } else if (action === 'swap') {
+      const pt = session.pendingTransaction;
+      if (!pt || !pt.swapQuote) {
+        await ctx.reply('❌ Session expired. Please start over.', mainMenu);
+        return;
+      }
+      // Re-use confirm_swap logic inline since we need the session
+      await executeSwap(ctx, userId, pt);
+    } else if (action === 'export') {
+      await doExportKey(ctx, userId);
+    } else {
+      await ctx.reply('✅ PIN verified.', mainMenu);
+    }
     return;
   }
 });
@@ -1930,6 +2031,86 @@ async function executeSend(
   }
 }
 
+// Reusable swap execution (used by confirm_swap and PIN verify flow)
+async function executeSwap(
+  ctx: ZendContext,
+  userId: string,
+  pt: NonNullable<ZendSession['pendingTransaction']>
+) {
+  const fromSymbol = pt.fromSymbol as string;
+  const toSymbol = pt.toSymbol as string;
+  const quote = pt.swapQuote as any;
+  const outAmount = pt.swapOutAmount as number;
+
+  await ctx.reply('⏳ Executing swap via Jupiter...');
+
+  try {
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    if (user.length === 0 || !user[0].walletEncryptedKey) {
+      throw new Error('Wallet not found');
+    }
+
+    // Check SOL for gas + ATA rent
+    const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, 0.005);
+    if (!hasGas) {
+      throw new Error(
+        'Insufficient SOL for gas and account creation.\n\n' +
+        'Swaps need ~0.005 SOL to cover:\n' +
+        '• Transaction gas (~0.001 SOL)\n' +
+        '• Token account rent (~0.002 SOL) if you don\'t have a USDT account yet\n\n' +
+        'Please deposit at least 0.005 SOL to your wallet.'
+      );
+    }
+
+    // Build swap transaction
+    const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
+    if (!serializedTx) {
+      throw new Error('Failed to build swap transaction');
+    }
+
+    // Sign and send
+    const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
+    const keypair = Keypair.fromSecretKey(secretKey);
+
+    await ctx.replyWithChatAction('typing');
+    const txHash = await walletService.signAndSendSerialized(keypair, serializedTx);
+    console.log('[Jupiter] Swap executed:', txHash);
+
+    // Record in DB
+    const txId = generateTxId();
+    await db.insert(transactions).values({
+      id: txId,
+      userId,
+      type: 'swap',
+      status: 'completed',
+      fromMint: pt.fromMint,
+      fromAmount: (Number(quote.inAmount) / Math.pow(10, getTokenBySymbol(fromSymbol)!.decimals)).toString(),
+      toMint: pt.toMint,
+      toAmount: outAmount.toString(),
+      solanaTxHash: txHash,
+    });
+
+    setSession(userId, { state: ConversationState.IDLE });
+
+    await ctx.reply(
+      `✅ *Swap Complete!*\n\n` +
+      `${formatTokenAmount(Number(quote.inAmount), getTokenBySymbol(fromSymbol)!.decimals)} ${fromSymbol} → ${outAmount.toFixed(2)} ${toSymbol}\n\n` +
+      `Tx: \`https://solscan.io/tx/${txHash}\`\n` +
+      `Reference: \`${txId}\``, 
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+  } catch (err: any) {
+    console.error('[Swap] Failed:', err);
+    setSession(userId, { state: ConversationState.IDLE });
+    await ctx.reply(
+      `❌ *Swap Failed*\n\n` +
+      `Error: ${err.message || 'Unknown error'}\n` +
+      `No funds were deducted.`,
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+  }
+}
+
 bot.action('confirm_send', async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from!.id.toString();
@@ -1938,6 +2119,24 @@ bot.action('confirm_send', async (ctx) => {
   if (session.state !== ConversationState.AWAITING_CONFIRMATION || !session.pendingTransaction) {
     await ctx.editMessageText('❌ Session expired. Please start over.');
     await ctx.reply('Use the menu to start again.', mainMenu);
+    return;
+  }
+
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  if (user.length === 0) {
+    await ctx.reply('Please run /start first.', mainMenu);
+    return;
+  }
+
+  // If PIN is set, require verification first
+  if (user[0].transactionPin) {
+    setSession(userId, { ...session, state: ConversationState.AWAITING_PIN_VERIFY, pinVerifyAction: 'send' });
+    await ctx.editMessageText(
+      `🔐 *Security Check*\n\n` +
+      `Enter your 4-digit PIN to confirm this transfer:`,
+      { parse_mode: 'Markdown' }
+    );
+    await ctx.reply('Waiting for PIN...', cancelKeyboard);
     return;
   }
 
@@ -2257,7 +2456,7 @@ async function handleSwapAmount(ctx: ZendContext, userId: string, text: string) 
 
   const outAmount = Number(quote.outAmount) / Math.pow(10, toToken.decimals);
   const minOut = Number(quote.otherAmountThreshold) / Math.pow(10, toToken.decimals);
-  const priceImpact = quote.priceImpactPct;
+  const priceImpact = parseFloat(quote.priceImpactPct);
 
   // Store quote for confirmation
   session.pendingTransaction = {
@@ -2272,7 +2471,7 @@ async function handleSwapAmount(ctx: ZendContext, userId: string, text: string) 
   setSession(userId, session);
 
   let msg = `🔄 *Swap Quote*\n\n`;
-  msg += `${formatTokenAmount(quote.inAmount, fromToken.decimals)} ${fromToken.symbol} → ${outAmount.toFixed(toToken.decimals === 9 ? 4 : 2)} ${toToken.symbol}\n`;
+  msg += `${formatTokenAmount(Number(quote.inAmount), fromToken.decimals)} ${fromToken.symbol} → ${outAmount.toFixed(toToken.decimals === 9 ? 4 : 2)} ${toToken.symbol}\n`;
   msg += `Minimum received: ${minOut.toFixed(toToken.decimals === 9 ? 4 : 2)} ${toToken.symbol}\n`;
   msg += `Price impact: ${priceImpact < 0.01 ? '<0.01%' : priceImpact.toFixed(2) + '%'}\n`;
   msg += `Slippage: 0.5%\n\n`;
@@ -2298,79 +2497,25 @@ bot.action('confirm_swap', async (ctx) => {
     return;
   }
 
-  const pt = session.pendingTransaction;
-  const fromSymbol = pt.fromSymbol as string;
-  const toSymbol = pt.toSymbol as string;
-  const quote = pt.swapQuote as any;
-  const outAmount = pt.swapOutAmount as number;
-
-  await ctx.editMessageText('⏳ Executing swap via Jupiter...');
-
-  try {
-    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-    if (user.length === 0 || !user[0].walletEncryptedKey) {
-      throw new Error('Wallet not found');
-    }
-
-    // Check SOL for gas + ATA rent
-    const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, 0.005);
-    if (!hasGas) {
-      throw new Error(
-        'Insufficient SOL for gas and account creation.\n\n' +
-        'Swaps need ~0.005 SOL to cover:\n' +
-        '• Transaction gas (~0.001 SOL)\n' +
-        '• Token account rent (~0.002 SOL) if you don\'t have a USDT account yet\n\n' +
-        'Please deposit at least 0.005 SOL to your wallet.'
-      );
-    }
-
-    // Build swap transaction
-    const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
-    if (!serializedTx) {
-      throw new Error('Failed to build swap transaction');
-    }
-
-    // Sign and send
-    const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
-    const keypair = Keypair.fromSecretKey(secretKey);
-
-    await ctx.replyWithChatAction('typing');
-    const txHash = await walletService.signAndSendSerialized(keypair, serializedTx);
-    console.log('[Jupiter] Swap executed:', txHash);
-
-    // Record in DB
-    const txId = generateTxId();
-    await db.insert(transactions).values({
-      id: txId,
-      userId,
-      type: 'swap',
-      status: 'completed',
-      fromMint: pt.fromMint,
-      fromAmount: (Number(quote.inAmount) / Math.pow(10, getTokenBySymbol(fromSymbol)!.decimals)).toString(),
-      toMint: pt.toMint,
-      toAmount: outAmount.toString(),
-      solanaTxHash: txHash,
-    });
-
-    setSession(userId, { state: ConversationState.IDLE });
-
-    await ctx.reply(
-      `✅ *Swap Complete!*\n\n` +
-      `${formatTokenAmount(quote.inAmount, getTokenBySymbol(fromSymbol)!.decimals)} ${fromSymbol} → ${outAmount.toFixed(2)} ${toSymbol}\n\n` +
-      `Tx: \`https://solscan.io/tx/${txHash}\`\n` +
-      `Reference: \`${txId}\``, 
-      { parse_mode: 'Markdown', ...mainMenu }
-    );
-  } catch (err: any) {
-    console.error('[Swap] Failed:', err);
-    setSession(userId, { state: ConversationState.IDLE });
-    await ctx.reply(
-      `❌ *Swap Failed*\n\n` +
-      `Error: ${err.message || 'Unknown error'}\n` +
-      `No funds were deducted.`,
-      { parse_mode: 'Markdown', ...mainMenu }
-    );
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  if (user.length === 0) {
+    await ctx.reply('Please run /start first.', mainMenu);
+    return;
   }
+
+  // If PIN is set, require verification first
+  if (user[0].transactionPin) {
+    setSession(userId, { ...session, state: ConversationState.AWAITING_PIN_VERIFY, pinVerifyAction: 'swap' });
+    await ctx.editMessageText(
+      `🔐 *Security Check*\n\n` +
+      `Enter your 4-digit PIN to confirm this swap:`,
+      { parse_mode: 'Markdown' }
+    );
+    await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    return;
+  }
+
+  await executeSwap(ctx, userId, session.pendingTransaction);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2591,18 +2736,29 @@ async function showSettings(ctx: ZendContext, userId: string) {
       `🔐 *Security*\n` +
       `Email: ${u.email || 'Not set'} ${u.emailVerified ? '✓' : ''}\n` +
       `PAJ: ${u.pajSessionToken ? '✅ Linked' : '❌ Not linked'}\n` +
-      `PIN: ${u.transactionPin ? 'Set' : 'Not set'}\n\n` +
+      `PIN: ${u.transactionPin ? 'Set ✅' : 'Not set'}\n\n` +
       `💰 *Preferences*\n` +
       `Auto-save: ${autoSave}`;
+
+    // Build dynamic settings menu — hide items already done
+    const buttons: any[] = [];
+    if (!u.email) {
+      buttons.push([Markup.button.callback('📧 Add Email', 'settings_email')]);
+    }
+    if (!u.pajSessionToken) {
+      buttons.push([Markup.button.callback('🔗 Link PAJ', 'settings_paj')]);
+    }
+    if (!u.transactionPin) {
+      buttons.push([Markup.button.callback('🔢 Set PIN', 'settings_pin')]);
+    } else {
+      buttons.push([Markup.button.callback('🔢 Change PIN', 'settings_pin')]);
+    }
+    buttons.push([Markup.button.callback('🔑 Export Private Key', 'export_key')]);
 
     await finishLoading(ctx, loading.message_id, msg, 'Markdown');
     await ctx.reply('Menu:', {
       parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('📧 Add Email', 'settings_email')],
-        [Markup.button.callback('🔗 Link PAJ', 'settings_paj')],
-        [Markup.button.callback('🔢 Set PIN', 'settings_pin')],
-      ]),
+      ...Markup.inlineKeyboard(buttons),
     });
   } catch (err) {
     console.error('Settings error:', err);
@@ -2637,7 +2793,7 @@ bot.action('settings_email', async (ctx) => {
   setSession(userId, { state: ConversationState.AWAITING_EMAIL });
 
   await ctx.editMessageText(
-    `📧 *Add Email*\n\n` +
+    `📧 *Add / Change Email*\n\n` +
     `Enter your email address:\n` +
     `Example: user@email.com`
   );
@@ -2652,8 +2808,8 @@ bot.action('settings_pin', async (ctx) => {
   setSession(userId, { state: ConversationState.AWAITING_PIN });
 
   await ctx.editMessageText(
-    `🔢 *Set Transaction PIN*\n\n` +
-    `Enter a 4-digit PIN for transaction security:\n` +
+    `🔢 *Set / Change Transaction PIN*\n\n` +
+    `Enter a new 4-digit PIN for transaction security:\n` +
     `Example: 1234`
   );
 
