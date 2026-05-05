@@ -3598,7 +3598,7 @@ async function runScheduledTransfers() {
   try {
     const now = new Date();
     const due = await db.select().from(scheduledTransfers)
-      .where(and(eq(scheduledTransfers.isActive, true), sql`${scheduledTransfers.nextRunAt} <= ${now}`));
+      .where(and(eq(scheduledTransfers.isActive, true), sql`${scheduledTransfers.nextRunAt} <= ${now.toISOString()}`));
 
     for (const s of due) {
       try {
