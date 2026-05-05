@@ -2251,6 +2251,8 @@ async function executeSend(
         `Time: ~2 minutes`,
         { parse_mode: 'Markdown', ...mainMenu }
       );
+      // Check milestones after successful transfer
+      await checkMilestones(userId, (text) => ctx.reply(text, { parse_mode: 'Markdown', ...mainMenu }));
     }, 3000);
   } else {
     await ctx.reply(
@@ -3096,26 +3098,50 @@ bot.action('cancel_bridge', async (ctx) => {
 async function buildHistoryMessage(userId: string): Promise<string | null> {
   const txs = await db.select().from(transactions)
     .where(eq(transactions.userId, userId))
-    .orderBy(transactions.createdAt)
+    .orderBy(sql`${transactions.createdAt} desc`)
     .limit(10);
 
   if (txs.length === 0) {
-    return '📋 No transactions yet.\n\nSend or receive money to see your history here.';
+    return '📋 *No transactions yet*\n\nSend or receive money to see your history here.';
   }
 
-  let msg = `📋 *Transaction History*\n\n`;
+  // Get user stats
+  const allTxs = await db.select().from(transactions)
+    .where(and(eq(transactions.userId, userId), eq(transactions.status, 'completed')));
+  const totalSent = allTxs.filter(t => t.type === 'ngn_send').reduce((sum, t) => sum + Number(t.ngnAmount || 0), 0);
+  const totalCount = allTxs.length;
+
+  let msg = `📋 *Transaction History*\n`;
+  msg += `━━━━━━━━━━━━━━━━━━━━\n`;
+  msg += `💰 Total Sent: ${formatNgn(totalSent)}  •  📊 ${totalCount} txs\n\n`;
 
   for (const tx of txs) {
-    const icon = tx.status === 'completed' ? '✅' : tx.status === 'processing' ? '⏳' : '❌';
-    const typeLabel = tx.type === 'ngn_send' ? 'Send NGN' : tx.type === 'ngn_receive' ? 'Deposit' : tx.type;
-    const amount = tx.ngnAmount ? formatNgn(Number(tx.ngnAmount)) : `${tx.fromAmount} ${tx.fromMint}`;
-    const date = tx.createdAt.toLocaleDateString('en-NG', { month: 'short', day: 'numeric' });
+    const statusEmoji = tx.status === 'completed' ? '✅' : tx.status === 'processing' ? '⏳' : tx.status === 'pending' ? '🕐' : '❌';
+    const typeEmoji = tx.type === 'ngn_send' ? '📤' : tx.type === 'ngn_receive' ? '📥' : tx.type === 'swap' ? '🔄' : tx.type === 'scheduled' ? '📅' : '💱';
+    const typeLabel = tx.type === 'ngn_send' ? 'Send' : tx.type === 'ngn_receive' ? 'Deposit' : tx.type === 'swap' ? 'Swap' : tx.type === 'scheduled' ? 'Scheduled' : tx.type;
 
-    msg += `${icon} ${typeLabel}  ${amount}  ${date}\n`;
-    if (tx.recipientBankName) {
-      msg += `   To: ${tx.recipientAccountName} (${tx.recipientBankName})\n`;
+    const amountLine = tx.ngnAmount
+      ? `${formatNgn(Number(tx.ngnAmount))}`
+      : tx.fromAmount && tx.fromMint
+        ? `${Number(tx.fromAmount).toFixed(2)} ${tx.fromMint === SOLANA_TOKENS.USDT.mint ? 'USDT' : tx.fromMint === SOLANA_TOKENS.USDC.mint ? 'USDC' : 'SOL'}`
+        : '';
+
+    const date = tx.createdAt.toLocaleDateString('en-NG', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+    msg += `${typeEmoji} *${typeLabel}*  ${statusEmoji}\n`;
+    msg += `💵 ${amountLine}\n`;
+
+    if (tx.recipientBankName || tx.recipientAccountName) {
+      msg += `👤 ${tx.recipientAccountName || 'Recipient'} · ${tx.recipientBankName || ''}\n`;
+      if (tx.recipientAccountNumber) {
+        msg += `🔢 \`${tx.recipientAccountNumber}\`\n`;
+      }
     }
-    msg += `   Ref: ${tx.id}\n\n`;
+    if (tx.solanaTxHash) {
+      msg += `🔗 [View on Solscan](https://solscan.io/tx/${tx.solanaTxHash})\n`;
+    }
+    msg += `🆔 \`${tx.id}\` · ${date}\n`;
+    msg += `━━━━━━━━━━━━━━━━━━━━\n`;
   }
 
   return msg;
@@ -3314,6 +3340,47 @@ bot.command('clear', async (ctx) => {
   }, 3000);
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// 📊 STATS
+// ═════════════════════════════════════════════════════════════════════════════
+
+bot.command('stats', async (ctx) => {
+  const userId = ctx.from.id.toString();
+
+  try {
+    // Personal stats
+    const userTxs = await db.select().from(transactions)
+      .where(and(eq(transactions.userId, userId), eq(transactions.status, 'completed')));
+    const sendTxs = userTxs.filter(t => t.type === 'ngn_send');
+    const swapTxs = userTxs.filter(t => t.type === 'swap');
+    const schedTxs = userTxs.filter(t => t.type === 'scheduled');
+    const totalNgn = sendTxs.reduce((sum, t) => sum + Number(t.ngnAmount || 0), 0);
+    const totalSwaps = swapTxs.length + schedTxs.length;
+
+    // Platform stats
+    const allTxs = await db.select().from(transactions).where(eq(transactions.status, 'completed'));
+    const platformSends = allTxs.filter(t => t.type === 'ngn_send');
+    const platformNgn = platformSends.reduce((sum, t) => sum + Number(t.ngnAmount || 0), 0);
+    const userCount = (await db.select().from(users)).length;
+
+    await ctx.reply(
+      `📊 *Your Stats*\n\n` +
+      `💰 Total Sent: ${formatNgn(totalNgn)}\n` +
+      `📤 Transfers: ${sendTxs.length}\n` +
+      `🔄 Swaps: ${totalSwaps}\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `📊 *Platform Stats*\n\n` +
+      `👥 Users: ${userCount}\n` +
+      `💰 Total Volume: ${formatNgn(platformNgn)}\n` +
+      `📤 Total Transfers: ${platformSends.length}`,
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+  } catch (err) {
+    console.error('Stats error:', err);
+    await ctx.reply('❌ Could not fetch stats. Please try again.', mainMenu);
+  }
+});
+
 // ─── Auto-delete helper for sensitive messages ───
 async function autoDeleteReply(ctx: ZendContext, text: string, extra?: any, delayMs = 120000) {
   const msg = await ctx.reply(text, extra);
@@ -3325,6 +3392,48 @@ async function autoDeleteReply(ctx: ZendContext, text: string, extra?: any, dela
     }
   }, delayMs);
   return msg;
+}
+
+// ─── Milestone tracking ───
+const MILESTONE_AMOUNTS = [10000, 50000, 100000, 500000, 1000000, 5000000, 10000000];
+const MILESTONE_COUNTS = [1, 5, 10, 25, 50, 100];
+
+async function checkMilestones(userId: string, notifyFn: (text: string) => Promise<any>) {
+  try {
+    const completed = await db.select().from(transactions)
+      .where(and(eq(transactions.userId, userId), eq(transactions.status, 'completed')));
+
+    const sendTxs = completed.filter(t => t.type === 'ngn_send');
+    const totalNgn = sendTxs.reduce((sum, t) => sum + Number(t.ngnAmount || 0), 0);
+    const count = sendTxs.length;
+
+    // Check amount milestones
+    for (const milestone of MILESTONE_AMOUNTS) {
+      if (totalNgn >= milestone && totalNgn < milestone + 1000) {
+        await notifyFn(
+          `🎉 *Milestone Reached!*\n\n` +
+          `You've sent a total of *${formatNgn(milestone)}* across ${count} transactions!\n\n` +
+          `Keep it going 🚀`
+        );
+        break; // Only announce one milestone at a time
+      }
+    }
+
+    // Check count milestones
+    for (const milestone of MILESTONE_COUNTS) {
+      if (count === milestone) {
+        await notifyFn(
+          `🎉 *Milestone Reached!*\n\n` +
+          `You've completed *${milestone}* successful transfers!\n\n` +
+          `Total sent: ${formatNgn(totalNgn)}\n` +
+          `Keep it going 🚀`
+        );
+        break;
+      }
+    }
+  } catch (err) {
+    console.error('[Milestone] Error checking milestones:', err);
+  }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -3539,6 +3648,8 @@ async function runScheduledTransfers() {
               `Time: ~2 minutes`,
               { parse_mode: 'Markdown', ...mainMenu }
             );
+            // Check milestones after successful scheduled transfer
+            await checkMilestones(s.userId, (text) => bot.telegram.sendMessage(s.userId, text, { parse_mode: 'Markdown', ...mainMenu }));
           } else {
             await bot.telegram.sendMessage(
               s.userId,
