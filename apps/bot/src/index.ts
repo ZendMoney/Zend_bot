@@ -1928,13 +1928,18 @@ async function executeSend(
 
   setSession(userId, { state: ConversationState.IDLE });
 
-  await ctx.editMessageText(
+  const processingText =
     `⏳ *Processing...*\n\n` +
     `Sending ${txData.amountUsdt.toFixed(2)} ${fromSymbol}\n` +
     `Estimated: 1-5 minutes\n\n` +
-    `Reference: \`${txId}\``,
-    { parse_mode: 'Markdown' }
-  );
+    `Reference: \`${txId}\``;
+
+  // editMessageText only works when called from callback query context
+  if (ctx.callbackQuery) {
+    await ctx.editMessageText(processingText, { parse_mode: 'Markdown' });
+  } else {
+    await ctx.reply(processingText, { parse_mode: 'Markdown' });
+  }
 
   let offRampRef = 'MOCK-' + Math.random().toString(36).substring(2, 8).toUpperCase();
   let solanaTxHash: string | undefined;
@@ -1986,12 +1991,15 @@ async function executeSend(
         const usdcBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDC.mint);
 
         if (usdcBalance >= order.amount) {
-          await ctx.editMessageText(
+          const swapStatusText =
             `⏳ *Processing...*\n\n` +
             `You have ${usdcBalance.toFixed(2)} USDC but only ${tokenBalance.toFixed(2)} USDT.\n` +
-            `Swapping USDC → USDT via Jupiter...`,
-            { parse_mode: 'Markdown' }
-          );
+            `Swapping USDC → USDT via Jupiter...`;
+          if (ctx.callbackQuery) {
+            await ctx.editMessageText(swapStatusText, { parse_mode: 'Markdown' });
+          } else {
+            await ctx.reply(swapStatusText, { parse_mode: 'Markdown' });
+          }
 
           const swapAmountUsdc = Math.min(usdcBalance, order.amount * 1.03);
           const swapAmountBase = Math.round(swapAmountUsdc * Math.pow(10, SOLANA_TOKENS.USDC.decimals));
