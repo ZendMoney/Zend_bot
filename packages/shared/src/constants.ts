@@ -71,6 +71,7 @@ export enum ConversationState {
   AWAITING_SCHEDULE_RECIPIENT = 'awaiting_schedule_recipient',
   AWAITING_SCHEDULE_AMOUNT = 'awaiting_schedule_amount',
   AWAITING_SCHEDULE_FREQUENCY = 'awaiting_schedule_frequency',
+  AWAITING_SCHEDULE_START = 'awaiting_schedule_start',
   AWAITING_EMAIL = 'awaiting_email',
   AWAITING_OTP = 'awaiting_otp',
   AWAITING_PIN = 'awaiting_pin',

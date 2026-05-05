@@ -11,8 +11,8 @@ import { Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { message } from 'telegraf/filters';
 import { db, checkConnection } from '@zend/db';
-import { users, transactions } from '@zend/db';
-import { eq } from 'drizzle-orm';
+import { users, transactions, savedBankAccounts, scheduledTransfers } from '@zend/db';
+import { eq, sql, and } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
 import { parseCommand, transcribeVoice, chatWithKimi, analyzeVoiceWithKimi, parseMenuInputWithAI, type ParsedCommand } from './services/nlp.js';
 import type { PAJClient } from '@zend/paj-client';
@@ -79,6 +79,15 @@ interface ZendSession {
     bankName: string | null;
     accountNumber: string | null;
     walletAddress: string | null;
+  };
+  scheduleData?: {
+    recipientBankAccountId?: number;
+    recipientName?: string;
+    bankName?: string;
+    accountNumber?: string;
+    amountNgn?: number;
+    frequency?: 'once' | 'daily' | 'weekly' | 'monthly';
+    startAt?: Date;
   };
 }
 
@@ -347,7 +356,8 @@ const mainMenu = Markup.keyboard([
   ['💰 Balance', '📤 Send'],
   ['💵 Add Naira', '💴 Cash Out'],
   ['🔄 Swap', '📥 Receive'],
-  ['📋 History', '⚙️ Settings'],
+  ['📅 Schedule', '📋 History'],
+  ['⚙️ Settings', '🌐 Community'],
 ]).resize();
 
 const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
@@ -695,7 +705,7 @@ bot.on(message('text'), async (ctx, next) => {
   const session = getSession(userId);
 
   // ─── Pass menu buttons to bot.hears() handlers ───
-  const menuButtons = ['💰 Balance', '💵 Add Naira', '📤 Send', '💴 Cash Out', '📥 Receive', '🔄 Swap', '📋 History', '⚙️ Settings'];
+  const menuButtons = ['💰 Balance', '💵 Add Naira', '📤 Send', '💴 Cash Out', '📥 Receive', '🔄 Swap', '📅 Schedule', '📋 History', '⚙️ Settings', '🌐 Community'];
   if (menuButtons.includes(text)) {
     return next();
   }
@@ -1484,6 +1494,111 @@ bot.on(message('text'), async (ctx, next) => {
     } else {
       await ctx.reply('✅ PIN verified.', mainMenu);
     }
+    return;
+  }
+
+  // ─── SCHEDULE: AWAITING_SCHEDULE_RECIPIENT ───
+  if (session.state === ConversationState.AWAITING_SCHEDULE_RECIPIENT) {
+    // User should have clicked an inline button — text input here is unexpected
+    await ctx.reply('❌ Please select a recipient from the buttons above.', cancelKeyboard);
+    return;
+  }
+
+  // ─── SCHEDULE: AWAITING_SCHEDULE_AMOUNT ───
+  if (session.state === ConversationState.AWAITING_SCHEDULE_AMOUNT) {
+    const amount = parseInt(text.replace(/[^0-9]/g, ''), 10);
+    if (!amount || amount < 100) {
+      await ctx.reply('❌ Please enter a valid amount (minimum ₦100).', cancelKeyboard);
+      return;
+    }
+
+    session.scheduleData!.amountNgn = amount;
+    session.state = ConversationState.AWAITING_SCHEDULE_FREQUENCY;
+    setSession(userId, session);
+
+    await ctx.reply(
+      `📅 *Schedule Transfer*\n\n` +
+      `Amount: ${formatNgn(amount)}\n\n` +
+      `How often should this run?`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('🔁 Once', 'schedule_freq:once')],
+          [Markup.button.callback('📆 Daily', 'schedule_freq:daily')],
+          [Markup.button.callback('📅 Weekly', 'schedule_freq:weekly')],
+          [Markup.button.callback('🗓️ Monthly', 'schedule_freq:monthly')],
+          [Markup.button.callback('❌ Cancel', 'cancel_schedule')],
+        ]),
+      }
+    );
+    return;
+  }
+
+  // ─── SCHEDULE: AWAITING_SCHEDULE_FREQUENCY ───
+  if (session.state === ConversationState.AWAITING_SCHEDULE_FREQUENCY) {
+    // User should have clicked a frequency button
+    await ctx.reply('❌ Please select a frequency from the buttons above.', cancelKeyboard);
+    return;
+  }
+
+  // ─── SCHEDULE: AWAITING_SCHEDULE_START ───
+  if (session.state === ConversationState.AWAITING_SCHEDULE_START) {
+    let startAt: Date;
+    const lower = text.trim().toLowerCase();
+
+    if (lower === 'now' || lower === 'today') {
+      startAt = new Date();
+    } else {
+      // Try parsing YYYY-MM-DD
+      const parsed = new Date(text.trim());
+      if (isNaN(parsed.getTime())) {
+        await ctx.reply(
+          `❌ Invalid date. Please enter a date in YYYY-MM-DD format, or type *now* to start immediately.`,
+          cancelKeyboard
+        );
+        return;
+      }
+      startAt = parsed;
+    }
+
+    const sd = session.scheduleData!;
+    sd.startAt = startAt;
+
+    // Calculate nextRunAt
+    let nextRunAt = new Date(startAt);
+    const freq = sd.frequency!;
+    if (freq === 'daily') {
+      nextRunAt.setDate(nextRunAt.getDate() + 1);
+    } else if (freq === 'weekly') {
+      nextRunAt.setDate(nextRunAt.getDate() + 7);
+    } else if (freq === 'monthly') {
+      nextRunAt.setMonth(nextRunAt.getMonth() + 1);
+    }
+
+    // Save to DB
+    await db.insert(scheduledTransfers).values({
+      userId,
+      recipientBankAccountId: sd.recipientBankAccountId!,
+      amountNgn: sd.amountNgn!.toString(),
+      frequency: freq,
+      startAt,
+      nextRunAt,
+      isActive: true,
+    });
+
+    setSession(userId, { state: ConversationState.IDLE });
+
+    await ctx.reply(
+      `✅ *Scheduled Transfer Created!*\n\n` +
+      `To: ${sd.recipientName}\n` +
+      `Bank: ${sd.bankName}\n` +
+      `Account: \`${sd.accountNumber}\`\n` +
+      `Amount: ${formatNgn(sd.amountNgn!)}\n` +
+      `Frequency: ${freq}\n` +
+      `Starts: ${startAt.toLocaleDateString('en-NG')}\n\n` +
+      `Use *📅 Schedule* to view or cancel.`,
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
     return;
   }
 });
@@ -2553,6 +2668,172 @@ bot.action('cancel_swap', async (ctx) => {
   await ctx.reply('Menu:', mainMenu);
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// 📅 SCHEDULED TRANSFERS
+// ═════════════════════════════════════════════════════════════════════════════
+
+bot.hears('📅 Schedule', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+
+  if (user.length === 0) {
+    await ctx.reply('Please run /start first.', mainMenu);
+    return;
+  }
+
+  if (isGroupChat(ctx)) {
+    await promptPrivateChat(ctx, 'schedule transfers');
+    return;
+  }
+
+  // Get saved bank accounts
+  const accounts = await db.select().from(savedBankAccounts).where(eq(savedBankAccounts.userId, userId));
+
+  if (accounts.length === 0) {
+    await ctx.reply(
+      `📅 *Scheduled Transfers*\n\n` +
+      `You don't have any saved bank accounts yet.\n\n` +
+      `Send money to a bank account first and I'll save it for scheduling.`,
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+    return;
+  }
+
+  // Show saved accounts + option to view existing schedules
+  const rows: any[] = accounts.map(acc =>
+    [Markup.button.callback(`${acc.bankName} • ${acc.accountNumber}`, `schedule_recipient:${acc.id}`)]
+  );
+  rows.push([Markup.button.callback('📋 View My Schedules', 'schedule_view')]);
+
+  await ctx.reply(
+    `📅 *Schedule Transfer*\n\n` +
+    `Select a saved recipient:`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }
+  );
+});
+
+bot.action(/schedule_recipient:(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const accountId = parseInt(ctx.match[1], 10);
+
+  const accounts = await db.select().from(savedBankAccounts)
+    .where(and(eq(savedBankAccounts.userId, userId), eq(savedBankAccounts.id, accountId)))
+    .limit(1);
+
+  if (accounts.length === 0) {
+    await ctx.editMessageText('❌ Account not found.');
+    await ctx.reply('Menu:', mainMenu);
+    return;
+  }
+
+  const acc = accounts[0];
+  setSession(userId, {
+    state: ConversationState.AWAITING_SCHEDULE_AMOUNT,
+    scheduleData: {
+      recipientBankAccountId: acc.id,
+      recipientName: acc.accountName,
+      bankName: acc.bankName,
+      accountNumber: acc.accountNumber,
+    },
+  });
+
+  await ctx.editMessageText(
+    `📅 *Schedule Transfer*\n\n` +
+    `Recipient: ${acc.accountName}\n` +
+    `Bank: ${acc.bankName}\n` +
+    `Account: \`${acc.accountNumber}\`\n\n` +
+    `How much NGN do you want to send each time?\n` +
+    `Example: 50000`,
+    { parse_mode: 'Markdown' }
+  );
+  await ctx.reply('Waiting for amount...', cancelKeyboard);
+});
+
+bot.action(/schedule_freq:(\w+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+
+  if (session.state !== ConversationState.AWAITING_SCHEDULE_FREQUENCY || !session.scheduleData) {
+    await ctx.editMessageText('❌ Session expired. Please start over.');
+    return;
+  }
+
+  const freq = ctx.match[1] as 'once' | 'daily' | 'weekly' | 'monthly';
+  session.scheduleData.frequency = freq;
+  session.state = ConversationState.AWAITING_SCHEDULE_START;
+  setSession(userId, session);
+
+  await ctx.editMessageText(
+    `📅 *Schedule Transfer*\n\n` +
+    `Frequency: *${freq}*\n\n` +
+    `When should the first transfer happen?\n` +
+    `Enter a date (YYYY-MM-DD) or type *now* to start immediately.`,
+    { parse_mode: 'Markdown' }
+  );
+  await ctx.reply('Waiting for start date...', cancelKeyboard);
+});
+
+bot.action('cancel_schedule', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  setSession(userId, { state: ConversationState.IDLE });
+  await ctx.editMessageText('❌ Schedule creation cancelled.');
+  await ctx.reply('Menu:', mainMenu);
+});
+
+bot.action('schedule_view', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+
+  const schedules = await db.select().from(scheduledTransfers)
+    .where(eq(scheduledTransfers.userId, userId))
+    .orderBy(scheduledTransfers.nextRunAt);
+
+  if (schedules.length === 0) {
+    await ctx.editMessageText('📅 You have no scheduled transfers.');
+    await ctx.reply('Menu:', mainMenu);
+    return;
+  }
+
+  let msg = `📅 *Your Scheduled Transfers*\n\n`;
+  const rows: any[] = [];
+
+  for (const s of schedules) {
+    const status = s.isActive ? '🟢 Active' : '🔴 Paused';
+    const next = s.nextRunAt ? s.nextRunAt.toLocaleDateString('en-NG') : '—';
+    msg += `${status} • ${formatNgn(Number(s.amountNgn))} • ${s.frequency}\n`;
+    msg += `   Next: ${next}  •  Runs: ${s.runCount}\n\n`;
+    if (s.isActive) {
+      rows.push([Markup.button.callback(`❌ Cancel #${s.id}`, `schedule_cancel:${s.id}`)]);
+    }
+  }
+
+  await ctx.editMessageText(msg, { parse_mode: 'Markdown' });
+  if (rows.length > 0) {
+    await ctx.reply('Tap to cancel:', Markup.inlineKeyboard(rows));
+  }
+  await ctx.reply('Menu:', mainMenu);
+});
+
+bot.action(/schedule_cancel:(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const scheduleId = parseInt(ctx.match[1], 10);
+
+  await db.update(scheduledTransfers)
+    .set({ isActive: false })
+    .where(and(eq(scheduledTransfers.id, scheduleId), eq(scheduledTransfers.userId, userId)));
+
+  await ctx.editMessageText(`✅ Scheduled transfer #${scheduleId} has been cancelled.`);
+  await ctx.reply('Menu:', mainMenu);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 🌉 CHAINRAILS BRIDGE (Cross-chain Deposit)
+// ═════════════════════════════════════════════════════════════════════════════
+
 // Handle swap amount input
 async function handleSwapAmount(ctx: ZendContext, userId: string, text: string) {
   const session = getSession(userId);
@@ -2974,6 +3255,79 @@ bot.action('settings_pin', async (ctx) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// 🌐 COMMUNITY
+// ═════════════════════════════════════════════════════════════════════════════
+
+bot.hears('🌐 Community', async (ctx) => {
+  await ctx.reply(
+    `🌐 *Zend Community*\n\n` +
+    `Join our community for support, feedback, and updates:\n\n` +
+    `👉 [Zend Community](https://t.me/zend_community)`,
+    { parse_mode: 'Markdown', link_preview_options: { is_disabled: true }, ...mainMenu }
+  );
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 🧹 CLEAR CHAT
+// ═════════════════════════════════════════════════════════════════════════════
+
+bot.command('clear', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const currentMsgId = ctx.message?.message_id;
+
+  if (!currentMsgId) {
+    await ctx.reply('❌ Could not clear chat.', mainMenu);
+    return;
+  }
+
+  const statusMsg = await ctx.reply('🧹 Clearing recent bot messages...');
+
+  let deleted = 0;
+  // Try deleting the last 15 messages before the current one
+  for (let offset = 1; offset <= 15; offset++) {
+    try {
+      const msgId = currentMsgId - offset;
+      if (msgId <= 0) break;
+      await ctx.telegram.deleteMessage(chatId, msgId);
+      deleted++;
+    } catch (e) {
+      // Message not from bot, too old, or already deleted — continue
+    }
+  }
+
+  // Delete the status message too
+  try {
+    await ctx.telegram.deleteMessage(chatId, statusMsg.message_id);
+  } catch (e) { /* ignore */ }
+
+  // Delete the /clear command itself
+  try {
+    await ctx.telegram.deleteMessage(chatId, currentMsgId);
+  } catch (e) { /* ignore */ }
+
+  const confirmMsg = await ctx.reply(`✅ Cleared ${deleted} messages.`, mainMenu);
+  // Auto-delete confirmation after 3 seconds
+  setTimeout(async () => {
+    try {
+      await ctx.telegram.deleteMessage(chatId, confirmMsg.message_id);
+    } catch (e) { /* ignore */ }
+  }, 3000);
+});
+
+// ─── Auto-delete helper for sensitive messages ───
+async function autoDeleteReply(ctx: ZendContext, text: string, extra?: any, delayMs = 120000) {
+  const msg = await ctx.reply(text, extra);
+  setTimeout(async () => {
+    try {
+      await ctx.telegram.deleteMessage(msg.chat.id, msg.message_id);
+    } catch (e) {
+      // Message may already be deleted or too old
+    }
+  }, delayMs);
+  return msg;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // ERROR HANDLER
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -3130,6 +3484,92 @@ function startWebhookServer(botInstance: Telegraf<any>) {
 // LAUNCH
 // ═════════════════════════════════════════════════════════════════════════════
 
+// ─── Scheduled Transfer Executor ───
+async function runScheduledTransfers() {
+  try {
+    const now = new Date();
+    const due = await db.select().from(scheduledTransfers)
+      .where(and(eq(scheduledTransfers.isActive, true), sql`${scheduledTransfers.nextRunAt} <= ${now}`));
+
+    for (const s of due) {
+      try {
+        // Get recipient details
+        const accounts = await db.select().from(savedBankAccounts)
+          .where(eq(savedBankAccounts.id, s.recipientBankAccountId))
+          .limit(1);
+
+        if (accounts.length === 0) {
+          console.log(`[Schedule] Skipping #${s.id}: recipient account not found`);
+          continue;
+        }
+
+        const acc = accounts[0];
+
+        // Create a transaction record
+        const txId = generateTxId();
+        await db.insert(transactions).values({
+          id: txId,
+          userId: s.userId,
+          type: 'scheduled',
+          status: 'pending',
+          ngnAmount: s.amountNgn.toString(),
+          recipientBankCode: acc.bankCode,
+          recipientBankName: acc.bankName,
+          recipientAccountNumber: acc.accountNumber,
+          recipientAccountName: acc.accountName,
+        });
+
+        // Notify user
+        try {
+          await bot.telegram.sendMessage(
+            s.userId,
+            `📅 *Scheduled Transfer Due*\n\n` +
+            `Amount: ${formatNgn(Number(s.amountNgn))}\n` +
+            `To: ${acc.accountName}\n` +
+            `Bank: ${acc.bankName} • \`${acc.accountNumber}\`\n\n` +
+            `Reference: \`${txId}\`\n\n` +
+            `Please open the bot and confirm to complete this transfer.`,
+            { parse_mode: 'Markdown', ...mainMenu }
+          );
+        } catch (notifyErr) {
+          console.log('[Schedule] Could not notify user:', notifyErr);
+        }
+
+        // Update schedule
+        const newRunCount = s.runCount + 1;
+        let updates: any = { runCount: newRunCount };
+
+        if (s.frequency === 'once') {
+          updates.isActive = false;
+        } else {
+          let next = new Date();
+          if (s.frequency === 'daily') next.setDate(next.getDate() + 1);
+          else if (s.frequency === 'weekly') next.setDate(next.getDate() + 7);
+          else if (s.frequency === 'monthly') next.setMonth(next.getMonth() + 1);
+          updates.nextRunAt = next;
+        }
+
+        if (s.maxRuns && newRunCount >= s.maxRuns) {
+          updates.isActive = false;
+        }
+        if (s.endAt && now >= s.endAt) {
+          updates.isActive = false;
+        }
+
+        await db.update(scheduledTransfers)
+          .set(updates)
+          .where(eq(scheduledTransfers.id, s.id));
+
+        console.log(`[Schedule] Processed #${s.id} for user ${s.userId}`);
+      } catch (err) {
+        console.error(`[Schedule] Error processing #${s.id}:`, err);
+      }
+    }
+  } catch (err) {
+    console.error('[Schedule] Executor error:', err);
+  }
+}
+
 async function main() {
   const dbOk = await checkConnection();
   if (!dbOk) {
@@ -3156,6 +3596,10 @@ async function main() {
   // Launch bot
   bot.launch({ dropPendingUpdates: true });
   console.log('🤖 Zend bot is running...');
+
+  // Start scheduled transfer executor (every 60 seconds)
+  setInterval(runScheduledTransfers, 60000);
+  console.log('📅 Scheduled transfer executor started (every 60s)');
 
   // Handle 409 conflict from polling loop (Railway deploy overlap)
   let retryTimeout: NodeJS.Timeout | null = null;
