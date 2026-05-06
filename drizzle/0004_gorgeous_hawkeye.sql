@@ -1,0 +1,1 @@
+ALTER TABLE "transactions" ADD COLUMN "chainrails_intent_address" varchar(100);

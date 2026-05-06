@@ -131,6 +131,8 @@ class ChainRailsClient {
         'Authorization': `Bearer ${this.apiKey}`,
       },
       body: body ? JSON.stringify(body) : undefined,
+      // @ts-ignore — AbortSignal.timeout available in Node 18+
+      signal: AbortSignal.timeout(30000),
     });
 
     if (!response.ok) {
@@ -138,7 +140,7 @@ class ChainRailsClient {
       throw new Error(`ChainRails ${response.status}: ${errorText}`);
     }
 
-    return response.json();
+    return response.json() as Promise<ChainRailsQuote>;
   }
 
   /** Get best quote for a cross-chain transfer */
@@ -167,7 +169,8 @@ class ChainRailsClient {
       const errorText = await response.text();
       throw new Error(`ChainRails quote ${response.status}: ${errorText}`);
     }
-    return response.json();
+    const data = await response.json();
+    return data as ChainRailsQuote;
   }
 
   /** Create a cross-chain payment intent (returns deposit address) */
@@ -222,7 +225,7 @@ class ChainRailsClient {
 // Singleton instance
 let _client: ChainRailsClient | null = null;
 
-export async function getChainRailsClient(): Promise<ChainRailsClient | null> {
+export function getChainRailsClient(): ChainRailsClient | null {
   if (_client) return _client;
   if (!CHAINRAILS_API_KEY) {
     console.warn('⚠️  ChainRails not configured — set CHAINRAILS_API_KEY');

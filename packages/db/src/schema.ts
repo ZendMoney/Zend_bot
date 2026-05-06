@@ -81,6 +81,9 @@ export const transactions = pgTable('transactions', {
   pajReference: varchar('paj_reference', { length: 50 }),
   pajPoolAddress: varchar('paj_pool_address', { length: 44 }),
   
+  // ChainRails
+  chainrailsIntentAddress: varchar('chainrails_intent_address', { length: 100 }),
+  
   // Metadata
   metadata: jsonb('metadata'),
   
