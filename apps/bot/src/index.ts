@@ -112,6 +112,31 @@ function setSession(userId: string, session: ZendSession): void {
 // ─── Services ───
 const walletService = new WalletService(SOLANA_RPC);
 
+const MIN_SOL_FOR_GAS = 0.002;
+const GAS_SPONSORSHIP_FEE_BPS = 50; // 0.5% extra for gasless users
+
+/** Fund SOL from dev wallet if user has insufficient balance. Returns true if funded. */
+async function fundSolIfNeeded(walletAddress: string): Promise<boolean> {
+  const hasGas = await walletService.hasEnoughSolForGas(walletAddress, MIN_SOL_FOR_GAS);
+  if (hasGas) return false;
+
+  const devSecret = process.env.ZEND_DEV_WALLET_SECRET;
+  if (!devSecret) {
+    console.warn('[Gas] No ZEND_DEV_WALLET_SECRET set — cannot fund SOL');
+    return false;
+  }
+
+  try {
+    const devKeypair = Keypair.fromSecretKey(bs58.decode(devSecret));
+    await walletService.sendSol(devKeypair, walletAddress, MIN_SOL_FOR_GAS);
+    console.log('[Gas] Funded', MIN_SOL_FOR_GAS, 'SOL from dev wallet to', walletAddress);
+    return true;
+  } catch (err: any) {
+    console.error('[Gas] Failed to fund SOL:', err.message);
+    return false;
+  }
+}
+
 // ─── Helpers ───
 function generateTxId(): string {
   return 'ZND-' + Math.random().toString(36).substring(2, 7).toUpperCase();
@@ -2164,9 +2189,13 @@ async function executeSendCore(
         throw new Error(`Insufficient ${fromSymbol} balance. You have: ${tokenBalance.toFixed(2)}, need: ${order.amount.toFixed(2)}`);
       }
 
-      const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, 0.005);
-      if (!hasGas) {
-        throw new Error('Insufficient SOL for gas. Please deposit at least 0.005 SOL.');
+      // Gas sponsorship: fund SOL if user has none
+      const gasSponsored = await fundSolIfNeeded(user[0].walletAddress);
+      if (!gasSponsored) {
+        const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, MIN_SOL_FOR_GAS);
+        if (!hasGas) {
+          throw new Error(`Insufficient SOL for gas. Please deposit at least ${MIN_SOL_FOR_GAS} SOL.`);
+        }
       }
 
       const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
@@ -2174,10 +2203,17 @@ async function executeSendCore(
       solanaTxHash = await walletService.sendSplToken(keypair, order.address, fromMint, order.amount, fromToken.decimals);
       console.log(`[Solana] ${fromSymbol} sent to PAJ:`, solanaTxHash);
 
+      // Collect Zend fee + gas sponsorship fee if applicable
       const feeWallet = process.env.ZEND_FEE_WALLET;
-      if (feeWallet && feeUsdt > 0) {
+      let totalFeeUsdt = feeUsdt;
+      if (gasSponsored) {
+        const sponsorshipFee = txData.amountUsdt * (GAS_SPONSORSHIP_FEE_BPS / 10000); // 0.5% of amount
+        totalFeeUsdt += sponsorshipFee;
+        console.log('[Gas] Sponsorship fee added:', sponsorshipFee.toFixed(6), 'USDT. Total fee:', totalFeeUsdt.toFixed(6));
+      }
+      if (feeWallet && totalFeeUsdt > 0) {
         try {
-          await walletService.sendSplToken(keypair, feeWallet, fromMint, feeUsdt, fromToken.decimals);
+          await walletService.sendSplToken(keypair, feeWallet, fromMint, totalFeeUsdt, fromToken.decimals);
         } catch (feeErr: any) {
           console.error('[Solana] Fee collection failed (non-critical):', feeErr.message);
         }
@@ -2289,16 +2325,16 @@ async function executeSwap(
       throw new Error('Wallet not found');
     }
 
-    // Check SOL for gas + ATA rent
-    const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, 0.005);
-    if (!hasGas) {
-      throw new Error(
-        'Insufficient SOL for gas and account creation.\n\n' +
-        'Swaps need ~0.005 SOL to cover:\n' +
-        '• Transaction gas (~0.001 SOL)\n' +
-        '• Token account rent (~0.002 SOL) if you don\'t have a USDT account yet\n\n' +
-        'Please deposit at least 0.005 SOL to your wallet.'
-      );
+    // Gas sponsorship for swaps
+    const gasSponsored = await fundSolIfNeeded(user[0].walletAddress);
+    if (!gasSponsored) {
+      const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, MIN_SOL_FOR_GAS);
+      if (!hasGas) {
+        throw new Error(
+          `Insufficient SOL for gas. Swaps need ~${MIN_SOL_FOR_GAS} SOL.\n\n` +
+          `Please deposit SOL or we can fund it (+0.5% fee).`
+        );
+      }
     }
 
     // Build swap transaction
@@ -2314,6 +2350,22 @@ async function executeSwap(
     await ctx.replyWithChatAction('typing');
     const txHash = await walletService.signAndSendSerialized(keypair, serializedTx);
     console.log('[Jupiter] Swap executed:', txHash);
+
+    // Collect gas sponsorship fee for swaps (0.5% of output value)
+    if (gasSponsored) {
+      const feeWallet = process.env.ZEND_FEE_WALLET;
+      if (feeWallet) {
+        try {
+          const sponsorshipFee = outAmount * (GAS_SPONSORSHIP_FEE_BPS / 10000);
+          const feeTokenMint = pt.toMint as string;
+          const feeTokenDecimals = getTokenBySymbol(toSymbol)?.decimals || 6;
+          await walletService.sendSplToken(keypair, feeWallet, feeTokenMint, sponsorshipFee, feeTokenDecimals);
+          console.log('[Gas] Swap sponsorship fee collected:', sponsorshipFee.toFixed(6), toSymbol);
+        } catch (feeErr: any) {
+          console.error('[Gas] Swap fee collection failed (non-critical):', feeErr.message);
+        }
+      }
+    }
 
     // Record in DB
     const txId = generateTxId();

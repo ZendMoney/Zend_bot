@@ -6,6 +6,7 @@ import {
   VersionedTransaction,
   TransactionMessage,
   ComputeBudgetProgram,
+  SystemProgram,
   LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
 import {
@@ -250,6 +251,47 @@ export class WalletService {
       amount,
       SOLANA_TOKENS.USDC.decimals
     );
+  }
+
+  // Send raw SOL (used for gas sponsorship from dev wallet)
+  async sendSol(
+    senderWallet: Keypair,
+    recipientAddress: string,
+    amountSol: number
+  ): Promise<string> {
+    const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+    const recipientPubkey = new PublicKey(recipientAddress);
+    const lamports = Math.round(amountSol * LAMPORTS_PER_SOL);
+
+    const instructions: TransactionInstruction[] = [];
+    instructions.push(
+      SystemProgram.transfer({
+        fromPubkey: senderWallet.publicKey,
+        toPubkey: recipientPubkey,
+        lamports,
+      })
+    );
+
+    const messageV0 = new TransactionMessage({
+      payerKey: senderWallet.publicKey,
+      recentBlockhash: blockhash,
+      instructions,
+    }).compileToV0Message();
+
+    const transaction = new VersionedTransaction(messageV0);
+    transaction.sign([senderWallet]);
+
+    const signature = await this.connection.sendTransaction(transaction, {
+      maxRetries: 3,
+      skipPreflight: false,
+    });
+
+    await this.connection.confirmTransaction(
+      { signature, blockhash, lastValidBlockHeight },
+      'confirmed'
+    );
+
+    return signature;
   }
 
   // Check if user has enough SOL for gas

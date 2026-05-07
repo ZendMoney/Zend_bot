@@ -515,8 +515,9 @@ EXACT features Zend has (do NOT mention anything else):
 3. Send to Nigerian bank — any bank (GTB, UBA, Access, OPay, Kuda, etc.)
 4. Receive crypto — Solana wallet address + virtual account
 5. Swap tokens — SOL ↔ USDT ↔ USDC
-6. Transaction history
-7. Voice commands — send a voice note
+6. Cross-chain deposit — send crypto from Ethereum, Base, BSC, Arbitrum → receive USDT on Solana
+7. Transaction history
+8. Voice commands — send a voice note
 
 EXACT features Zend does NOT have (never mention these):
 - NO airtime recharge
@@ -525,9 +526,8 @@ EXACT features Zend does NOT have (never mention these):
 - NO loans or borrowing
 - NO betting or gambling
 - NO stocks or investment trading
-- NO cross-chain to Ethereum/Bitcoin
 
-If asked about fees: 1% Zend fee + Solana network gas (~0.001 SOL).
+If asked about fees: 1% Zend fee + Solana network gas (~0.001 SOL). If user has no SOL, we fund it and add 0.5% to the Zend fee (so 1.5% total).
 If asked about security: wallets are encrypted, PAJ handles KYC compliance.
 Keep replies under 150 words. End with a nudge to try something real.`;
 
