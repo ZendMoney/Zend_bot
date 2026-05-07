@@ -3156,7 +3156,7 @@ bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
         tokenIn,
         tokenOut: TOKEN_ADDRESSES.SOLANA_MAINNET.USDT,
         sourceChain,
-        destinationChain: 'SOLANA_MAINNET',
+        destinationChain: 'SOLANA',
         amount: '1000000',
         amountSymbol: token,
         recipient: user[0].walletAddress,
@@ -3173,7 +3173,7 @@ bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
       amountSymbol: token,
       tokenIn,
       sourceChain,
-      destinationChain: 'SOLANA_MAINNET',
+      destinationChain: 'SOLANA',
       recipient: user[0].walletAddress,
       metadata: {
         userId,
@@ -3925,6 +3925,19 @@ async function main() {
     }
   } else {
     console.warn('⚠️  PAJ not configured');
+  }
+
+  // ChainRails startup check
+  const chainRails = getChainRailsClient();
+  if (chainRails) {
+    try {
+      const chains = await chainRails.getSupportedChains('mainnet');
+      console.log('🔗 ChainRails supported chains:', chains.join(', '));
+    } catch (err: any) {
+      console.warn('⚠️  ChainRails chains check failed:', err.message);
+    }
+  } else {
+    console.warn('⚠️  ChainRails not configured');
   }
 
   // Start webhook server (runs alongside bot)
