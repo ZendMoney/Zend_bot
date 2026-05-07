@@ -9,7 +9,7 @@ import { NIGERIAN_BANKS } from '@zend/shared';
 // ─── Types ───
 
 export interface ParsedCommand {
-  intent: 'send' | 'add_naira' | 'cash_out' | 'balance' | 'unknown';
+  intent: 'send' | 'add_naira' | 'cash_out' | 'balance' | 'bridge' | 'unknown';
   amount?: number;
   currency?: 'NGN' | 'USDT' | 'SOL';
   fromToken?: 'USDT' | 'USDC' | 'SOL';
@@ -229,7 +229,10 @@ function detectIntent(text: string): ParsedCommand['intent'] {
   if (/\b(balance|how much|what.*have)\b/.test(lower)) {
     return 'balance';
   }
-  
+  if (/\b(bridge|cross.chain|deposit from|receive from)\b/.test(lower)) {
+    return 'bridge';
+  }
+
   return 'unknown';
 }
 

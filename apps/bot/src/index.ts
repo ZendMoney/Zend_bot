@@ -1414,6 +1414,11 @@ bot.on(message('text'), async (ctx, next) => {
         return;
       }
 
+      case 'bridge': {
+        await showBridgeMenu(ctx, userId);
+        return;
+      }
+
       default: {
         // Try conversational AI for unknown intents
         const aiReply = await chatWithKimi(text);
