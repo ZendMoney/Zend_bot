@@ -3061,14 +3061,14 @@ async function showBridgeMenu(ctx: ZendContext, userId: string) {
 
   await ctx.reply(
     `🌉 *Cross-Chain Deposit*\n\n` +
-    `Send crypto from any chain and receive USDT on Solana.\n\n` +
+    `Send USDC or USDT from any chain and receive USDT on Solana.\n\n` +
     `Select source chain:`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
-        [Markup.button.callback('🔗 Ethereum (USDC)', 'bridge:ethereum:USDC'), Markup.button.callback('🔵 Base (USDC)', 'bridge:base:USDC')],
-        [Markup.button.callback('🟡 BSC (USDT)', 'bridge:bsc:USDT'), Markup.button.callback('🔷 Arbitrum (USDC)', 'bridge:arbitrum:USDC')],
-        [Markup.button.callback('🔴 Optimism (USDC)', 'bridge:optimism:USDC'), Markup.button.callback('🟣 Polygon (USDC)', 'bridge:polygon:USDC')],
+        [Markup.button.callback('🔗 Ethereum', 'bridge_chain:ethereum'), Markup.button.callback('🔵 Base', 'bridge_chain:base')],
+        [Markup.button.callback('🟡 BSC', 'bridge_chain:bsc'), Markup.button.callback('🔷 Arbitrum', 'bridge_chain:arbitrum')],
+        [Markup.button.callback('🔴 Optimism', 'bridge_chain:optimism'), Markup.button.callback('🟣 Polygon', 'bridge_chain:polygon')],
         [Markup.button.callback('❌ Cancel', 'cancel_bridge')],
       ]),
     }
@@ -3077,6 +3077,44 @@ async function showBridgeMenu(ctx: ZendContext, userId: string) {
 
 bot.command('bridge', async (ctx) => {
   await showBridgeMenu(ctx, ctx.from.id.toString());
+});
+
+// Step 2: After chain selected, show token options (USDC / USDT)
+bot.action(/bridge_chain:([a-z]+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const chainKey = ctx.match[1];
+  const sourceChain = BRIDGE_CHAIN_MAP[chainKey];
+  if (!sourceChain) {
+    await ctx.editMessageText('❌ Unsupported chain.');
+    return;
+  }
+  const chainDisplay = CHAIN_NAMES[sourceChain] || sourceChain;
+
+  // Check which tokens are available on this chain
+  const hasUsdc = !!TOKEN_ADDRESSES[sourceChain]?.USDC;
+  const hasUsdt = !!TOKEN_ADDRESSES[sourceChain]?.USDT;
+  const buttons: any[] = [];
+  if (hasUsdc) buttons.push(Markup.button.callback('USDC', `bridge:${chainKey}:USDC`));
+  if (hasUsdt) buttons.push(Markup.button.callback('USDT', `bridge:${chainKey}:USDT`));
+
+  await ctx.editMessageText(
+    `🌉 *Cross-Chain Deposit*\n\n` +
+    `Chain: *${chainDisplay}*\n\n` +
+    `Select token to send:`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        buttons,
+        [Markup.button.callback('← Back', 'bridge_back')],
+        [Markup.button.callback('❌ Cancel', 'cancel_bridge')],
+      ]),
+    }
+  );
+});
+
+bot.action('bridge_back', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showBridgeMenu(ctx, ctx.from!.id.toString());
 });
 
 bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
