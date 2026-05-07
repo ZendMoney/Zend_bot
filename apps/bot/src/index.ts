@@ -3061,15 +3061,14 @@ async function showBridgeMenu(ctx: ZendContext, userId: string) {
 
   await ctx.reply(
     `🌉 *Cross-Chain Deposit*\n\n` +
-    `Send crypto from any EVM chain and receive USDT on Solana.\n\n` +
+    `Send crypto from any chain and receive USDT on Solana.\n\n` +
     `Select source chain:`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
-        [Markup.button.callback('Ethereum (USDC)', 'bridge:ethereum:USDC')],
-        [Markup.button.callback('Base (USDC)', 'bridge:base:USDC')],
-        [Markup.button.callback('BSC (USDT)', 'bridge:bsc:USDT')],
-        [Markup.button.callback('Arbitrum (USDC)', 'bridge:arbitrum:USDC')],
+        [Markup.button.callback('🔗 Ethereum (USDC)', 'bridge:ethereum:USDC'), Markup.button.callback('🔵 Base (USDC)', 'bridge:base:USDC')],
+        [Markup.button.callback('🟡 BSC (USDT)', 'bridge:bsc:USDT'), Markup.button.callback('🔷 Arbitrum (USDC)', 'bridge:arbitrum:USDC')],
+        [Markup.button.callback('🔴 Optimism (USDC)', 'bridge:optimism:USDC'), Markup.button.callback('🟣 Polygon (USDC)', 'bridge:polygon:USDC')],
         [Markup.button.callback('❌ Cancel', 'cancel_bridge')],
       ]),
     }
@@ -3161,7 +3160,13 @@ bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
     });
 
     const chainDisplay = CHAIN_NAMES[sourceChain] || sourceChain;
-    const feeLine = quote ? `• Estimated fee: ${quote.totalFeeFormatted} ${token}\n` : '';
+    // Use intent's actual fee if available, fallback to quote estimate
+    const actualFee = intent.fees_in_asset_token || intent.app_fee_in_asset_token;
+    const feeLine = actualFee
+      ? `• Fee: ${actualFee} ${token} (deducted from deposit)\n`
+      : quote
+        ? `• Est. fee: ${quote.totalFeeFormatted} ${token}\n`
+        : '';
 
     await ctx.reply(
       `🌉 *Deposit ${token} from ${chainDisplay}*\n\n` +
@@ -3170,8 +3175,9 @@ bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
       `⚠️ *Important:*\n` +
       `• Only send ${token} on ${chainDisplay}\n` +
       `• You'll receive USDT on Solana\n` +
+      `• Minimum: 1 ${token}\n` +
       feeLine +
-      `• Expires: ${new Date(intent.expires_at).toLocaleString()}\n\n` +
+      `• Expires: ${new Date(intent.expires_at).toLocaleString('en-NG')}\n\n` +
       `Reference: \`${txId}\`\n` +
       `Intent: \`${intent.intent_address}\``, 
       { parse_mode: 'Markdown', ...mainMenu }
