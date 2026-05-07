@@ -160,13 +160,14 @@ export class WalletService {
   }
 
   // Send SPL tokens (USDT, USDC) to a recipient
-  // NOTE: User must have SOL for gas. Zend can optionally fund their wallet on first deposit.
+  // Optionally bundle additional instructions (e.g. fee transfer) in the same tx
   async sendSplToken(
     userWallet: Keypair,
     recipientAddress: string,
     mintAddress: string,
     amount: number,
-    decimals: number
+    decimals: number,
+    additionalInstructions?: TransactionInstruction[]
   ): Promise<string> {
     const mintPubkey = new PublicKey(mintAddress);
     const recipientPubkey = new PublicKey(recipientAddress);
@@ -218,6 +219,11 @@ export class WalletService {
           rawAmount
         )
       );
+    }
+
+    // Bundle additional instructions (e.g. fee transfer)
+    if (additionalInstructions) {
+      instructions.push(...additionalInstructions);
     }
 
     return this.signAndSend(userWallet, instructions);

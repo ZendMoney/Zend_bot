@@ -7,7 +7,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 config({ path: resolve(__dirname, '../../../.env') });
 
 import { Telegraf, Markup, Context } from 'telegraf';
-import { Keypair } from '@solana/web3.js';
+import { Keypair, PublicKey } from '@solana/web3.js';
+import {
+  getAssociatedTokenAddress,
+  createAssociatedTokenAccountIdempotentInstruction,
+  createTransferInstruction,
+} from '@solana/spl-token';
 import bs58 from 'bs58';
 import { message } from 'telegraf/filters';
 import { db, checkConnection } from '@zend/db';
@@ -112,7 +117,7 @@ function setSession(userId: string, session: ZendSession): void {
 // ─── Services ───
 const walletService = new WalletService(SOLANA_RPC);
 
-const MIN_SOL_FOR_GAS = 0.002;
+const MIN_SOL_FOR_GAS = 0.0005; // ~0.00008 base fee + buffer for bundled tx
 const GAS_SPONSORSHIP_FEE_BPS = 50; // 0.5% extra for gasless users
 
 /** Fund SOL from dev wallet if user has insufficient balance. Returns true if funded. */
@@ -2198,12 +2203,7 @@ async function executeSendCore(
         }
       }
 
-      const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
-      const keypair = Keypair.fromSecretKey(secretKey);
-      solanaTxHash = await walletService.sendSplToken(keypair, order.address, fromMint, order.amount, fromToken.decimals);
-      console.log(`[Solana] ${fromSymbol} sent to PAJ:`, solanaTxHash);
-
-      // Collect Zend fee + gas sponsorship fee if applicable
+      // Calculate total fee (Zend fee + gas sponsorship if applicable)
       const feeWallet = process.env.ZEND_FEE_WALLET;
       let totalFeeUsdt = feeUsdt;
       if (gasSponsored) {
@@ -2211,13 +2211,39 @@ async function executeSendCore(
         totalFeeUsdt += sponsorshipFee;
         console.log('[Gas] Sponsorship fee added:', sponsorshipFee.toFixed(6), 'USDT. Total fee:', totalFeeUsdt.toFixed(6));
       }
+
+      // Build fee transfer instructions to bundle with main send
+      const feeInstructions: any[] = [];
       if (feeWallet && totalFeeUsdt > 0) {
-        try {
-          await walletService.sendSplToken(keypair, feeWallet, fromMint, totalFeeUsdt, fromToken.decimals);
-        } catch (feeErr: any) {
-          console.error('[Solana] Fee collection failed (non-critical):', feeErr.message);
-        }
+        const mintPubkey = new PublicKey(fromMint);
+        const feeWalletPubkey = new PublicKey(feeWallet);
+        const senderTokenAccount = await getAssociatedTokenAddress(mintPubkey, new PublicKey(user[0].walletAddress));
+        const feeTokenAccount = await getAssociatedTokenAddress(mintPubkey, feeWalletPubkey);
+        const rawFeeAmount = BigInt(Math.round(totalFeeUsdt * Math.pow(10, fromToken.decimals)));
+
+        feeInstructions.push(
+          createAssociatedTokenAccountIdempotentInstruction(
+            new PublicKey(user[0].walletAddress),
+            feeTokenAccount,
+            feeWalletPubkey,
+            mintPubkey
+          ),
+          createTransferInstruction(
+            senderTokenAccount,
+            feeTokenAccount,
+            new PublicKey(user[0].walletAddress),
+            rawFeeAmount
+          )
+        );
       }
+
+      const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
+      const keypair = Keypair.fromSecretKey(secretKey);
+      solanaTxHash = await walletService.sendSplToken(
+        keypair, order.address, fromMint, order.amount, fromToken.decimals,
+        feeInstructions.length > 0 ? feeInstructions : undefined
+      );
+      console.log(`[Solana] ${fromSymbol} sent to PAJ (+ fee bundled):`, solanaTxHash);
 
       await db.update(transactions)
         .set({ solanaTxHash, pajReference: offRampRef })
