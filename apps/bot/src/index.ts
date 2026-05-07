@@ -3130,7 +3130,7 @@ bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
 
     // Create intent — user will send to intent_address
     const intent = await chainRails.createIntent({
-      amount: '0', // 0 = open amount, user can send any amount
+      amount: '1', // minimum valid amount; intent address accepts any deposit size
       amountSymbol: token,
       tokenIn,
       sourceChain,
