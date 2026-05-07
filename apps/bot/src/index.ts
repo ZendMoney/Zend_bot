@@ -3129,8 +3129,10 @@ bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
     }
 
     // Create intent — user will send to intent_address
+    const intentAmount = '1000000'; // 1 unit in token base decimals (consistent with quote)
+    console.log('[Bridge] Creating intent:', { sourceChain, token, amount: intentAmount, recipient: user[0].walletAddress });
     const intent = await chainRails.createIntent({
-      amount: '1', // minimum valid amount; intent address accepts any deposit size
+      amount: intentAmount,
       amountSymbol: token,
       tokenIn,
       sourceChain,

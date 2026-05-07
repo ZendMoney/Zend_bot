@@ -124,6 +124,9 @@ class ChainRailsClient {
 
   private async request(method: string, path: string, body?: any): Promise<any> {
     const url = `${this.baseUrl}${path}`;
+    if (body) {
+      console.log('[ChainRails] Request body:', JSON.stringify(body));
+    }
     const response = await fetch(url, {
       method,
       headers: {
