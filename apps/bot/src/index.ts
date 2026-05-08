@@ -553,7 +553,7 @@ bot.command('start', async (ctx) => {
   const existing = await db.select().from(users).where(eq(users.id, userId)).limit(1);
 
   if (existing.length > 0) {
-    await ctx.reply(`👋 Welcome back, ${firstName}!\n\nYour Zend wallet is ready.`, mainMenu);
+    await ctx.reply(`👋 Welcome back, ${firstName}!\n\nYour Zend account is ready.`, mainMenu);
     return;
   }
 
@@ -574,20 +574,18 @@ bot.command('start', async (ctx) => {
 
   await ctx.reply(
     `🟣 *Welcome to Zend*\n\n` +
-    `Your Solana wallet + Naira bank account — inside Telegram.\n\n` +
-    `✅ Wallet created automatically\n` +
-    `✅ No seed phrase to remember\n` +
+    `Your Dollar savings + Naira bank account — inside Telegram.\n\n` +
+    `✅ Account created automatically\n` +
+    `✅ No password to remember\n` +
     `✅ Send naira to any Nigerian bank\n` +
     `✅ Receive naira via bank transfer`,
     { parse_mode: 'Markdown' }
   );
 
   await ctx.reply(
-    `✅ *Wallet Created!*\n\n` +
-    `Your Solana address:\n` +
+    `✅ *Account Created!*\n\n` +
+    `Your Zend address:\n` +
     `\`${wallet.publicKey}\`\n\n` +
-    `⚠️ *Important:* You need SOL for gas fees.\n` +
-    `Send a small amount of SOL to this address to start transacting.\n\n` +
     `💡 Tap *💵 Add Naira* to get your virtual bank account.`,
     { parse_mode: 'Markdown', ...mainMenu }
   );
@@ -608,17 +606,16 @@ bot.command('wallet', async (ctx) => {
 
   const u = user[0];
   const msg =
-    `👛 *Your Wallet*\n\n` +
-    `*Solana Address:*\n` +
+    `👛 *Your Account*\n\n` +
+    `*Your Address:*\n` +
     `\`\`\`\n${u.walletAddress}\n\`\`\`\n\n` +
     `Tap the code block above to copy your address.\n\n` +
-    `*Network:* Solana Mainnet\n` +
-    `*Tokens:* SOL, USDT, USDC\n\n` +
-    `⚠️ To export your private key, go to *⚙️ Settings*.`;
+    `*Currencies:* SOL, USDT, USDC\n\n` +
+    `⚠️ To view your secret code, go to *⚙️ Settings*.`;
 
   if (isGroupChat(ctx)) {
     const name = ctx.from?.first_name || 'there';
-    await ctx.reply(`📩 ${name}, check your DM for your wallet address.`);
+    await ctx.reply(`📩 ${name}, check your DM for your address.`);
     await ctx.telegram.sendMessage(ctx.from!.id, msg, { parse_mode: 'Markdown' });
     return;
   }
@@ -638,13 +635,11 @@ async function doExportKey(ctx: ZendContext, userId: string) {
     const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
 
     const msg = await ctx.reply(
-      `🔑 *Private Key Export*\n\n` +
+      `🔑 *Secret Recovery Code*\n\n` +
       `⚠️ *SECURITY WARNING*\n` +
       `Never share this with anyone. Zend will NEVER ask for it.\n\n` +
-      `*Private Key (Base58):*\n` +
+      `*Your Secret Code:*\n` +
       `\`${bs58.encode(secretKey)}\`\n\n` +
-      `*Private Key (Hex):*\n` +
-      `\`${Buffer.from(secretKey).toString('hex')}\`\n\n` +
       `Copy this and store it in a password manager or write it down.\n` +
       `This message will self-destruct in 1 minute.`,
       { parse_mode: 'Markdown' }
@@ -660,7 +655,7 @@ async function doExportKey(ctx: ZendContext, userId: string) {
     }, 60000);
   } catch (err) {
     console.error('Export key error:', err);
-    await ctx.reply('❌ Could not export private key. Please contact support.', mainMenu);
+    await ctx.reply('❌ Could not export secret code. Please contact support.', mainMenu);
   }
 }
 
@@ -669,7 +664,7 @@ bot.action('export_key', async (ctx) => {
   const userId = ctx.from!.id.toString();
 
   if (isGroupChat(ctx)) {
-    await promptPrivateChat(ctx, 'export your private key');
+    await promptPrivateChat(ctx, 'view your secret code');
     return;
   }
 
@@ -687,7 +682,7 @@ bot.action('export_key', async (ctx) => {
     setSession(userId, { state: ConversationState.AWAITING_PIN_VERIFY, pinVerifyAction: 'export' });
     await ctx.editMessageText(
       `🔐 *Security Check*\n\n` +
-      `Enter your 4-digit PIN to export your private key:`,
+      `Enter your 4-digit PIN to view your secret code:`,
       { parse_mode: 'Markdown' }
     );
     await ctx.reply('Waiting for PIN...', cancelKeyboard);
@@ -697,7 +692,7 @@ bot.action('export_key', async (ctx) => {
   // No PIN set — proceed directly (but warn)
   await ctx.editMessageText(
     `⚠️ *No PIN Set*\n\n` +
-    `For security, we recommend setting a PIN in Settings before exporting your private key.\n\n` +
+    `For security, we recommend setting a PIN in Settings before viewing your secret code.\n\n` +
     `Proceeding anyway...`,
     { parse_mode: 'Markdown' }
   );
@@ -737,7 +732,7 @@ async function buildBalanceMessage(userId: string): Promise<string | null> {
 
     msg += `\n━━━━━━━━━━━━━━━━━━━━\n`;
     msg += `💵 Total: ≈${formatNgn(totalNgn)}\n`;
-    msg += `📈 SOL: $${solPrice.toFixed(2)}  ·  Rate: ${formatNgn(offRampRate)}/USDT`;
+    msg += `📈 Rate: ${formatNgn(offRampRate)} per Dollar`;
     return msg;
   } catch (err) {
     console.error('Balance error:', err);
@@ -801,7 +796,7 @@ bot.hears('💵 Add Naira', async (ctx) => {
 
   await ctx.reply(
     `💵 *Add Naira*\n\n` +
-    `How much NGN do you want to add to your wallet?\n\n` +
+    `How much NGN do you want to add?\n\n` +
     `Minimum: ${formatNgn(PAJ_MIN_DEPOSIT_NGN)}\n\n` +
     `Enter the amount (numbers only):`,
     { parse_mode: 'Markdown', ...cancelKeyboard }
@@ -847,7 +842,7 @@ bot.on(message('text'), async (ctx, next) => {
 
     const pajClient = await getPAJClient();
     if (!pajClient) {
-      await ctx.reply('❌ PAJ service unavailable.', mainMenu);
+      await ctx.reply('❌ Service temporarily unavailable. Please try again later.', mainMenu);
       setSession(userId, { state: ConversationState.IDLE });
       return;
     }
@@ -887,8 +882,8 @@ bot.on(message('text'), async (ctx, next) => {
       `Amount: ${formatNgn(amount)}\n` +
       `Rate: ₦${rate.toLocaleString()}/USD\n` +
       `Fee: ${formatNgn(feeNgn)}\n` +
-      `You receive: ~${usdtAmount.toFixed(2)} USDT\n\n` +
-      `🔐 *PAJ Authentication Required*\n\n` +
+      `You receive: ~${usdtAmount.toFixed(2)} Dollars\n\n` +
+      `🔐 *Identity Verification*\n\n` +
       `Enter your email or phone number (with country code):\n` +
       `Example: user@email.com or +2348012345678`,
       { parse_mode: 'Markdown', ...cancelKeyboard }
@@ -929,7 +924,7 @@ bot.on(message('text'), async (ctx, next) => {
     }
 
     try {
-      await ctx.reply('⏳ Generating deposit address via ChainRails...');
+      await ctx.reply('⏳ Generating deposit address...');
 
       // Get quote for fee estimate
       let quote: any = null;
@@ -986,30 +981,31 @@ bot.on(message('text'), async (ctx, next) => {
       });
 
       const chainDisplay = CHAIN_NAMES[bd.sourceChain] || bd.sourceChain;
-      const actualFee = intent.fees_in_asset_token || intent.app_fee_in_asset_token;
+      const tokenDecimals = TOKEN_DECIMALS[bd.sourceChain]?.[bd.token] || 6;
+      const actualFeeRaw = intent.fees_in_asset_token || intent.app_fee_in_asset_token;
+      const actualFee = actualFeeRaw ? (Number(actualFeeRaw) / Math.pow(10, tokenDecimals)).toFixed(6) : null;
       const feeLine = actualFee
-        ? `• Fee: ${actualFee} ${bd.token}\n`
-        : quote
-          ? `• Est. fee: ${quote.totalFeeFormatted} ${bd.token}\n`
+        ? `• Fee: ~${actualFee} ${bd.token}\n`
+        : quote?.totalFeeFormatted
+          ? `• Est. fee: ~${quote.totalFeeFormatted} ${bd.token}\n`
           : '';
 
       await ctx.reply(
-        `🌉 *Deposit ${bd.token} from ${chainDisplay}*\n\n` +
-        `Send *${amount} ${bd.token}* to this ChainRails intent address:\n` +
+        `🌉 *Receive ${bd.token} from ${chainDisplay}*\n\n` +
+        `Send *${amount} ${bd.token}* to this address:\n` +
         `\`\`\`\n${intent.intent_address}\n\`\`\`\n\n` +
         `⚠️ *Important:*\n` +
         `• Only send ${bd.token} on ${chainDisplay}\n` +
-        `• You'll receive USDT on Solana\n` +
+        `• You'll receive Dollars (USDT) in your Zend account\n` +
         feeLine +
         `• Expires: ${new Date(intent.expires_at).toLocaleString('en-NG')}\n\n` +
-        `Reference: \`${txId}\`\n` +
-        `Intent: \`${intent.intent_address}\``,
+        `Reference: \`${txId}\``,
         { parse_mode: 'Markdown', ...mainMenu }
       );
     } catch (err: any) {
       console.error('[Bridge] Failed:', err);
       await ctx.reply(
-        `❌ *Bridge Error*\n\n` +
+        `❌ *Receive Error*\n\n` +
         `Could not generate deposit address.\n` +
         `Error: ${err.message || 'Unknown error'}\n\n` +
         `Please try again later or contact support.`,
@@ -1071,19 +1067,19 @@ bot.on(message('text'), async (ctx, next) => {
       // User-friendly error messages
       if (errorMsg.includes('No recipients defined') || errorMsg.includes('recipients')) {
         await ctx.reply(
-          `❌ *PAJ Server Error*\n\n` +
-          `Could not send OTP. PAJ is experiencing issues with phone number processing.\n\n` +
+          `❌ *Service Error*\n\n` +
+          `Could not send verification code. We're experiencing issues with phone number processing.\n\n` +
           `Try these options:\n` +
           `1. Use your email instead of phone number\n` +
           `2. Try again in a few minutes\n` +
-          `3. Contact PAJ support if the issue persists`,
+          `3. Contact support if the issue persists`,
           { parse_mode: 'Markdown', ...mainMenu }
         );
       } else if (errorMsg.includes('Can\'t find business') || errorMsg.includes('business')) {
         await ctx.reply(
-          `❌ *PAJ API Key Invalid*\n\n` +
-          `Your PAJ business API key is not recognized.\n` +
-          `Please check your PAJ dashboard and update the PAJ_BUSINESS_API_KEY environment variable.`,
+          `❌ *Service Error*\n\n` +
+          `Our payment partner is temporarily unavailable.\n` +
+          `Please try again in a few minutes or contact support.`,
           mainMenu
         );
       } else {
@@ -1170,7 +1166,7 @@ bot.on(message('text'), async (ctx, next) => {
 
       if (errorMsg.includes('No recipients defined') || errorMsg.includes('recipients')) {
         await ctx.reply(
-          `❌ *PAJ Server Error*\n\n` +
+          `❌ *Service Error*\n\n` +
           `The verification server is experiencing issues.\n\n` +
           `Please try again in a few minutes or use email instead of phone number.`,
           mainMenu
@@ -1244,7 +1240,7 @@ bot.on(message('text'), async (ctx, next) => {
     setSession(userId, session);
 
     let msg = `📤 Send ${formatNgn(amount)}\n` +
-      `Rate: ${formatNgn(rate)}/USDT\n` +
+      `Rate: ${formatNgn(rate)} per Dollar\n` +
       `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${zendFeeUsdt.toFixed(4)} USDT\n` +
       `You pay: *${usdtNeeded.toFixed(2)} USDT*\n\n` +
       `Who should receive it?\n\n` +
@@ -1356,7 +1352,7 @@ bot.on(message('text'), async (ctx, next) => {
     let verifyMsg: { message_id: number } | undefined;
 
     if (user[0]?.pajSessionToken) {
-      verifyMsg = await showLoading(ctx, 'Verifying account with PAJ...');
+      verifyMsg = await showLoading(ctx, 'Verifying account...');
       const verification = await verifyBankAccount(user[0].pajSessionToken, bankCode, accountNumber);
       if (verification.verified && verification.accountName) {
         verifiedName = verification.accountName;
@@ -1381,9 +1377,9 @@ bot.on(message('text'), async (ctx, next) => {
     let confirmMsg = `📤 *Confirm Transfer*\n\n`;
 
     if (verifiedStatus === 'verified') {
-      confirmMsg += `✅ *Account Verified by PAJ*\n`;
+      confirmMsg += `✅ *Account Verified*\n`;
     } else if (verifiedStatus === 'no_paj') {
-      confirmMsg += `⚠️ *Account Not Verified* (link PAJ in Settings to verify)\n`;
+      confirmMsg += `⚠️ *Account Not Verified* (verify identity in Settings)\n`;
     } else {
       confirmMsg += `⚠️ *Could not verify account* — please double-check details\n`;
     }
@@ -1402,7 +1398,6 @@ bot.on(message('text'), async (ctx, next) => {
       `Account: \`${accountNumber}\`\n\n` +
       feeLine +
       `You pay: *${amountUsdt!.toFixed(2)} ${menuFromToken.symbol}*\n` +
-      `💡 *Gas: ~0.001 SOL* (deducted from your wallet)\n\n` +
       `━━━━━━━━━━━━━━━━━━━━`;
 
     await ctx.reply(confirmMsg, {
@@ -1550,9 +1545,9 @@ bot.on(message('text'), async (ctx, next) => {
         let msg = `📤 *Confirm Transfer*\n\n`;
 
         if (verifiedStatus === 'verified') {
-          msg += `✅ *Account Verified by PAJ*\n`;
+          msg += `✅ *Account Verified*\n`;
         } else if (verifiedStatus === 'no_paj') {
-          msg += `⚠️ *Account Not Verified* (link PAJ in Settings to verify)\n`;
+          msg += `⚠️ *Account Not Verified* (verify identity in Settings)\n`;
         } else {
           msg += `⚠️ *Could not verify account* — please double-check details\n`;
         }
@@ -1565,8 +1560,7 @@ bot.on(message('text'), async (ctx, next) => {
           `Amount: ${formatNgn(parsed.amount)}\n` +
           `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${zendFeeUsdt.toFixed(4)} USDT\n` +
           `You pay: *${usdtNeeded.toFixed(2)} ${fromSymbol}*\n` +
-          `Rate: ${formatNgn(rate)}/USDT\n\n` +
-          `💡 *Gas: ~0.001 SOL* (deducted from your wallet)\n\n` +
+          `Rate: ${formatNgn(rate)} per Dollar\n\n` +
           `Confirm?`;
 
         await ctx.reply(msg, {
@@ -1623,7 +1617,7 @@ bot.on(message('text'), async (ctx, next) => {
 
           msg += `\n━━━━━━━━━━━━━━━━━━━━\n`;
           msg += `💵 Total: ≈${formatNgn(totalNgn)}\n`;
-          msg += `📈 SOL: $${solPrice.toFixed(2)}  ·  Rate: ${formatNgn(offRampRate)}/USDT`;
+          msg += `📈 Rate: ${formatNgn(offRampRate)} per Dollar`;
 
           await ctx.reply(msg, { parse_mode: 'Markdown', ...mainMenu });
         } catch (err) {
@@ -2215,12 +2209,12 @@ async function showVirtualAccount(
   }
 
   await ctx.reply(
-    `💵 *Add Naira to Your Wallet*\n\n` +
+    `💵 *Add Naira*\n\n` +
     `*Deposit Details:*\n` +
     `Amount: ${formatNgn(fiatAmount)}\n` +
     `Rate: ₦${_rate.toLocaleString()}/USD\n` +
     `Fee: ${formatNgn(_fee)}\n` +
-    `You receive: ~${usdtAmount.toFixed(2)} USDT\n\n` +
+    `You receive: ~${usdtAmount.toFixed(2)} Dollars\n\n` +
     `*Send bank transfer to:*\n` +
     `🏦 *${virtualAccount.bankName}*\n` +
     `🔢 \`${virtualAccount.accountNumber}\`\n` +
@@ -2315,7 +2309,7 @@ async function executeSendCore(
   try {
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     if (user.length === 0 || !user[0].walletEncryptedKey) {
-      throw new Error('User wallet not found');
+      throw new Error('Account not found. Please run /start first.');
     }
 
     const pajClient = await getPAJClient();
@@ -2356,11 +2350,11 @@ async function executeSendCore(
           const swapAmountBase = Math.round(swapAmountUsdc * Math.pow(10, SOLANA_TOKENS.USDC.decimals));
           const quote = await getSwapQuote(SOLANA_TOKENS.USDC.mint, SOLANA_TOKENS.USDT.mint, swapAmountBase, 100);
           if (!quote) {
-            throw new Error('Swap route unavailable. Please deposit USDT.');
+            throw new Error('Exchange not available right now. Please deposit Dollars (USDT).');
           }
           const outAmountUsdt = Number(quote.outAmount) / Math.pow(10, SOLANA_TOKENS.USDT.decimals);
           if (outAmountUsdt < order.amount) {
-            throw new Error(`Swap would only give ${outAmountUsdt.toFixed(2)} USDT. Deposit more.`);
+            throw new Error(`Conversion would only give ${outAmountUsdt.toFixed(2)} Dollars. Deposit more USDT.`);
           }
           const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
           if (!serializedTx) throw new Error('Failed to build swap transaction.');
@@ -2388,7 +2382,7 @@ async function executeSendCore(
       if (!gasSponsored) {
         const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, MIN_SOL_FOR_GAS);
         if (!hasGas) {
-          throw new Error(`Insufficient SOL for gas. Please deposit at least ${MIN_SOL_FOR_GAS} SOL.`);
+          throw new Error(`You need a small network fee to send. We can cover it for you (+0.5% extra).`);
         }
       }
 
@@ -2532,12 +2526,12 @@ async function executeSwap(
   const quote = pt.swapQuote as any;
   const outAmount = pt.swapOutAmount as number;
 
-  await ctx.reply('⏳ Executing swap via Jupiter...');
+  await ctx.reply('⏳ Converting...');
 
   try {
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     if (user.length === 0 || !user[0].walletEncryptedKey) {
-      throw new Error('Wallet not found');
+      throw new Error('Account not found. Please run /start first.');
     }
 
     // Gas sponsorship for swaps
@@ -2546,8 +2540,7 @@ async function executeSwap(
       const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, MIN_SOL_FOR_GAS);
       if (!hasGas) {
         throw new Error(
-          `Insufficient SOL for gas. Swaps need ~${MIN_SOL_FOR_GAS} SOL.\n\n` +
-          `Please deposit SOL or we can fund it (+0.5% fee).`
+          `You need a small network fee to convert. We can cover it for you (+0.5% extra).`
         );
       }
     }
@@ -2599,9 +2592,9 @@ async function executeSwap(
     setSession(userId, { state: ConversationState.IDLE });
 
     await ctx.reply(
-      `✅ *Swap Complete!*\n\n` +
+      `✅ *Conversion Complete!*\n\n` +
       `${formatTokenAmount(Number(quote.inAmount), getTokenBySymbol(fromSymbol)!.decimals)} ${fromSymbol} → ${outAmount.toFixed(2)} ${toSymbol}\n\n` +
-      `Tx: \`https://solscan.io/tx/${txHash}\`\n` +
+      `View: [Transaction Details](https://solscan.io/tx/${txHash})\n` +
       `Reference: \`${txId}\``, 
       { parse_mode: 'Markdown', ...mainMenu }
     );
@@ -2745,9 +2738,9 @@ async function prepareSendConfirmation(
   let msg = `📤 *Confirm Transfer*\n\n`;
 
   if (verifiedStatus === 'verified') {
-    msg += `✅ *Account Verified by PAJ*\n`;
+    msg += `✅ *Account Verified*\n`;
   } else if (verifiedStatus === 'no_paj') {
-    msg += `⚠️ *Account Not Verified* (link PAJ in Settings to verify)\n`;
+    msg += `⚠️ *Account Not Verified* (verify identity in Settings)\n`;
   } else {
     msg += `⚠️ *Could not verify account* — please double-check details\n`;
   }
@@ -2759,8 +2752,7 @@ async function prepareSendConfirmation(
     `Amount: ${formatNgn(amountNgn)}\n` +
     `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${zendFeeUsdt.toFixed(4)} USDT\n` +
     `You pay: *${usdtNeeded.toFixed(2)} ${selectedSymbol}*\n` +
-    `Rate: ${formatNgn(rate)}/USDT\n\n` +
-    `💡 *Gas: ~0.001 SOL* (deducted from your wallet)\n\n` +
+    `Rate: ${formatNgn(rate)} per Dollar\n\n` +
     `Confirm?`;
 
   await ctx.reply(msg, {
@@ -2839,8 +2831,8 @@ async function showReceive(ctx: ZendContext, userId: string) {
   let msg = `📥 *Receive Money*\n\n`;
   msg += `Choose how you want to get paid:\n\n`;
 
-  msg += `*🪙 Crypto (Solana)*\n`;
-  msg += `Send SOL, USDT, or USDC to:\n`;
+  msg += `*🪙 Crypto*\n`;
+  msg += `Send Dollars (USDT/USDC) or SOL to:\n`;
   msg += `\`\`\`\n${walletAddress}\n\`\`\`\n\n`;
 
   if (hasVA) {
@@ -2855,8 +2847,8 @@ async function showReceive(ctx: ZendContext, userId: string) {
     msg += `Tap 💵 *Add Naira* to create one.\n\n`;
   }
 
-  msg += `\n*🌉 Cross-Chain (Any Chain)*\n`;
-  msg += `Send USDC/USDT from Ethereum, Base, BSC, Arbitrum, Optimism, Polygon → get USDT on Solana.\n\n`;
+  msg += `\n*🌉 From Other Apps*\n`;
+  msg += `Send Dollars from Binance, MetaMask, Trust Wallet, etc. → receive in your Zend account.\n\n`;
 
   msg += `💡 *Crypto arrives instantly*\n`;
   msg += `⏱️ *Naira takes 2–5 minutes* after bank transfer`;
@@ -2864,7 +2856,7 @@ async function showReceive(ctx: ZendContext, userId: string) {
   await ctx.reply(msg, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
-      [Markup.button.callback('🌉 Bridge from Any Chain', 'bridge_start')],
+      [Markup.button.callback('🌉 Receive from Other Apps', 'bridge_start')],
     ]),
   });
 }
@@ -2887,9 +2879,9 @@ import { getChainRailsClient, TOKEN_ADDRESSES, CHAIN_NAMES } from '@zend/chainra
 
 async function showSwapMenu(ctx: ZendContext, userId: string) {
   await ctx.reply(
-    `🔄 *Swap Tokens*\n\n` +
-    `Convert tokens in your wallet instantly via Jupiter.\n\n` +
-    `Select a swap pair:`,
+    `🔄 *Convert Currency*\n\n` +
+    `Exchange money in your account instantly.\n\n` +
+    `Select a pair:`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
@@ -2920,7 +2912,7 @@ bot.action(/swap:([A-Z]+):([A-Z]+)/, async (ctx) => {
   const fromToken = getTokenBySymbol(fromSymbol);
   const toToken = getTokenBySymbol(toSymbol);
   if (!fromToken || !toToken) {
-    await ctx.editMessageText('❌ Invalid token pair.');
+    await ctx.editMessageText('❌ Invalid pair selected.');
     return;
   }
 
@@ -2936,8 +2928,8 @@ bot.action(/swap:([A-Z]+):([A-Z]+)/, async (ctx) => {
   });
 
   await ctx.editMessageText(
-    `🔄 *Swap ${fromSymbol} → ${toSymbol}*\n\n` +
-    `How much ${fromSymbol} do you want to swap?\n\n` +
+    `🔄 *Convert ${fromSymbol} → ${toSymbol}*\n\n` +
+    `How much ${fromSymbol} do you want to convert?\n\n` +
     `Example: 0.1, 1, 10`,
     {
       parse_mode: 'Markdown',
@@ -3127,7 +3119,7 @@ async function handleSwapAmount(ctx: ZendContext, userId: string, text: string) 
   const session = getSession(userId);
   const pt = session.pendingTransaction;
   if (!pt?.fromMint || !pt.toMint || !pt.fromSymbol || !pt.toSymbol || !pt.fromDecimals) {
-    await ctx.reply('❌ Swap session expired. Please start over.', mainMenu);
+    await ctx.reply('❌ Session expired. Please start over.', mainMenu);
     setSession(userId, { state: ConversationState.IDLE });
     return;
   }
@@ -3145,7 +3137,7 @@ async function handleSwapAmount(ctx: ZendContext, userId: string, text: string) 
   const quote = await getSwapQuote(pt.fromMint, pt.toMint, amountBase, 50);
 
   if (!quote) {
-    await ctx.reply('❌ Could not get a swap quote. The route may not exist or liquidity is too low.', mainMenu);
+    await ctx.reply('❌ Could not get an exchange rate. Not enough available right now. Please try again later.', mainMenu);
     setSession(userId, { state: ConversationState.IDLE });
     return;
   }
@@ -3169,13 +3161,12 @@ async function handleSwapAmount(ctx: ZendContext, userId: string, text: string) 
   session.state = ConversationState.AWAITING_CONFIRMATION;
   setSession(userId, session);
 
-  let msg = `🔄 *Swap Quote*\n\n`;
+  let msg = `🔄 *Exchange Rate*\n\n`;
   msg += `${formatTokenAmount(Number(quote.inAmount), fromToken.decimals)} ${fromToken.symbol} → ${outAmount.toFixed(toToken.decimals === 9 ? 4 : 2)} ${toToken.symbol}\n`;
-  msg += `Minimum received: ${minOut.toFixed(toToken.decimals === 9 ? 4 : 2)} ${toToken.symbol}\n`;
+  msg += `Minimum you'll get: ${minOut.toFixed(toToken.decimals === 9 ? 4 : 2)} ${toToken.symbol}\n`;
   msg += `Price impact: ${priceImpact < 0.01 ? '<0.01%' : priceImpact.toFixed(2) + '%'}\n`;
-  msg += `Slippage: 0.5%\n\n`;
-  msg += `💡 *Gas: ~0.001 SOL* (deducted from your wallet)\n\n`;
-  msg += `Confirm swap?`;
+  msg += `Price protection: 0.5%\n\n`;
+  msg += `Confirm?`;
 
   await ctx.reply(msg, {
     parse_mode: 'Markdown',
@@ -3242,21 +3233,21 @@ async function showBridgeMenu(ctx: ZendContext, userId: string) {
   const chainRails = getChainRailsClient();
   if (!chainRails) {
     await ctx.reply(
-      `🌉 *Cross-Chain Deposit*\n\n` +
-      `Deposit crypto from any chain directly into your Zend Solana wallet.\n\n` +
-      `⚠️ *ChainRails API key not configured.*\n\n` +
+      `🌉 *Receive from Other Apps*\n\n` +
+      `Receive Dollars from Binance, MetaMask, or any app.\n\n` +
+      `⚠️ *Service not configured.*\n\n` +
       `For now, use:\n` +
-      `• 💵 *Add Naira* — NGN bank transfer → USDT\n` +
-      `• 📥 *Receive* — Direct Solana deposit`,
+      `• 💵 *Add Naira* — NGN bank transfer → Dollars\n` +
+      `• 📥 *Receive* — Direct crypto deposit`,
       { parse_mode: 'Markdown', ...mainMenu }
     );
     return;
   }
 
   await ctx.reply(
-    `🌉 *Cross-Chain Deposit*\n\n` +
-    `Send USDC or USDT from any chain and receive USDT on Solana.\n\n` +
-    `Select source chain:`,
+    `🌉 *Receive from Other Apps*\n\n` +
+    `Send Dollars from Binance, MetaMask, Trust Wallet, or any app.\n\n` +
+    `Where are you sending from?`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
@@ -3292,9 +3283,9 @@ bot.action(/bridge_chain:([a-z]+)/, async (ctx) => {
   if (hasUsdt) buttons.push(Markup.button.callback('USDT', `bridge:${chainKey}:USDT`));
 
   await ctx.editMessageText(
-    `🌉 *Cross-Chain Deposit*\n\n` +
-    `Chain: *${chainDisplay}*\n\n` +
-    `Select token to send:`,
+    `🌉 *Receive from Other Apps*\n\n` +
+    `From: *${chainDisplay}*\n\n` +
+    `What are you sending?`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
@@ -3336,7 +3327,7 @@ bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
 
   const tokenIn = TOKEN_ADDRESSES[sourceChain]?.[token];
   if (!tokenIn) {
-    await ctx.editMessageText(`❌ ${token} not supported on ${CHAIN_NAMES[sourceChain] || sourceChain}.`);
+    await ctx.editMessageText(`❌ ${token} is not supported from ${CHAIN_NAMES[sourceChain] || sourceChain} yet.`);
     return;
   }
 
@@ -3349,10 +3340,10 @@ bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
   });
 
   await ctx.editMessageText(
-    `🌉 *Cross-Chain Deposit*\n\n` +
-    `Chain: *${chainDisplay}*\n` +
-    `Token: *${token}*\n\n` +
-    `How much ${token} do you want to deposit?\n\n` +
+    `🌉 *Receive from Other Apps*\n\n` +
+    `From: *${chainDisplay}*\n` +
+    `Currency: *${token}*\n\n` +
+    `How much ${token} do you want to receive?\n\n` +
     `Examples:\n` +
     `• 10\n` +
     `• 50\n` +
@@ -3363,7 +3354,7 @@ bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
 
 bot.action('cancel_bridge', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.editMessageText('❌ Bridge cancelled.');
+  await ctx.editMessageText('❌ Cancelled.');
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -3393,7 +3384,7 @@ async function buildHistoryMessage(userId: string): Promise<string | null> {
   for (const tx of txs) {
     const statusEmoji = tx.status === 'completed' ? '✅' : tx.status === 'processing' ? '⏳' : tx.status === 'pending' ? '🕐' : '❌';
     const typeEmoji = tx.type === 'ngn_send' ? '📤' : tx.type === 'ngn_receive' ? '📥' : tx.type === 'swap' ? '🔄' : tx.type === 'scheduled' ? '📅' : '💱';
-    const typeLabel = tx.type === 'ngn_send' ? 'Send' : tx.type === 'ngn_receive' ? 'Deposit' : tx.type === 'swap' ? 'Swap' : tx.type === 'scheduled' ? 'Scheduled' : tx.type;
+    const typeLabel = tx.type === 'ngn_send' ? 'Send' : tx.type === 'ngn_receive' ? 'Deposit' : tx.type === 'swap' ? 'Convert' : tx.type === 'scheduled' ? 'Scheduled' : tx.type;
 
     const amountLine = tx.ngnAmount
       ? `${formatNgn(Number(tx.ngnAmount))}`
@@ -3466,11 +3457,11 @@ async function showSettings(ctx: ZendContext, userId: string) {
       `⚙️ *Settings*\n\n` +
       `👤 *Profile*\n` +
       `Name: ${u.firstName} ${u.lastName || ''}\n\n` +
-      `*Wallet Address:*\n` +
+      `*Your Address:*\n` +
       `\`\`\`\n${u.walletAddress}\n\`\`\`\n\n` +
       `🔐 *Security*\n` +
       `Email: ${u.email || 'Not set'} ${u.emailVerified ? '✓' : ''}\n` +
-      `PAJ: ${u.pajSessionToken ? '✅ Linked' : '❌ Not linked'}\n` +
+      `Identity: ${u.pajSessionToken ? '✅ Verified' : '❌ Not verified'}\n` +
       `PIN: ${u.transactionPin ? 'Set ✅' : 'Not set'}\n\n` +
       `💰 *Preferences*\n` +
       `Auto-save: ${autoSave}`;
@@ -3488,7 +3479,7 @@ async function showSettings(ctx: ZendContext, userId: string) {
     } else {
       buttons.push([Markup.button.callback('🔢 Change PIN', 'settings_pin')]);
     }
-    buttons.push([Markup.button.callback('🔑 Export Private Key', 'export_key')]);
+    buttons.push([Markup.button.callback('🔑 Show Secret Code', 'export_key')]);
 
     await finishLoading(ctx, loading.message_id, msg, 'Markdown');
     await ctx.reply('Menu:', {
@@ -3868,8 +3859,8 @@ function startWebhookServer(botInstance: Telegraf<any>) {
             try {
               await botInstance.telegram.sendMessage(
                 userId,
-                `✅ *Cross-Chain Deposit Complete!*\n\n` +
-                `${amount || ''} ${token || 'USDT'} has arrived in your Zend Solana wallet.\n\n` +
+                `✅ *Deposit Received!*\n\n` +
+                `${amount || ''} ${token || 'USDT'} has arrived in your Zend account.\n\n` +
                 `Reference: \`${tx.id}\``,
                 { parse_mode: 'Markdown', ...mainMenu }
               );
