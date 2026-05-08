@@ -619,8 +619,8 @@ bot.command('start', async (ctx) => {
 
   await ctx.reply(
     `✅ *Account Created!*\n\n` +
-    `Your Zend address:\n` +
-    `\`${wallet.publicKey}\`\n\n` +
+    `Your Zend address:\n\n` +
+    `${wallet.publicKey}\n\n` +
     `💡 Tap *💵 Add Naira* to get your virtual bank account.`,
     { parse_mode: 'Markdown', ...mainMenu }
   );
@@ -642,9 +642,9 @@ bot.command('wallet', async (ctx) => {
   const u = user[0];
   const msg =
     `👛 *Your Account*\n\n` +
-    `*Your Address:*\n` +
-    `\`\`\`\n${u.walletAddress}\n\`\`\`\n\n` +
-    `Tap the code block above to copy your address.\n\n` +
+    `*Your Address:*\n\n` +
+    `${u.walletAddress}\n\n` +
+    `Tap and hold the address above to copy it.\n\n` +
     `*Currencies:* SOL, USDT, USDC\n\n` +
     `⚠️ To view your secret code, go to *⚙️ Settings*.`;
 
@@ -673,8 +673,8 @@ async function doExportKey(ctx: ZendContext, userId: string) {
       `🔑 *Secret Recovery Code*\n\n` +
       `⚠️ *SECURITY WARNING*\n` +
       `Never share this with anyone. Zend will NEVER ask for it.\n\n` +
-      `*Your Secret Code:*\n` +
-      `\`${bs58.encode(secretKey)}\`\n\n` +
+      `*Your Secret Code:*\n\n` +
+      `${bs58.encode(secretKey)}\n\n` +
       `Copy this and store it in a password manager or write it down.\n` +
       `This message will self-destruct in 1 minute.`,
       { parse_mode: 'Markdown' }
@@ -1027,8 +1027,8 @@ bot.on(message('text'), async (ctx, next) => {
 
       await ctx.reply(
         `🌉 *Receive ${bd.token} from ${chainDisplay}*\n\n` +
-        `Send *${amount} ${bd.token}* to this address:\n` +
-        `\`\`\`\n${intent.intent_address}\n\`\`\`\n\n` +
+        `Send *${amount} ${bd.token}* to this address:\n\n` +
+        `${intent.intent_address}\n\n` +
         `⚠️ *Important:*\n` +
         `• Only send ${bd.token} on ${chainDisplay}\n` +
         `• You'll receive Dollars (USDT) in your Zend account\n` +
@@ -2287,40 +2287,45 @@ async function showVirtualAccount(
   }
   const usdtAmount = fiatAmount / _rate;
 
-  // Always create a fresh on-ramp order for the specific amount
-  // (Don't reuse cached VAs since amounts may differ)
-  const loadingVA = await showLoading(ctx, 'Creating your virtual bank account...');
-  let virtualAccount: any;
-  try {
-    const order = await pajClient.createOnramp({
-      fiatAmount,
-      currency: Currency.NGN,
-      recipient: walletAddress,
-      mint: SOLANA_TOKENS.USDT.mint,
-      chain: Chain.SOLANA,
-    }, sessionToken);
+  // Check if we have a cached virtual account to reuse
+  let virtualAccount: any = user[0]?.virtualAccount;
+  const hasCachedVA = virtualAccount?.accountNumber && virtualAccount?.bankName;
 
-    virtualAccount = {
-      bankCode: 'WEM', // PAJ uses Wema Bank
-      bankName: order.bank,
-      accountNumber: order.accountNumber,
-      accountName: order.accountName,
-      orderId: order.id,
-      amount: fiatAmount,
-      createdAt: new Date().toISOString(),
-    };
+  if (!hasCachedVA) {
+    const loadingVA = await showLoading(ctx, 'Creating your virtual bank account...');
+    try {
+      const order = await pajClient.createOnramp({
+        fiatAmount,
+        currency: Currency.NGN,
+        recipient: walletAddress,
+        mint: SOLANA_TOKENS.USDT.mint,
+        chain: Chain.SOLANA,
+      }, sessionToken);
 
-    // Cache in DB (overwrite previous)
-    await db.update(users)
-      .set({ virtualAccount })
-      .where(eq(users.id, userId));
+      virtualAccount = {
+        bankCode: 'WEM', // PAJ uses Wema Bank
+        bankName: order.bank,
+        accountNumber: order.accountNumber,
+        accountName: order.accountName,
+        orderId: order.id,
+        amount: fiatAmount,
+        createdAt: new Date().toISOString(),
+      };
 
-    console.log('[PAJ] Virtual account created:', order.accountNumber, 'for ₦', fiatAmount);
-  } catch (err: any) {
-    console.error('[PAJ] createOnramp failed:', err);
-    await finishLoading(ctx, loadingVA.message_id, `❌ Could not create virtual account.\nError: ${err.message || 'Unknown error'}`);
-    await ctx.reply('Menu:', mainMenu);
-    return;
+      // Cache in DB (overwrite previous)
+      await db.update(users)
+        .set({ virtualAccount })
+        .where(eq(users.id, userId));
+
+      console.log('[PAJ] Virtual account created:', order.accountNumber, 'for ₦', fiatAmount);
+    } catch (err: any) {
+      console.error('[PAJ] createOnramp failed:', err);
+      await finishLoading(ctx, loadingVA.message_id, `❌ Could not create virtual account.\nError: ${err.message || 'Unknown error'}`);
+      await ctx.reply('Menu:', mainMenu);
+      return;
+    }
+  } else {
+    console.log('[PAJ] Reusing cached virtual account:', virtualAccount.accountNumber);
   }
 
   await ctx.reply(
@@ -2971,7 +2976,7 @@ async function showReceive(ctx: ZendContext, userId: string) {
 
   msg += `*🪙 Crypto*\n`;
   msg += `Send Dollars (USDT/USDC) or SOL to:\n`;
-  msg += `\`\`\`\n${walletAddress}\n\`\`\`\n\n`;
+  msg += `${walletAddress}\n\n`;
 
   if (hasVA) {
     msg += `*🇳🇬 Naira (Bank Transfer)*\n`;
