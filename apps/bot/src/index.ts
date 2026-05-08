@@ -94,6 +94,12 @@ interface ZendSession {
     frequency?: 'once' | 'daily' | 'weekly' | 'monthly';
     startAt?: Date;
   };
+  bridgeData?: {
+    chainKey: string;
+    sourceChain: string;
+    token: string;
+    tokenIn: string;
+  };
 }
 
 interface ZendContext extends Context {
@@ -829,6 +835,131 @@ bot.on(message('text'), async (ctx, next) => {
       `Example: user@email.com or +2348012345678`,
       { parse_mode: 'Markdown', ...cancelKeyboard }
     );
+    return;
+  }
+
+  // ─── BRIDGE: AWAITING_BRIDGE_AMOUNT ───
+  if (session.state === ConversationState.AWAITING_BRIDGE_AMOUNT) {
+    const bd = session.bridgeData;
+    if (!bd) {
+      setSession(userId, { state: ConversationState.IDLE });
+      await ctx.reply('❌ Session expired. Please start over.', mainMenu);
+      return;
+    }
+
+    const amount = parseFloat(text.trim());
+    if (isNaN(amount) || amount <= 0) {
+      await ctx.reply('❌ Please enter a valid amount. Example: 10, 50, 100', cancelKeyboard);
+      return;
+    }
+
+    const decimals = TOKEN_DECIMALS[bd.sourceChain]?.[bd.token] || 6;
+    const baseAmount = Math.floor(amount * Math.pow(10, decimals)).toString();
+
+    const chainRails = getChainRailsClient();
+    if (!chainRails) {
+      await ctx.reply('❌ ChainRails not configured.', mainMenu);
+      setSession(userId, { state: ConversationState.IDLE });
+      return;
+    }
+
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    if (user.length === 0) {
+      await ctx.reply('❌ User not found. Run /start first.', mainMenu);
+      setSession(userId, { state: ConversationState.IDLE });
+      return;
+    }
+
+    try {
+      await ctx.reply('⏳ Generating deposit address via ChainRails...');
+
+      // Get quote for fee estimate
+      let quote: any = null;
+      try {
+        quote = await chainRails.getBestQuote({
+          tokenIn: bd.tokenIn,
+          tokenOut: TOKEN_ADDRESSES.SOLANA_MAINNET.USDT,
+          sourceChain: bd.sourceChain,
+          destinationChain: 'SOLANA_MAINNET',
+          amount: baseAmount,
+          amountSymbol: bd.token,
+          recipient: user[0].walletAddress,
+        });
+      } catch (quoteErr: any) {
+        console.log('[Bridge] Quote failed (non-critical):', quoteErr.message);
+      }
+
+      // Create intent with user-specified amount
+      console.log('[Bridge] Creating intent:', {
+        sourceChain: bd.sourceChain,
+        token: bd.token,
+        amount: baseAmount,
+        recipient: user[0].walletAddress,
+      });
+
+      const intent = await chainRails.createIntent({
+        amount: baseAmount,
+        amountSymbol: bd.token,
+        tokenIn: bd.tokenIn,
+        sourceChain: bd.sourceChain,
+        destinationChain: 'SOLANA_MAINNET',
+        recipient: user[0].walletAddress,
+        metadata: {
+          userId,
+          telegramUserId: userId,
+          sourceChain: bd.sourceChain,
+          token: bd.token,
+          originalAmount: amount.toString(),
+        },
+      });
+
+      // Record in DB
+      const txId = generateTxId();
+      await db.insert(transactions).values({
+        id: txId,
+        userId,
+        type: 'crypto_receive',
+        status: 'pending',
+        chainrailsIntentAddress: intent.intent_address,
+        recipientWalletAddress: user[0].walletAddress,
+        fromAmount: amount.toString(),
+        fromMint: bd.tokenIn,
+        toMint: TOKEN_ADDRESSES.SOLANA_MAINNET.USDT,
+      });
+
+      const chainDisplay = CHAIN_NAMES[bd.sourceChain] || bd.sourceChain;
+      const actualFee = intent.fees_in_asset_token || intent.app_fee_in_asset_token;
+      const feeLine = actualFee
+        ? `• Fee: ${actualFee} ${bd.token}\n`
+        : quote
+          ? `• Est. fee: ${quote.totalFeeFormatted} ${bd.token}\n`
+          : '';
+
+      await ctx.reply(
+        `🌉 *Deposit ${bd.token} from ${chainDisplay}*\n\n` +
+        `Send *${amount} ${bd.token}* to this ChainRails intent address:\n` +
+        `\`\`\`\n${intent.intent_address}\n\`\`\`\n\n` +
+        `⚠️ *Important:*\n` +
+        `• Only send ${bd.token} on ${chainDisplay}\n` +
+        `• You'll receive USDT on Solana\n` +
+        feeLine +
+        `• Expires: ${new Date(intent.expires_at).toLocaleString('en-NG')}\n\n` +
+        `Reference: \`${txId}\`\n` +
+        `Intent: \`${intent.intent_address}\``,
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
+    } catch (err: any) {
+      console.error('[Bridge] Failed:', err);
+      await ctx.reply(
+        `❌ *Bridge Error*\n\n` +
+        `Could not generate deposit address.\n` +
+        `Error: ${err.message || 'Unknown error'}\n\n` +
+        `Please try again later or contact support.`,
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
+    }
+
+    setSession(userId, { state: ConversationState.IDLE });
     return;
   }
 
@@ -3117,17 +3248,22 @@ bot.action('bridge_back', async (ctx) => {
   await showBridgeMenu(ctx, ctx.from!.id.toString());
 });
 
+// Token decimals per chain for base-unit conversion
+const TOKEN_DECIMALS: Record<string, Record<string, number>> = {
+  ETHEREUM_MAINNET: { USDC: 6, USDT: 6, DAI: 18, ETH: 18 },
+  BASE_MAINNET: { USDC: 6, USDT: 6, DAI: 18, ETH: 18 },
+  BSC_MAINNET: { USDC: 18, USDT: 18, DAI: 18, BNB: 18 },
+  ARBITRUM_MAINNET: { USDC: 6, USDT: 6, DAI: 18, ETH: 18 },
+  OPTIMISM_MAINNET: { USDC: 6, USDT: 6, DAI: 18, ETH: 18 },
+  POLYGON_MAINNET: { USDC: 6, USDT: 6, DAI: 18, MATIC: 18 },
+  SOLANA_MAINNET: { USDC: 6, USDT: 6, SOL: 9 },
+};
+
 bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from!.id.toString();
   const chainKey = ctx.match[1];
   const token = ctx.match[2];
-
-  const chainRails = getChainRailsClient();
-  if (!chainRails) {
-    await ctx.editMessageText('❌ ChainRails not configured.');
-    return;
-  }
 
   const sourceChain = BRIDGE_CHAIN_MAP[chainKey];
   if (!sourceChain) {
@@ -3135,101 +3271,31 @@ bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
     return;
   }
 
-  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-  if (user.length === 0) {
-    await ctx.editMessageText('❌ User not found. Run /start first.');
+  const tokenIn = TOKEN_ADDRESSES[sourceChain]?.[token];
+  if (!tokenIn) {
+    await ctx.editMessageText(`❌ ${token} not supported on ${CHAIN_NAMES[sourceChain] || sourceChain}.`);
     return;
   }
 
-  try {
-    await ctx.editMessageText('⏳ Generating deposit address via ChainRails...');
+  const chainDisplay = CHAIN_NAMES[sourceChain] || sourceChain;
 
-    const tokenIn = TOKEN_ADDRESSES[sourceChain]?.[token];
-    if (!tokenIn) {
-      throw new Error(`Token ${token} not supported on ${sourceChain}`);
-    }
+  // Store bridge data in session and ask for amount
+  setSession(userId, {
+    state: ConversationState.AWAITING_BRIDGE_AMOUNT,
+    bridgeData: { chainKey, sourceChain, token, tokenIn },
+  });
 
-    // Get quote first for fee transparency (use 1 unit for estimate)
-    let quote: any = null;
-    try {
-      quote = await chainRails.getBestQuote({
-        tokenIn,
-        tokenOut: TOKEN_ADDRESSES.SOLANA_MAINNET.USDT,
-        sourceChain,
-        destinationChain: 'SOLANA',
-        amount: '1000000',
-        amountSymbol: token,
-        recipient: user[0].walletAddress,
-      });
-    } catch (quoteErr: any) {
-      console.log('[Bridge] Quote failed (non-critical):', quoteErr.message);
-    }
-
-    // Create intent — user will send to intent_address
-    const intentAmount = '1000000'; // 1 unit in token base decimals (consistent with quote)
-    console.log('[Bridge] Creating intent:', { sourceChain, token, amount: intentAmount, recipient: user[0].walletAddress });
-    const intent = await chainRails.createIntent({
-      amount: intentAmount,
-      amountSymbol: token,
-      tokenIn,
-      sourceChain,
-      destinationChain: 'SOLANA',
-      recipient: user[0].walletAddress,
-      metadata: {
-        userId,
-        telegramUserId: userId,
-        sourceChain,
-        token,
-      },
-    });
-
-    // Record in DB
-    const txId = generateTxId();
-    await db.insert(transactions).values({
-      id: txId,
-      userId,
-      type: 'crypto_receive',
-      status: 'pending',
-      chainrailsIntentAddress: intent.intent_address,
-      recipientWalletAddress: user[0].walletAddress,
-      fromAmount: '0',
-      fromMint: tokenIn,
-      toMint: TOKEN_ADDRESSES.SOLANA_MAINNET.USDT,
-    });
-
-    const chainDisplay = CHAIN_NAMES[sourceChain] || sourceChain;
-    // Use intent's actual fee if available, fallback to quote estimate
-    const actualFee = intent.fees_in_asset_token || intent.app_fee_in_asset_token;
-    const feeLine = actualFee
-      ? `• Fee: ${actualFee} ${token} (deducted from deposit)\n`
-      : quote
-        ? `• Est. fee: ${quote.totalFeeFormatted} ${token}\n`
-        : '';
-
-    await ctx.reply(
-      `🌉 *Deposit ${token} from ${chainDisplay}*\n\n` +
-      `Send ${token} to this ChainRails intent address:\n` +
-      `\`\`\`\n${intent.intent_address}\n\`\`\`\n\n` +
-      `⚠️ *Important:*\n` +
-      `• Only send ${token} on ${chainDisplay}\n` +
-      `• You'll receive USDT on Solana\n` +
-      `• Minimum: 1 ${token}\n` +
-      feeLine +
-      `• Expires: ${new Date(intent.expires_at).toLocaleString('en-NG')}\n\n` +
-      `Reference: \`${txId}\`\n` +
-      `Intent: \`${intent.intent_address}\``, 
-      { parse_mode: 'Markdown', ...mainMenu }
-    );
-  } catch (err: any) {
-    console.error('[Bridge] Failed:', err);
-    await ctx.reply(
-      `❌ *Bridge Error*\n\n` +
-      `Could not generate deposit address.\n` +
-      `Error: ${err.message || 'Unknown error'}\n\n` +
-      `Please try again later or contact support.`,
-      { parse_mode: 'Markdown', ...mainMenu }
-    );
-  }
+  await ctx.editMessageText(
+    `🌉 *Cross-Chain Deposit*\n\n` +
+    `Chain: *${chainDisplay}*\n` +
+    `Token: *${token}*\n\n` +
+    `How much ${token} do you want to deposit?\n\n` +
+    `Examples:\n` +
+    `• 10\n` +
+    `• 50\n` +
+    `• 100`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'cancel_bridge')]]) }
+  );
 });
 
 bot.action('cancel_bridge', async (ctx) => {

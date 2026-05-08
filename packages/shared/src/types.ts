@@ -182,6 +182,12 @@ export interface UserSession {
   state: string;           // ConversationState
   pendingTransaction?: Partial<Transaction>;
   pendingIntent?: ParsedIntent;
+  bridgeData?: {
+    chainKey: string;
+    sourceChain: string;
+    token: string;
+    tokenIn: string;
+  };
   lastActivity: Date;
 }
 

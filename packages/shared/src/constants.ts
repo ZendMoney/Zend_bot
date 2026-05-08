@@ -79,6 +79,7 @@ export enum ConversationState {
   AWAITING_BANK_ACCOUNT_NUMBER = 'awaiting_bank_account_number',
   AWAITING_BANK_ACCOUNT_NAME = 'awaiting_bank_account_name',
   AWAITING_ONRAMP_AMOUNT = 'awaiting_onramp_amount',
+  AWAITING_BRIDGE_AMOUNT = 'awaiting_bridge_amount',
 }
 
 // Transaction Types
