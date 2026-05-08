@@ -163,7 +163,7 @@ setInterval(async () => {
       // Message already deleted or too old
     }
   }
-}, 30000); // every 30 seconds
+}, 5000); // every 5 seconds
 
 // ─── Services ───
 const walletService = new WalletService(SOLANA_RPC);
@@ -455,7 +455,7 @@ bot.use(async (ctx, next) => {
   await next();
 });
 
-// Auto-delete all bot messages after 10 minutes
+// Auto-delete all bot messages after 10 minutes (PIN after 5 sec)
 bot.use(async (ctx, next) => {
   const originalReply = ctx.reply.bind(ctx);
   ctx.reply = async function(text: any, extra?: any) {
@@ -466,7 +466,41 @@ bot.use(async (ctx, next) => {
     }
     return msg;
   };
+  const originalEdit = ctx.editMessageText.bind(ctx);
+  ctx.editMessageText = async function(text: any, extra?: any) {
+    const result = await originalEdit(text, extra);
+    if (result && typeof result === 'object' && 'message_id' in result && ctx.chat) {
+      const isPin = typeof text === 'string' && text.toLowerCase().includes('pin');
+      trackMessage(ctx.chat.id, result.message_id, isPin);
+    }
+    return result;
+  };
   await next();
+});
+
+// Track & auto-delete user messages during sensitive flows
+bot.on(message('text'), async (ctx, next) => {
+  const userId = ctx.from?.id?.toString();
+  if (!userId || !ctx.chat) return next();
+  const session = getSession(userId);
+  const sensitiveStates = [
+    ConversationState.AWAITING_PIN,
+    ConversationState.AWAITING_PIN_VERIFY,
+    ConversationState.AWAITING_SEND_AMOUNT,
+    ConversationState.AWAITING_SWAP_AMOUNT,
+    ConversationState.AWAITING_BRIDGE_AMOUNT,
+    ConversationState.AWAITING_ONRAMP_AMOUNT,
+    ConversationState.AWAITING_SCHEDULE_AMOUNT,
+    ConversationState.AWAITING_SCHEDULE_FREQUENCY,
+    ConversationState.AWAITING_SCHEDULE_START,
+    ConversationState.AWAITING_EMAIL,
+    ConversationState.AWAITING_SEND_RECIPIENT,
+    ConversationState.AWAITING_BANK_DETAILS,
+  ];
+  if (sensitiveStates.includes(session.state)) {
+    trackMessage(ctx.chat.id, ctx.message.message_id, session.state === ConversationState.AWAITING_PIN || session.state === ConversationState.AWAITING_PIN_VERIFY);
+  }
+  return next();
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
