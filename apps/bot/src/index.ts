@@ -93,6 +93,7 @@ interface ZendSession {
     amountNgn?: number;
     frequency?: 'once' | 'daily' | 'weekly' | 'monthly';
     startAt?: Date;
+    pendingAccountNumber?: string; // used when adding new recipient
   };
   bridgeData?: {
     chainKey: string;
@@ -1785,8 +1786,88 @@ bot.on(message('text'), async (ctx, next) => {
 
   // ─── SCHEDULE: AWAITING_SCHEDULE_RECIPIENT ───
   if (session.state === ConversationState.AWAITING_SCHEDULE_RECIPIENT) {
-    // User should have clicked an inline button — text input here is unexpected
-    await ctx.reply('❌ Please select a recipient from the buttons above.', cancelKeyboard);
+    // Parse "BANK_NAME ACCOUNT_NUMBER" or "BANK_NAME • ACCOUNT_NUMBER"
+    const cleanText = text.replace(/[•,]/g, ' ').trim();
+    const parts = cleanText.split(/\s+/);
+    if (parts.length < 2) {
+      await ctx.reply('❌ Please enter bank name and account number.\nExample: GTB 0123456789', cancelKeyboard);
+      return;
+    }
+    const accountNumber = parts[parts.length - 1].replace(/\D/g, '');
+    const bankQuery = parts.slice(0, parts.length - 1).join(' ').toLowerCase();
+
+    if (!/^\d{10}$/.test(accountNumber)) {
+      await ctx.reply('❌ Account number must be 10 digits.', cancelKeyboard);
+      return;
+    }
+
+    // Find bank
+    const bank = NIGERIAN_BANKS.find(b =>
+      b.name.toLowerCase().includes(bankQuery) ||
+      b.code.toLowerCase() === bankQuery ||
+      bankQuery.includes(b.name.toLowerCase().split(' ')[0])
+    );
+    if (!bank) {
+      const bankButtons = NIGERIAN_BANKS.map(b => Markup.button.callback(b.name, `schedule_bank:${b.code}`));
+      const rows: any[] = [];
+      for (let i = 0; i < bankButtons.length; i += 2) {
+        rows.push(bankButtons.slice(i, i + 2));
+      }
+      setSession(userId, {
+        state: ConversationState.AWAITING_BANK_DETAILS,
+        scheduleData: { pendingAccountNumber: accountNumber },
+      });
+      await ctx.reply(
+        `🏦 Which bank is account \`${accountNumber}\` with?`,
+        { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }
+      );
+      return;
+    }
+
+    // Try to verify account name via PAJ if linked
+    let accountName = 'Unknown';
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    if (user[0]?.pajSessionToken) {
+      try {
+        const verification = await verifyBankAccount(user[0].pajSessionToken, bank.code, accountNumber);
+        if (verification.verified && verification.accountName) {
+          accountName = verification.accountName;
+        }
+      } catch {
+        // Non-critical
+      }
+    }
+
+    // Save to savedBankAccounts
+    const saved = await db.insert(savedBankAccounts).values({
+      userId,
+      bankCode: bank.code,
+      bankName: bank.name,
+      accountNumber,
+      accountName,
+      verified: accountName !== 'Unknown',
+    }).returning();
+
+    const savedId = saved[0]?.id;
+    setSession(userId, {
+      state: ConversationState.AWAITING_SCHEDULE_AMOUNT,
+      scheduleData: {
+        recipientBankAccountId: savedId,
+        recipientName: accountName,
+        bankName: bank.name,
+        accountNumber,
+      },
+    });
+
+    await ctx.reply(
+      `✅ *Recipient Saved*\n\n` +
+      `Name: ${accountName}\n` +
+      `Bank: ${bank.name}\n` +
+      `Account: \`${accountNumber}\`\n\n` +
+      `How much NGN do you want to send each time?\n` +
+      `Example: 50000`,
+      { parse_mode: 'Markdown' }
+    );
     return;
   }
 
@@ -2531,11 +2612,34 @@ async function executeSend(
         `${formatNgn(txData.amountNgn)} sent to ${finalName}\n` +
         `${finalBank} • \`${finalAccount}\`\n\n` +
         `Reference: \`${txId}\`\n` +
-        `PAJ Ref: \`${offRampRef}\`\n` +
-        (solanaTxHash ? `Tx: \`https://solscan.io/tx/${solanaTxHash}\`\n` : '') +
+        (solanaTxHash ? `View: [Transaction Details](https://solscan.io/tx/${solanaTxHash})\n` : '') +
         `Time: ~2 minutes`,
         { parse_mode: 'Markdown', ...mainMenu }
       );
+      // Auto-save recipient for scheduling
+      if (txData.recipientBankCode && txData.recipientAccountNumber) {
+        try {
+          const existing = await db.select().from(savedBankAccounts)
+            .where(and(
+              eq(savedBankAccounts.userId, userId),
+              eq(savedBankAccounts.bankCode, txData.recipientBankCode),
+              eq(savedBankAccounts.accountNumber, txData.recipientAccountNumber)
+            ))
+            .limit(1);
+          if (existing.length === 0) {
+            await db.insert(savedBankAccounts).values({
+              userId,
+              bankCode: txData.recipientBankCode,
+              bankName: txData.recipientBankName || finalBank,
+              accountNumber: txData.recipientAccountNumber,
+              accountName: finalName,
+              verified: true,
+            });
+          }
+        } catch (err) {
+          console.log('[Schedule] Auto-save failed (non-critical):', err);
+        }
+      }
       // Check milestones after successful transfer
       await checkMilestones(userId, (text) => ctx.reply(text, { parse_mode: 'Markdown', ...mainMenu }));
     }, 3000);
@@ -3003,26 +3107,103 @@ bot.hears('📅 Schedule', async (ctx) => {
   // Get saved bank accounts
   const accounts = await db.select().from(savedBankAccounts).where(eq(savedBankAccounts.userId, userId));
 
-  if (accounts.length === 0) {
-    await ctx.reply(
-      `📅 *Scheduled Transfers*\n\n` +
-      `You don't have any saved bank accounts yet.\n\n` +
-      `Send money to a bank account first and I'll save it for scheduling.`,
-      { parse_mode: 'Markdown', ...mainMenu }
-    );
-    return;
-  }
-
-  // Show saved accounts + option to view existing schedules
+  // Show saved accounts + add new + view schedules
   const rows: any[] = accounts.map(acc =>
     [Markup.button.callback(`${acc.bankName} • ${acc.accountNumber}`, `schedule_recipient:${acc.id}`)]
   );
+  rows.push([Markup.button.callback('➕ Add New Recipient', 'schedule_add_recipient')]);
   rows.push([Markup.button.callback('📋 View My Schedules', 'schedule_view')]);
 
   await ctx.reply(
     `📅 *Schedule Transfer*\n\n` +
-    `Select a saved recipient:`,
+    (accounts.length > 0
+      ? `Select a saved recipient:`
+      : `You don't have any saved recipients yet.\n\nTap *➕ Add New Recipient* to add one.`),
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }
+  );
+});
+
+bot.action('schedule_add_recipient', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  setSession(userId, {
+    state: ConversationState.AWAITING_SCHEDULE_RECIPIENT,
+    scheduleData: {},
+  });
+  await ctx.editMessageText(
+    `📅 *Add New Recipient*\n\n` +
+    `Enter the bank name and account number.\n\n` +
+    `Example: *GTB 0123456789*\n` +
+    `Or: *Opay 7082406410*`,
+    { parse_mode: 'Markdown' }
+  );
+  await ctx.reply('Waiting for recipient details...', cancelKeyboard);
+});
+
+bot.action(/schedule_bank:([A-Z]+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+  const bankCode = ctx.match[1];
+
+  if (session.state !== ConversationState.AWAITING_BANK_DETAILS || !session.scheduleData?.pendingAccountNumber) {
+    await ctx.editMessageText('❌ Session expired. Please start over.');
+    await ctx.reply('Menu:', mainMenu);
+    return;
+  }
+
+  const bank = NIGERIAN_BANKS.find(b => b.code === bankCode);
+  if (!bank) {
+    await ctx.editMessageText('❌ Invalid bank selected.');
+    await ctx.reply('Menu:', mainMenu);
+    return;
+  }
+
+  const accountNumber = session.scheduleData.pendingAccountNumber;
+
+  // Try to verify account name via PAJ if linked
+  let accountName = 'Unknown';
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  if (user[0]?.pajSessionToken) {
+    try {
+      const verification = await verifyBankAccount(user[0].pajSessionToken, bank.code, accountNumber);
+      if (verification.verified && verification.accountName) {
+        accountName = verification.accountName;
+      }
+    } catch {
+      // Non-critical
+    }
+  }
+
+  // Save to savedBankAccounts
+  const saved = await db.insert(savedBankAccounts).values({
+    userId,
+    bankCode: bank.code,
+    bankName: bank.name,
+    accountNumber,
+    accountName,
+    verified: accountName !== 'Unknown',
+  }).returning();
+
+  const savedId = saved[0]?.id;
+  setSession(userId, {
+    state: ConversationState.AWAITING_SCHEDULE_AMOUNT,
+    scheduleData: {
+      recipientBankAccountId: savedId,
+      recipientName: accountName,
+      bankName: bank.name,
+      accountNumber,
+    },
+  });
+
+  await ctx.editMessageText(
+    `✅ *Recipient Saved*\n\n` +
+    `Name: ${accountName}\n` +
+    `Bank: ${bank.name}\n` +
+    `Account: \`${accountNumber}\`\n\n` +
+    `How much NGN do you want to send each time?\n` +
+    `Example: 50000`,
+    { parse_mode: 'Markdown' }
   );
 });
 
