@@ -120,6 +120,51 @@ function setSession(userId: string, session: ZendSession): void {
   sessions.set(userId, session);
 }
 
+// ─── Auto-Delete Messages ───
+interface TrackedMessage {
+  chatId: number | string;
+  messageId: number;
+  deleteAt: number;
+}
+const messageQueue: TrackedMessage[] = [];
+const MESSAGE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const PIN_TTL_MS = 5 * 1000; // PIN messages: delete after 5 seconds
+
+function trackMessage(chatId: number | string, messageId: number, isPin = false) {
+  messageQueue.push({
+    chatId,
+    messageId,
+    deleteAt: Date.now() + (isPin ? PIN_TTL_MS : MESSAGE_TTL_MS),
+  });
+}
+
+async function deleteMessageNow(chatId: number | string, messageId: number) {
+  try {
+    await bot.telegram.deleteMessage(chatId, messageId);
+  } catch {
+    // Already deleted or permission issue
+  }
+}
+
+// Cleanup loop
+setInterval(async () => {
+  const now = Date.now();
+  const toDelete: TrackedMessage[] = [];
+  for (let i = messageQueue.length - 1; i >= 0; i--) {
+    if (messageQueue[i].deleteAt <= now) {
+      toDelete.push(messageQueue[i]);
+      messageQueue.splice(i, 1);
+    }
+  }
+  for (const m of toDelete) {
+    try {
+      await bot.telegram.deleteMessage(m.chatId, m.messageId);
+    } catch {
+      // Message already deleted or too old
+    }
+  }
+}, 30000); // every 30 seconds
+
 // ─── Services ───
 const walletService = new WalletService(SOLANA_RPC);
 
@@ -392,9 +437,8 @@ const mainMenu = Markup.keyboard([
   ['💰 Balance', '📤 Send'],
   ['💵 Add Naira', '💴 Cash Out'],
   ['🔄 Swap', '📥 Receive'],
-  ['🌉 Bridge', '📅 Schedule'],
-  ['📋 History', '⚙️ Settings'],
-  ['🌐 Community'],
+  ['📅 Schedule', '📋 History'],
+  ['⚙️ Settings', '🌐 Community'],
 ]).resize();
 
 const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
@@ -408,6 +452,20 @@ bot.use(async (ctx, next) => {
   if (userId) {
     (ctx as any).session = getSession(userId);
   }
+  await next();
+});
+
+// Auto-delete all bot messages after 10 minutes
+bot.use(async (ctx, next) => {
+  const originalReply = ctx.reply.bind(ctx);
+  ctx.reply = async function(text: any, extra?: any) {
+    const msg = await originalReply(text, extra);
+    if (msg && typeof msg === 'object' && 'message_id' in msg && ctx.chat) {
+      const isPin = typeof text === 'string' && text.toLowerCase().includes('pin');
+      trackMessage(ctx.chat.id, msg.message_id, isPin);
+    }
+    return msg;
+  };
   await next();
 });
 
@@ -2798,21 +2856,26 @@ async function showReceive(ctx: ZendContext, userId: string) {
   }
 
   msg += `\n*🌉 Cross-Chain (Any Chain)*\n`;
-  msg += `Send from Ethereum, Base, BSC, Arbitrum → get USDT on Solana.\n`;
-  msg += `Tap *🌉 Bridge* to start.\n\n`;
+  msg += `Send USDC/USDT from Ethereum, Base, BSC, Arbitrum, Optimism, Polygon → get USDT on Solana.\n\n`;
 
   msg += `💡 *Crypto arrives instantly*\n`;
   msg += `⏱️ *Naira takes 2–5 minutes* after bank transfer`;
 
-  await ctx.reply(msg, { parse_mode: 'Markdown', ...mainMenu });
+  await ctx.reply(msg, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('🌉 Bridge from Any Chain', 'bridge_start')],
+    ]),
+  });
 }
 
 bot.hears('📥 Receive', async (ctx) => {
   await showReceive(ctx, ctx.from.id.toString());
 });
 
-bot.hears('🌉 Bridge', async (ctx) => {
-  await showBridgeMenu(ctx, ctx.from.id.toString());
+bot.action('bridge_start', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showBridgeMenu(ctx, ctx.from!.id.toString());
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
