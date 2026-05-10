@@ -5,12 +5,27 @@ const rateMap = new Map<string, { count: number; resetAt: number }>();
 
 const LIMIT = 30; // messages per minute
 const WINDOW_MS = 60_000;
+const MAX_RATE_ENTRIES = 5000;
+
+// Cleanup old entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [uid, record] of rateMap) {
+    if (now > record.resetAt) rateMap.delete(uid);
+  }
+}, 300000);
 
 export const rateLimitMiddleware: MiddlewareFn<any> = async (ctx, next) => {
   if (!ctx.from) return next();
 
   const userId = ctx.from.id.toString();
   const now = Date.now();
+
+  // Evict oldest if over limit
+  if (rateMap.size >= MAX_RATE_ENTRIES) {
+    const oldest = rateMap.keys().next().value;
+    if (oldest) rateMap.delete(oldest);
+  }
 
   const record = rateMap.get(userId);
 

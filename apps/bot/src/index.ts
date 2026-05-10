@@ -29,6 +29,7 @@ import {
 } from '@zend/shared';
 
 import crypto from 'crypto';
+import { rateLimitMiddleware } from './middleware/rateLimit.js';
 
 const BOT_TOKEN = process.env.BOT_TOKEN!;
 const SOLANA_RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
@@ -107,18 +108,29 @@ interface ZendContext extends Context {
   session: ZendSession;
 }
 
-// ─── Session Store (in-memory, replace with Redis in production) ───
-const sessions = new Map<string, ZendSession>();
+// ─── Session Store (in-memory with TTL, replace with Redis in production) ───
+const sessions = new Map<string, ZendSession & { _lastAccessed: number }>();
+const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const MAX_SESSIONS = 10000;
 
 function getSession(userId: string): ZendSession {
-  if (!sessions.has(userId)) {
-    sessions.set(userId, { state: ConversationState.IDLE });
+  const existing = sessions.get(userId);
+  if (existing) {
+    existing._lastAccessed = Date.now();
+    return existing;
   }
-  return sessions.get(userId)!;
+  const sess = { state: ConversationState.IDLE, _lastAccessed: Date.now() };
+  sessions.set(userId, sess);
+  // Evict oldest if over limit
+  if (sessions.size > MAX_SESSIONS) {
+    const oldest = sessions.keys().next().value;
+    if (oldest) sessions.delete(oldest);
+  }
+  return sess;
 }
 
 function setSession(userId: string, session: ZendSession): void {
-  sessions.set(userId, session);
+  sessions.set(userId, { ...session, _lastAccessed: Date.now() });
 }
 
 // ─── Auto-Delete Messages ───
@@ -130,8 +142,12 @@ interface TrackedMessage {
 const messageQueue: TrackedMessage[] = [];
 const MESSAGE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const PIN_TTL_MS = 5 * 1000; // PIN messages: delete after 5 seconds
+const MAX_QUEUE_SIZE = 5000;
 
 function trackMessage(chatId: number | string, messageId: number, isPin = false) {
+  if (messageQueue.length >= MAX_QUEUE_SIZE) {
+    messageQueue.shift(); // drop oldest
+  }
   messageQueue.push({
     chatId,
     messageId,
@@ -147,9 +163,10 @@ async function deleteMessageNow(chatId: number | string, messageId: number) {
   }
 }
 
-// Cleanup loop
+// Cleanup loop — messages + sessions
 setInterval(async () => {
   const now = Date.now();
+  // Delete expired messages
   const toDelete: TrackedMessage[] = [];
   for (let i = messageQueue.length - 1; i >= 0; i--) {
     if (messageQueue[i].deleteAt <= now) {
@@ -162,6 +179,12 @@ setInterval(async () => {
       await bot.telegram.deleteMessage(m.chatId, m.messageId);
     } catch {
       // Message already deleted or too old
+    }
+  }
+  // Evict stale sessions
+  for (const [uid, sess] of sessions) {
+    if (now - sess._lastAccessed > SESSION_TTL_MS) {
+      sessions.delete(uid);
     }
   }
 }, 5000); // every 5 seconds
@@ -203,8 +226,12 @@ function generateReferralCode(): string {
   return 'ZND' + Math.random().toString(36).substring(2, 6).toUpperCase();
 }
 
-function encryptPrivateKey(secretKey: Uint8Array): string {
-  const key = crypto.scryptSync(process.env.ENCRYPTION_KEY || 'zend-dev-key', 'salt', 32);
+async function encryptPrivateKey(secretKey: Uint8Array): Promise<string> {
+  const key = await new Promise<Buffer>((resolve, reject) => {
+    crypto.scrypt(process.env.ENCRYPTION_KEY || 'zend-dev-key', 'salt', 32, (err, derived) => {
+      if (err) reject(err); else resolve(derived);
+    });
+  });
   const iv = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const encrypted = Buffer.concat([cipher.update(Buffer.from(secretKey)), cipher.final()]);
@@ -212,8 +239,12 @@ function encryptPrivateKey(secretKey: Uint8Array): string {
   return iv.toString('hex') + ':' + authTag.toString('hex') + ':' + encrypted.toString('hex');
 }
 
-function decryptPrivateKey(encryptedKey: string): Uint8Array {
-  const key = crypto.scryptSync(process.env.ENCRYPTION_KEY || 'zend-dev-key', 'salt', 32);
+async function decryptPrivateKey(encryptedKey: string): Promise<Uint8Array> {
+  const key = await new Promise<Buffer>((resolve, reject) => {
+    crypto.scrypt(process.env.ENCRYPTION_KEY || 'zend-dev-key', 'salt', 32, (err, derived) => {
+      if (err) reject(err); else resolve(derived);
+    });
+  });
   const parts = encryptedKey.split(':');
   if (parts.length !== 3) throw new Error('Invalid encrypted key format');
   const iv = Buffer.from(parts[0], 'hex');
@@ -226,13 +257,17 @@ function decryptPrivateKey(encryptedKey: string): Uint8Array {
 }
 
 // ─── PIN hashing ───
-function hashPin(pin: string): string {
+async function hashPin(pin: string): Promise<string> {
   const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto.pbkdf2Sync(pin, salt, 100000, 32, 'sha256').toString('hex');
-  return salt + ':' + hash;
+  const hash = await new Promise<Buffer>((resolve, reject) => {
+    crypto.pbkdf2(pin, salt, 100000, 32, 'sha256', (err, derived) => {
+      if (err) reject(err); else resolve(derived);
+    });
+  });
+  return salt + ':' + hash.toString('hex');
 }
 
-function verifyPin(pin: string, stored: string): { valid: boolean; isLegacy: boolean } {
+async function verifyPin(pin: string, stored: string): Promise<{ valid: boolean; isLegacy: boolean }> {
   // Legacy: plaintext PIN stored before hashing was introduced
   if (!stored.includes(':')) {
     return { valid: stored === pin, isLegacy: true };
@@ -240,8 +275,12 @@ function verifyPin(pin: string, stored: string): { valid: boolean; isLegacy: boo
   const parts = stored.split(':');
   if (parts.length !== 2) return { valid: false, isLegacy: false };
   const [salt, hash] = parts;
-  const computed = crypto.pbkdf2Sync(pin, salt, 100000, 32, 'sha256').toString('hex');
-  return { valid: computed === hash, isLegacy: false };
+  const computed = await new Promise<Buffer>((resolve, reject) => {
+    crypto.pbkdf2(pin, salt, 100000, 32, 'sha256', (err, derived) => {
+      if (err) reject(err); else resolve(derived);
+    });
+  });
+  return { valid: computed.toString('hex') === hash, isLegacy: false };
 }
 
 function formatBalance(amount: number, symbol: string): string {
@@ -447,6 +486,9 @@ const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
 // ─── Bot ───
 const bot = new Telegraf<ZendContext>(BOT_TOKEN);
 
+// Rate limiting — MUST be first
+bot.use(rateLimitMiddleware);
+
 // Session middleware
 bot.use(async (ctx, next) => {
   const userId = ctx.from?.id.toString();
@@ -594,7 +636,7 @@ bot.command('start', async (ctx) => {
 
   // Generate wallet
   const wallet = walletService.generateWallet();
-  const encryptedKey = encryptPrivateKey(wallet.secretKey);
+  const encryptedKey = await encryptPrivateKey(wallet.secretKey);
   const referralCode = generateReferralCode();
 
   await db.insert(users).values({
@@ -667,7 +709,7 @@ async function doExportKey(ctx: ZendContext, userId: string) {
   }
 
   try {
-    const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
+    const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
 
     const msg = await ctx.reply(
       `🔑 *Secret Recovery Code*\n\n` +
@@ -1690,7 +1732,7 @@ bot.on(message('text'), async (ctx, next) => {
       return;
     }
 
-    const hashed = hashPin(pin);
+    const hashed = await hashPin(pin);
     await db.update(users)
       .set({ transactionPin: hashed })
       .where(eq(users.id, userId));
@@ -1715,7 +1757,7 @@ bot.on(message('text'), async (ctx, next) => {
       return;
     }
 
-    const result = verifyPin(pin, user[0].transactionPin);
+    const result = await verifyPin(pin, user[0].transactionPin);
     if (!result.valid) {
       await ctx.reply('❌ Incorrect PIN. Please try again.', cancelKeyboard);
       return;
@@ -1724,7 +1766,7 @@ bot.on(message('text'), async (ctx, next) => {
     // Auto-migrate legacy plaintext PIN to hashed
     if (result.isLegacy) {
       await db.update(users)
-        .set({ transactionPin: hashPin(pin) })
+        .set({ transactionPin: await hashPin(pin) })
         .where(eq(users.id, userId));
       console.log(`[PIN] Migrated plaintext PIN to hashed for user ${userId}`);
     }
@@ -2287,9 +2329,15 @@ async function showVirtualAccount(
   }
   const usdtAmount = fiatAmount / _rate;
 
-  // Check if we have a cached virtual account to reuse
+  // Check if we have a cached virtual account to reuse (max 24h old)
   let virtualAccount: any = user[0]?.virtualAccount;
-  const hasCachedVA = virtualAccount?.accountNumber && virtualAccount?.bankName;
+  const VA_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+  const vaAge = virtualAccount?.createdAt ? Date.now() - new Date(virtualAccount.createdAt).getTime() : Infinity;
+  const hasCachedVA = virtualAccount?.accountNumber && virtualAccount?.bankName && vaAge < VA_MAX_AGE_MS;
+
+  const webhookUrl = process.env.WEBHOOK_BASE_URL
+    ? `${process.env.WEBHOOK_BASE_URL}/webhooks/paj`
+    : 'https://example.com/webhook';
 
   if (!hasCachedVA) {
     const loadingVA = await showLoading(ctx, 'Creating your virtual bank account...');
@@ -2300,6 +2348,7 @@ async function showVirtualAccount(
         recipient: walletAddress,
         mint: SOLANA_TOKENS.USDT.mint,
         chain: Chain.SOLANA,
+        webhookURL: webhookUrl,
       }, sessionToken);
 
       virtualAccount = {
@@ -2478,7 +2527,7 @@ async function executeSendCore(
           }
           const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
           if (!serializedTx) throw new Error('Failed to build swap transaction.');
-          const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
+          const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
           const keypair = Keypair.fromSecretKey(secretKey);
           const swapTxHash = await walletService.signAndSendSerialized(keypair, serializedTx);
           console.log('[Jupiter] Auto-swap USDC→USDT:', swapTxHash);
@@ -2540,7 +2589,7 @@ async function executeSendCore(
         );
       }
 
-      const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
+      const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
       const keypair = Keypair.fromSecretKey(secretKey);
       solanaTxHash = await walletService.sendSplToken(
         keypair, order.address, fromMint, order.amount, fromToken.decimals,
@@ -2695,7 +2744,7 @@ async function executeSwap(
     }
 
     // Sign and send
-    const secretKey = decryptPrivateKey(user[0].walletEncryptedKey);
+    const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
     const keypair = Keypair.fromSecretKey(secretKey);
 
     await ctx.replyWithChatAction('typing');
@@ -4140,7 +4189,13 @@ function startWebhookServer(botInstance: Telegraf<any>) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 // ─── Scheduled Transfer Executor ───
+let _scheduledRunning = false;
 async function runScheduledTransfers() {
+  if (_scheduledRunning) {
+    console.log('[Schedule] Skipping: previous run still in progress');
+    return;
+  }
+  _scheduledRunning = true;
   try {
     const now = new Date();
     const due = await db.select().from(scheduledTransfers)
@@ -4244,6 +4299,8 @@ async function runScheduledTransfers() {
     }
   } catch (err) {
     console.error('[Schedule] Executor error:', err);
+  } finally {
+    _scheduledRunning = false;
   }
 }
 
