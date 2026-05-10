@@ -167,7 +167,8 @@ export class WalletService {
     mintAddress: string,
     amount: number,
     decimals: number,
-    additionalInstructions?: TransactionInstruction[]
+    additionalInstructions?: TransactionInstruction[],
+    totalRequiredAmount?: number
   ): Promise<string> {
     const mintPubkey = new PublicKey(mintAddress);
     const recipientPubkey = new PublicKey(recipientAddress);
@@ -182,8 +183,9 @@ export class WalletService {
       throw new Error(`You don't have a ${mintAddress.slice(0, 6)}... token account yet. Please deposit tokens first.`);
     }
 
-    if (senderBalance < amount) {
-      throw new Error(`Insufficient balance. You have ${senderBalance.toFixed(decimals)} but need ${amount.toFixed(decimals)}.`);
+    const required = totalRequiredAmount ?? amount;
+    if (senderBalance < required) {
+      throw new Error(`Insufficient balance. You have ${senderBalance.toFixed(decimals)} but need ${required.toFixed(decimals)}.`);
     }
 
     const rawAmount = BigInt(Math.round(amount * Math.pow(10, decimals)));

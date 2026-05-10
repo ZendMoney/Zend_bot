@@ -2542,10 +2542,6 @@ async function executeSendCore(
         }
       }
 
-      if (tokenBalance < order.amount) {
-        throw new Error(`Insufficient ${fromSymbol} balance. You have: ${tokenBalance.toFixed(2)}, need: ${order.amount.toFixed(2)}`);
-      }
-
       // Gas sponsorship: fund SOL if user has none
       const gasSponsored = await fundSolIfNeeded(user[0].walletAddress);
       if (!gasSponsored) {
@@ -2562,6 +2558,11 @@ async function executeSendCore(
         const sponsorshipFee = txData.amountUsdt * (GAS_SPONSORSHIP_FEE_BPS / 10000); // 0.5% of amount
         totalFeeUsdt += sponsorshipFee;
         console.log('[Gas] Sponsorship fee added:', sponsorshipFee.toFixed(6), 'USDT. Total fee:', totalFeeUsdt.toFixed(6));
+      }
+
+      const totalRequired = order.amount + totalFeeUsdt;
+      if (tokenBalance < totalRequired) {
+        throw new Error(`Insufficient ${fromSymbol} balance. You have: ${tokenBalance.toFixed(2)}, need: ${totalRequired.toFixed(2)} (includes ${order.amount.toFixed(2)} transfer + ${totalFeeUsdt.toFixed(2)} fee).`);
       }
 
       // Build fee transfer instructions to bundle with main send
@@ -2593,7 +2594,8 @@ async function executeSendCore(
       const keypair = Keypair.fromSecretKey(secretKey);
       solanaTxHash = await walletService.sendSplToken(
         keypair, order.address, fromMint, order.amount, fromToken.decimals,
-        feeInstructions.length > 0 ? feeInstructions : undefined
+        feeInstructions.length > 0 ? feeInstructions : undefined,
+        totalRequired
       );
       console.log(`[Solana] ${fromSymbol} sent to PAJ (+ fee bundled):`, solanaTxHash);
 
