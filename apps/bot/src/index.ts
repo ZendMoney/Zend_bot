@@ -2012,7 +2012,7 @@ async function saveScheduledTransfer(userId: string, sd: NonNullable<ZendSession
   else if (freq === 'weekly') nextRunAt.setDate(nextRunAt.getDate() + 7);
   else if (freq === 'monthly') nextRunAt.setMonth(nextRunAt.getMonth() + 1);
 
-  await db.insert(scheduledTransfers).values({
+  const result = await db.insert(scheduledTransfers).values({
     userId,
     recipientBankAccountId: sd.recipientBankAccountId!,
     amountNgn: sd.amountNgn!.toString(),
@@ -2020,6 +2020,14 @@ async function saveScheduledTransfer(userId: string, sd: NonNullable<ZendSession
     startAt,
     nextRunAt,
     isActive: true,
+  }).returning();
+
+  console.log(`[Schedule] Created schedule #${result[0]?.id} for user ${userId}:`, {
+    recipientBankAccountId: sd.recipientBankAccountId,
+    amountNgn: sd.amountNgn,
+    frequency: freq,
+    startAt,
+    nextRunAt,
   });
 }
 
@@ -3335,37 +3343,57 @@ bot.action('cancel_schedule', async (ctx) => {
 });
 
 bot.action('schedule_view', async (ctx) => {
-  await ctx.answerCbQuery();
-  const userId = ctx.from!.id.toString();
+  try {
+    await ctx.answerCbQuery();
+    const userId = ctx.from!.id.toString();
 
-  const schedules = await db.select().from(scheduledTransfers)
-    .where(eq(scheduledTransfers.userId, userId))
-    .orderBy(scheduledTransfers.nextRunAt);
+    const schedules = await db.select().from(scheduledTransfers)
+      .where(eq(scheduledTransfers.userId, userId))
+      .orderBy(scheduledTransfers.nextRunAt);
 
-  if (schedules.length === 0) {
-    await ctx.editMessageText('📅 You have no scheduled transfers.');
-    await ctx.reply('Menu:', mainMenu);
-    return;
-  }
+    console.log(`[Schedule] View requested by user ${userId}. Found ${schedules.length} schedules:`, schedules.map(s => ({ id: s.id, active: s.isActive, freq: s.frequency, next: s.nextRunAt })));
 
-  let msg = `📅 *Your Scheduled Transfers*\n\n`;
-  const rows: any[] = [];
-
-  for (const s of schedules) {
-    const status = s.isActive ? '🟢 Active' : '🔴 Paused';
-    const next = s.nextRunAt ? s.nextRunAt.toLocaleDateString('en-NG') : '—';
-    msg += `${status} • ${formatNgn(Number(s.amountNgn))} • ${s.frequency}\n`;
-    msg += `   Next: ${next}  •  Runs: ${s.runCount}\n\n`;
-    if (s.isActive) {
-      rows.push([Markup.button.callback(`❌ Cancel #${s.id}`, `schedule_cancel:${s.id}`)]);
+    if (schedules.length === 0) {
+      await ctx.editMessageText('📅 You have no scheduled transfers.');
+      await ctx.reply('Menu:', mainMenu);
+      return;
     }
-  }
 
-  await ctx.editMessageText(msg, { parse_mode: 'Markdown' });
-  if (rows.length > 0) {
-    await ctx.reply('Tap to cancel:', Markup.inlineKeyboard(rows));
+    let msg = `📅 *Your Scheduled Transfers*\n\n`;
+    const rows: any[] = [];
+
+    for (const s of schedules) {
+      const status = s.isActive ? '🟢 Active' : '🔴 Paused';
+      let next = '—';
+      try {
+        if (s.nextRunAt) {
+          const d = s.nextRunAt instanceof Date ? s.nextRunAt : new Date(s.nextRunAt as any);
+          next = d.toLocaleDateString('en-NG');
+        }
+      } catch (e) {
+        console.error(`[Schedule] Failed to format nextRunAt for schedule ${s.id}:`, e);
+      }
+      msg += `${status} • ${formatNgn(Number(s.amountNgn))} • ${s.frequency}\n`;
+      msg += `   Next: ${next}  •  Runs: ${s.runCount}\n\n`;
+      if (s.isActive) {
+        rows.push([Markup.button.callback(`❌ Cancel #${s.id}`, `schedule_cancel:${s.id}`)]);
+      }
+    }
+
+    // Telegram message text limit is 4096 chars — truncate if needed
+    if (msg.length > 4000) {
+      msg = msg.substring(0, 4000) + '\n\n... (more schedules — contact support if needed)';
+    }
+
+    await ctx.editMessageText(msg, { parse_mode: 'Markdown' });
+    if (rows.length > 0) {
+      await ctx.reply('Tap to cancel:', Markup.inlineKeyboard(rows));
+    }
+    await ctx.reply('Menu:', mainMenu);
+  } catch (err) {
+    console.error('[Schedule] Error in schedule_view:', err);
+    await ctx.reply('❌ Something went wrong loading your schedules. Please try again.', mainMenu);
   }
-  await ctx.reply('Menu:', mainMenu);
 });
 
 bot.action(/schedule_cancel:(\d+)/, async (ctx) => {
@@ -3373,9 +3401,14 @@ bot.action(/schedule_cancel:(\d+)/, async (ctx) => {
   const userId = ctx.from!.id.toString();
   const scheduleId = parseInt(ctx.match[1], 10);
 
-  await db.update(scheduledTransfers)
+  console.log(`[Schedule] Cancel requested by user ${userId} for schedule #${scheduleId}`);
+
+  const result = await db.update(scheduledTransfers)
     .set({ isActive: false })
-    .where(and(eq(scheduledTransfers.id, scheduleId), eq(scheduledTransfers.userId, userId)));
+    .where(and(eq(scheduledTransfers.id, scheduleId), eq(scheduledTransfers.userId, userId)))
+    .returning();
+
+  console.log(`[Schedule] Cancel result for #${scheduleId}:`, result.length > 0 ? 'success' : 'not found');
 
   await ctx.editMessageText(`✅ Scheduled transfer #${scheduleId} has been cancelled.`);
   await ctx.reply('Menu:', mainMenu);
