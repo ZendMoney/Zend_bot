@@ -1,10 +1,33 @@
 /**
  * NLP Service for Zend Bot
  * Parses natural language commands for Nigerian crypto payments
- * Uses local regex patterns + Kimi (Moonshot) API for complex cases
+ *
+ * ARCHITECTURE:
+ * 1. Local regex parser (fast, zero latency, works offline)
+ * 2. QVAC local LLM fallback (private, no API cost, sovereign AI)
+ *
+ * Previously used Kimi (Moonshot) cloud API — now fully local via QVAC.
  */
 
 import { NIGERIAN_BANKS } from '@zend/shared';
+import { callQVACLLM } from './qvac/llm.js';
+import { transcribeWithQVAC } from './qvac/transcribe.js';
+import { extractTextFromImage, parseReceiptImage, type ParsedReceipt } from './qvac/ocr.js';
+import { generateEmbedding, indexTransaction, searchTransactions } from './qvac/embed.js';
+import { translateForProcessing, translateText, detectLanguage, getLangName, type SupportedLang } from './qvac/translate.js';
+import {
+  COMMAND_PARSER_PROMPT,
+  MENU_PARSE_PROMPT,
+  CHAT_SYSTEM_PROMPT,
+  VOICE_CONFIRM_PROMPT,
+  RECEIPT_PARSER_PROMPT,
+  TX_SUMMARY_PROMPT,
+} from './qvac/prompts.js';
+
+// ─── Re-export QVAC capabilities for upstream use ───
+export { extractTextFromImage, parseReceiptImage, type ParsedReceipt } from './qvac/ocr.js';
+export { generateEmbedding, indexTransaction, searchTransactions } from './qvac/embed.js';
+export { translateText, detectLanguage, translateForProcessing, getLangName, type SupportedLang } from './qvac/translate.js';
 
 // ─── Types ───
 
@@ -272,91 +295,28 @@ export function parseLocal(text: string): ParsedCommand {
   };
 }
 
-// ─── Kimi Coding API (same pattern as snipey_v2) ───
+// ─── QVAC Local LLM Fallback ───
 
-const KIMI_API_KEY = process.env.KIMI_API_KEY || process.env.OPENAI_API_KEY;
-const KIMI_BASE_URL = process.env.KIMI_BASE_URL || 'https://api.kimi.com/coding';
-const KIMI_MODEL = process.env.KIMI_MODEL || 'kimi-for-coding';
-
-// Normalize base URL — strip trailing /v1 if present so we don't get /v1/v1/messages
-function getKimiBaseUrl(): string {
-  let url = KIMI_BASE_URL;
-  if (url.endsWith('/v1')) {
-    url = url.slice(0, -3);
-  }
-  return url.replace(/\/$/, '');
-}
-
-if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
-  console.warn('[NLP] ⚠️  KIMI_API_KEY not set — AI features disabled');
-}
-
-function getKimiResponse(data: any): string {
-  // Anthropic-style response: content[0].text
-  const text = data?.content?.[0]?.text;
-  if (text) return text;
-  // Fallback to OpenAI-style
-  return data?.choices?.[0]?.message?.content || '';
-}
-
-async function callKimi(systemPrompt: string, userPrompt: string, temperature: number, maxTokens: number): Promise<string | null> {
-  if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
-    return null;
-  }
-
-  try {
-    const response = await fetch(`${getKimiBaseUrl()}/v1/messages`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${KIMI_API_KEY}`,
-        'User-Agent': 'claude-code/0.1.0',
-      },
-      body: JSON.stringify({
-        model: KIMI_MODEL,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userPrompt }],
-        temperature,
-        max_tokens: maxTokens,
-      }),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text().catch(() => '');
-      console.error(`[Kimi] API error ${response.status}: ${errText.slice(0, 200)}`);
-      return null;
-    }
-
-    const data: any = await response.json();
-    return getKimiResponse(data) || null;
-  } catch (err) {
-    console.error('[Kimi] API call failed:', err);
-    return null;
-  }
+async function callQVAC(systemPrompt: string, userPrompt: string, temperature: number, maxTokens: number): Promise<string | null> {
+  return callQVACLLM({
+    systemPrompt,
+    userPrompt,
+    temperature,
+    maxTokens,
+    jsonMode: false,
+  });
 }
 
 // ─── Command Parser ───
 
-const SYSTEM_PROMPT = `You are a payment command parser for a Nigerian crypto wallet bot.
-Extract the following from user messages:
-- intent: "send" | "add_naira" | "cash_out" | "balance" | "unknown"
-- amount: number (always in NGN, convert "50k" to 50000)
-- recipientName: person or business name
-- bankName: full bank name
-- bankCode: one of: GTB, FIRST, UBA, ZENITH, ACCESS, ECOBANK, FIDELITY, FCMB, WEMA, POLARIS, STERLING, UNITY, JAIZ, KEYSTONE, HERITAGE, STANBIC, UNION, OPY, KUD, PAL, MON, PAG, VFD, CAR, FAI, BRA
-- accountNumber: 10 digit Nigerian bank account number
-- walletAddress: Solana wallet address (32-44 chars)
-- fromToken: "USDT" | "USDC" | "SOL" — the crypto token user wants to send FROM. Default USDT unless they mention USDC or SOL.
-
-Respond ONLY with valid JSON. No markdown, no explanation.`;
-
 /**
- * Parse using Kimi API (for complex/voice transcribed text)
+ * Parse using QVAC local LLM (for complex/voice transcribed text)
+ * Falls back to local parser if QVAC is unavailable.
  */
-export async function parseWithKimi(text: string): Promise<ParsedCommand> {
-  const content = await callKimi(SYSTEM_PROMPT, text, 0.1, 500);
+export async function parseWithQVAC(text: string): Promise<ParsedCommand> {
+  const content = await callQVAC(COMMAND_PARSER_PROMPT, text, 0.1, 500);
   if (!content) {
-    console.log('[NLP] No Kimi API key or call failed, falling back to local parser');
+    console.log('[NLP] QVAC LLM unavailable, falling back to local parser');
     return parseLocal(text);
   }
 
@@ -378,23 +338,23 @@ export async function parseWithKimi(text: string): Promise<ParsedCommand> {
       raw: text,
     };
   } catch (err) {
-    console.error('[NLP] Kimi parse failed:', err);
+    console.error('[NLP] QVAC parse failed:', err);
     return parseLocal(text);
   }
 }
 
 /**
- * Main parse function - tries local first, falls back to Kimi
+ * Main parse function - tries local first, falls back to QVAC LLM
  */
-export async function parseCommand(text: string, useKimi = false): Promise<ParsedCommand> {
-  if (useKimi) {
-    return parseWithKimi(text);
+export async function parseCommand(text: string, useAI = false): Promise<ParsedCommand> {
+  if (useAI) {
+    return parseWithQVAC(text);
   }
   
   const local = parseLocal(text);
   
-  if (local.intent === 'unknown' && KIMI_API_KEY && KIMI_API_KEY !== 'your_openai_key') {
-    return parseWithKimi(text);
+  if (local.intent === 'unknown') {
+    return parseWithQVAC(text);
   }
   
   return local;
@@ -414,46 +374,8 @@ export interface MenuParseResult {
   message?: string;
 }
 
-const MENU_PARSE_PROMPT = `You are an intelligent input parser for a Nigerian crypto payment bot.
-The user is in the middle of a send-money flow and just typed free text.
-
-Your job: extract structured data from their message. Be smart about Nigerian context.
-
-Supported banks and codes:
-GTB=GTBank, FIRST=FirstBank, UBA=UBA, ZENITH=Zenith, ACCESS=Access Bank,
-ECOBANK=Ecobank, FIDELITY=Fidelity, FCMB=FCMB, WEMA=Wema, POLARIS=Polaris,
-STERLING=Sterling, UNITY=Unity, JAIZ=Jaiz, KEYSTONE=Keystone, HERITAGE=Heritage,
-STANBIC=Stanbic IBTC, UNION=Union Bank, OPY=OPay, MON=Moniepoint, KUD=Kuda,
-PAL=PalmPay, PAG=Paga, VFD=VFD, CAR=Carbon, FAI=FairMoney, BRA=Branch
-
-Rules:
-- amount: convert "2k" to 2000, "50k" to 50000, "1.5k" to 1500, "two thousand" to 2000
-- bankCode: return the 2-4 letter code above, NEVER make up codes. If bank is unclear, leave null.
-- accountNumber: must be exactly 10 digits. Nigerian NUBAN format.
-- recipientName: the person's name. If only one word and it's a bank name, that's NOT a name.
-- fromToken: "USDC" if they mention USDC/usdc, "SOL" if SOL/sol, else "USDT"
-- If ANY field is missing or unclear, set success:false and write a friendly, conversational message asking for what's missing.
-
-Response format — JSON only:
-{
-  "success": true | false,
-  "amount": number | null,
-  "recipientName": string | null,
-  "bankCode": string | null,
-  "bankName": string | null,
-  "accountNumber": string | null,
-  "fromToken": "USDT" | "USDC" | "SOL" | null,
-  "message": "Your conversational response to the user."
-}
-
-If success is false, message should be warm and helpful, like a Nigerian friend. Use light Pidgin when natural. Never be robotic.`;
-
 export async function parseMenuInputWithAI(text: string): Promise<MenuParseResult | null> {
-  if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
-    return null;
-  }
-
-  const content = await callKimi(MENU_PARSE_PROMPT, text, 0.1, 600);
+  const content = await callQVAC(MENU_PARSE_PROMPT, text, 0.1, 600);
   if (!content) return null;
 
   try {
@@ -505,93 +427,30 @@ export async function parseMenuInputWithAI(text: string): Promise<MenuParseResul
 
 // ─── Conversational AI (Smart Assistant) ───
 
-const CHAT_SYSTEM_PROMPT = `You are Zend, a friendly Nigerian payment assistant inside a Telegram bot.
-
-Your personality: Warm, concise, helpful. Speak like a knowledgeable Nigerian friend. Light Pidgin like "No wahala" or "Sharp sharp" is fine when natural.
-
-EXACT features Zend has (do NOT mention anything else):
-1. Check balance — Dollars (USDT/USDC) and SOL with live Naira rates
-2. Add Naira — bank transfer to a virtual account, get Dollars in your account
-3. Send to Nigerian bank — any bank (GTB, UBA, Access, OPay, Kuda, etc.)
-4. Receive money — crypto address for direct deposit + virtual bank account
-5. Convert currency — exchange SOL ↔ USDT ↔ USDC
-6. Receive from other apps — send Dollars from Binance, MetaMask, Trust Wallet → receive in your Zend account
-7. Transaction history
-8. Voice commands — send a voice note
-
-EXACT features Zend does NOT have (never mention these):
-- NO airtime recharge
-- NO data bundles
-- NO bill payments (electricity, cable, etc.)
-- NO loans or borrowing
-- NO betting or gambling
-- NO stocks or investment trading
-
-If asked about fees: 1% Zend fee + small network fee. If you don't have enough for the network fee, we cover it and add 0.5% to the Zend fee (so 1.5% total).
-If asked about security: your account is protected with encryption and PIN. We handle identity verification for compliance.
-Keep replies under 150 words. End with a nudge to try something real.`;
-
 export interface ChatReply {
   reply: string;
   suggestedAction?: string;
 }
 
 /**
- * Get a conversational reply from Kimi when the user's message is not a command.
+ * Get a conversational reply from QVAC local LLM when the user's message is not a command.
  */
-export async function chatWithKimi(text: string): Promise<ChatReply | null> {
-  const reply = await callKimi(CHAT_SYSTEM_PROMPT, text, 0.7, 400);
+export async function chatWithAI(text: string): Promise<ChatReply | null> {
+  const reply = await callQVAC(CHAT_SYSTEM_PROMPT, text, 0.7, 400);
   if (!reply) return null;
   return { reply: reply.trim() };
 }
 
-// ─── Voice Transcription (Local whisper.cpp — same as OpenClaw) ───
+// Backward-compatible alias
+export { chatWithAI as chatWithKimi };
 
-import { transcribeWithWhisper } from './whisper/index.js';
+// ─── Voice Transcription (QVAC Whisper) ───
 
 export async function transcribeVoice(audioBuffer: Buffer): Promise<string> {
-  return transcribeWithWhisper(audioBuffer);
+  return transcribeWithQVAC(audioBuffer);
 }
 
 // ─── Voice Confirmation AI ───
-
-const VOICE_CONFIRM_PROMPT = `You are Zend, a Nigerian crypto payment assistant. A user sent a voice note.
-
-Your job:
-1. Understand what they want to do
-2. Extract relevant details
-3. Respond in a friendly, conversational way
-
-Supported intents:
-- "balance" — check wallet balance
-- "add_naira" — deposit NGN (extract amount if mentioned)
-- "send" — send money to bank (extract amount, recipient name, bank, account number)
-- "cash_out" — withdraw to bank (same as send)
-- "receive" — show how to receive money
-- "history" — show transaction history
-- "swap" — swap tokens
-- "settings" — open settings
-- "chat" — general conversation
-
-Response format — JSON only:
-{
-  "intent": "balance" | "add_naira" | "send" | "cash_out" | "receive" | "history" | "swap" | "settings" | "chat",
-  "amount": number | null,
-  "recipientName": string | null,
-  "bankName": string | null,
-  "bankCode": string | null,
-  "accountNumber": string | null,
-  "walletAddress": string | null,
-  "message": "Your friendly response to the user.",
-  "needsConfirm": true | false
-}
-
-Rules:
-- "needsConfirm": true ONLY for send/cash_out with BOTH amount AND (accountNumber OR walletAddress)
-- "message" should be warm and conversational, in Nigerian style
-- If send/cash_out missing details, set needsConfirm:false and ask what's missing
-- For balance/receive/history/swap/settings: set needsConfirm:false, just acknowledge
-- Never make up details. If unsure, ask.`;
 
 export interface VoiceAnalysis {
   intent: string;
@@ -606,14 +465,10 @@ export interface VoiceAnalysis {
 }
 
 /**
- * Analyze transcribed voice text with Kimi — returns confirmation message + extracted data
+ * Analyze transcribed voice text with QVAC — returns confirmation message + extracted data
  */
-export async function analyzeVoiceWithKimi(text: string): Promise<VoiceAnalysis | null> {
-  if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
-    return null;
-  }
-
-  const content = await callKimi(VOICE_CONFIRM_PROMPT, `User's voice note: "${text}"`, 0.3, 600);
+export async function analyzeVoiceWithAI(text: string): Promise<VoiceAnalysis | null> {
+  const content = await callQVAC(VOICE_CONFIRM_PROMPT, `User's voice note: "${text}"`, 0.3, 600);
   if (!content) return null;
 
   try {
@@ -631,7 +486,92 @@ export async function analyzeVoiceWithKimi(text: string): Promise<VoiceAnalysis 
       needsConfirm: parsed.needsConfirm || false,
     };
   } catch (err) {
-    console.error('[Voice] Kimi analysis parse failed:', err);
+    console.error('[Voice] QVAC analysis parse failed:', err);
     return null;
   }
+}
+
+// Backward-compatible alias
+export { analyzeVoiceWithAI as analyzeVoiceWithKimi };
+
+// ─── Receipt OCR + LLM Parser ───
+
+/**
+ * Parse a receipt/screenshot using QVAC OCR + LLM for structured extraction.
+ * Two-stage pipeline: OCR extracts text → LLM parses into JSON.
+ */
+export async function parseReceiptWithQVAC(imageBuffer: Buffer): Promise<ParsedReceipt | null> {
+  // Stage 1: OCR
+  let rawText: string;
+  try {
+    rawText = await extractTextFromImage(imageBuffer);
+  } catch (err: any) {
+    console.error('[Receipt] OCR failed:', err.message);
+    return null;
+  }
+
+  if (!rawText || rawText.length < 10) {
+    console.log('[Receipt] OCR returned too little text');
+    return null;
+  }
+
+  // Stage 2: LLM parses OCR text
+  const prompt = `OCR text from receipt:\n${rawText}\n\nExtract payment details as JSON.`;
+  const content = await callQVACLLM({
+    systemPrompt: RECEIPT_PARSER_PROMPT,
+    userPrompt: prompt,
+    temperature: 0.1,
+    maxTokens: 300,
+    jsonMode: true,
+  });
+
+  if (!content) {
+    // Fallback to regex parser
+    return parseReceiptImage(imageBuffer).catch(() => null);
+  }
+
+  try {
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+
+    return {
+      amount: parsed.amount ? Number(parsed.amount) : undefined,
+      bankName: parsed.bankName || undefined,
+      accountNumber: sanitizeAccountNumber(parsed.accountNumber) || undefined,
+      recipientName: parsed.recipientName || undefined,
+      rawText,
+    };
+  } catch (err) {
+    console.error('[Receipt] LLM parse failed:', err);
+    return { rawText };
+  }
+}
+
+// ─── Semantic Transaction Search ───
+
+/**
+ * Ask a natural language question about transaction history.
+ * Uses QVAC embeddings for semantic search + LLM for summarization.
+ */
+export async function askTransactionQuestion(
+  userId: string,
+  question: string
+): Promise<string | null> {
+  const results = await searchTransactions(userId, question, 8);
+  if (results.length === 0) {
+    return null;
+  }
+
+  const context = results
+    .map((r, i) => `${i + 1}. ${r.text}${r.metadata?.amount ? ` (₦${r.metadata.amount})` : ''}`)
+    .join('\n');
+
+  const summary = await callQVACLLM({
+    systemPrompt: TX_SUMMARY_PROMPT,
+    userPrompt: `User question: "${question}"\n\nMatching transactions:\n${context}`,
+    temperature: 0.7,
+    maxTokens: 300,
+  });
+
+  return summary;
 }

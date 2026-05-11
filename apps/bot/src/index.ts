@@ -19,7 +19,12 @@ import { db, checkConnection } from '@zend/db';
 import { users, transactions, savedBankAccounts, scheduledTransfers } from '@zend/db';
 import { eq, sql, and } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
-import { parseCommand, transcribeVoice, chatWithKimi, analyzeVoiceWithKimi, parseMenuInputWithAI, type ParsedCommand } from './services/nlp.js';
+import {
+  parseCommand, transcribeVoice, chatWithAI, analyzeVoiceWithAI,
+  parseMenuInputWithAI, parseReceiptWithQVAC, askTransactionQuestion,
+  indexTransaction, type ParsedCommand,
+} from './services/nlp.js';
+import { initQVAC, getQVACStatus } from './services/qvac/index.js';
 import type { PAJClient } from '@zend/paj-client';
 import {
   ConversationState,
@@ -1058,6 +1063,10 @@ bot.on(message('text'), async (ctx, next) => {
       });
 
       const chainDisplay = CHAIN_NAMES[bd.sourceChain] || bd.sourceChain;
+      await indexTransaction(userId, txId, `Received crypto from ${chainDisplay} bridge`, {
+        amount,
+        chain: chainDisplay,
+      });
       const tokenDecimals = TOKEN_DECIMALS[bd.sourceChain]?.[bd.token] || 6;
       const actualFeeRaw = intent.fees_in_asset_token || intent.app_fee_in_asset_token;
       const actualFee = actualFeeRaw ? (Number(actualFeeRaw) / Math.pow(10, tokenDecimals)).toFixed(6) : null;
@@ -1495,6 +1504,25 @@ bot.on(message('text'), async (ctx, next) => {
 
   // ─── NLP: Parse natural language when IDLE ───
   if (session.state === ConversationState.IDLE) {
+    // ─── Semantic Transaction Search (QVAC Embeddings) ───
+    const historyQueryPatterns = /\b(how much did i send|how much did i|did i send|transactions? with|payments? to|money i sent|what did i pay|show me my|search my)\b/i;
+    if (historyQueryPatterns.test(text)) {
+      const loading = await showLoading(ctx, 'Searching your history with QVAC...');
+      try {
+        const answer = await askTransactionQuestion(userId, text);
+        if (answer) {
+          await finishLoading(ctx, loading.message_id, `🔍 *Smart Search*\n\n${answer}`, 'Markdown');
+        } else {
+          await finishLoading(ctx, loading.message_id, '🔍 No matching transactions found. Try a different question or check your 📋 History.');
+        }
+      } catch (err: any) {
+        console.error('[Search] Error:', err);
+        await finishLoading(ctx, loading.message_id, '❌ Search failed. Please try 📋 History instead.');
+      }
+      await ctx.reply('Menu:', mainMenu);
+      return;
+    }
+
     const parsed = await parseCommand(text);
     console.log('[NLP] Parsed:', parsed);
 
@@ -1507,7 +1535,7 @@ bot.on(message('text'), async (ctx, next) => {
 
         // Use Kimi for conversational responses when details are missing
         if (!parsed.amount) {
-          const reply = await chatWithKimi(
+          const reply = await chatWithAI(
             `The user said: "${text}". They want to send money but didn't specify an amount. ` +
             `Respond conversationally in Nigerian Pidgin style. Ask how much they want to send.`
           );
@@ -1516,7 +1544,7 @@ bot.on(message('text'), async (ctx, next) => {
           return;
         }
         if (parsed.amount < 100) {
-          const reply = await chatWithKimi(
+          const reply = await chatWithAI(
             `The user wants to send ${parsed.amount} Naira. Minimum is ₦100. ` +
             `Respond in Nigerian Pidgin style telling them the minimum.`
           );
@@ -1525,7 +1553,7 @@ bot.on(message('text'), async (ctx, next) => {
         }
         if (!parsed.accountNumber && !parsed.walletAddress) {
           // We have amount + recipient name but missing bank/account
-          const reply = await chatWithKimi(
+          const reply = await chatWithAI(
             `The user said: "${text}". I understood they want to send ${formatNgn(parsed.amount)} to ${parsed.recipientName || 'someone'}. ` +
             `But I need the bank name and account number. Respond conversationally in Nigerian Pidgin style.`
           );
@@ -1711,7 +1739,7 @@ bot.on(message('text'), async (ctx, next) => {
 
       default: {
         // Try conversational AI for unknown intents
-        const aiReply = await chatWithKimi(text);
+        const aiReply = await chatWithAI(text);
         if (aiReply) {
           await ctx.reply(aiReply.reply, mainMenu);
         } else {
@@ -2044,28 +2072,6 @@ bot.on(message('voice'), async (ctx) => {
     return;
   }
 
-  // Check whisper.cpp is available
-  try {
-    const { hasWhisper } = await import('./services/whisper/index.js');
-    if (!hasWhisper()) {
-      await ctx.reply(
-        '🎙️ *Voice Notes*\n\n' +
-        'Voice transcription is being set up.\n' +
-        'For now, please type your command or use the menu below.',
-        { parse_mode: 'Markdown', ...mainMenu }
-      );
-      return;
-    }
-  } catch {
-    await ctx.reply(
-      '🎙️ *Voice Notes*\n\n' +
-      'Voice transcription is not ready yet.\n' +
-      'Please type your command or use the menu below.',
-      { parse_mode: 'Markdown', ...mainMenu }
-    );
-    return;
-  }
-
   const loadingVoice = await showLoading(ctx, 'Listening to your voice note...');
 
   try {
@@ -2074,7 +2080,7 @@ bot.on(message('voice'), async (ctx) => {
     const response = await fetch(fileLink.toString());
     const audioBuffer = Buffer.from(await response.arrayBuffer());
 
-    await updateLoading(ctx, loadingVoice.message_id, 'Transcribing with Deepgram...');
+    await updateLoading(ctx, loadingVoice.message_id, 'Transcribing with QVAC Whisper...');
 
     // Step 1: STT
     const text = await transcribeVoice(audioBuffer);
@@ -2085,10 +2091,10 @@ bot.on(message('voice'), async (ctx) => {
       return;
     }
 
-    await updateLoading(ctx, loadingVoice.message_id, 'Analyzing with Kimi...');
+    await updateLoading(ctx, loadingVoice.message_id, 'Analyzing with QVAC AI...');
 
-    // Step 2: Kimi analysis + confirmation
-    const analysis = await analyzeVoiceWithKimi(text);
+    // Step 2: QVAC LLM analysis + confirmation
+    const analysis = await analyzeVoiceWithAI(text);
 
     if (!analysis) {
       await finishLoading(ctx, loadingVoice.message_id, `📝 *You said:* "${text}"\n\nI understood you, but I need a bit more info. Can you type it out?`, 'Markdown');
@@ -2301,6 +2307,90 @@ bot.action('voice_confirm_no', async (ctx) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// 📸 PHOTO / RECEIPT OCR — QVAC-powered screenshot parsing
+// ═════════════════════════════════════════════════════════════════════════════
+
+bot.on(message('photo'), async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+
+  if (user.length === 0) {
+    await ctx.reply('Please run /start first.', mainMenu);
+    return;
+  }
+
+  const loading = await showLoading(ctx, 'Reading your screenshot with QVAC OCR...');
+
+  try {
+    // Get the largest photo
+    const photo = ctx.message.photo[ctx.message.photo.length - 1];
+    const fileLink = await ctx.telegram.getFileLink(photo.file_id);
+    const response = await fetch(fileLink.toString());
+    const imageBuffer = Buffer.from(await response.arrayBuffer());
+
+    const receipt = await parseReceiptWithQVAC(imageBuffer);
+
+    if (!receipt || !receipt.rawText) {
+      await finishLoading(ctx, loading.message_id, '❌ Could not read text from this image. Try a clearer screenshot.');
+      await ctx.reply('Menu:', mainMenu);
+      return;
+    }
+
+    // If we got structured data, offer to send
+    if (receipt.amount && receipt.accountNumber && receipt.bankName) {
+      await finishLoading(ctx, loading.message_id, `📝 I found payment details!\n\nAmount: ₦${receipt.amount.toLocaleString()}\nBank: ${receipt.bankName}\nAccount: ${receipt.accountNumber}\nName: ${receipt.recipientName || 'Unknown'}`, 'Markdown');
+
+      // Find bank code
+      const bank = NIGERIAN_BANKS.find(b =>
+        b.name.toLowerCase().includes((receipt.bankName || '').toLowerCase()) ||
+        (receipt.bankName || '').toLowerCase().includes(b.name.toLowerCase())
+      );
+
+      if (bank) {
+        setSession(userId, {
+          state: ConversationState.AWAITING_CONFIRMATION,
+          pendingTransaction: {
+            amountNgn: receipt.amount,
+            recipientAccountNumber: receipt.accountNumber,
+            recipientBankCode: bank.code,
+            recipientBankName: bank.name,
+            recipientName: receipt.recipientName || 'Recipient',
+          },
+        });
+
+        await ctx.reply(
+          `Send ₦${receipt.amount.toLocaleString()} to ${receipt.recipientName || 'Recipient'} at ${bank.name}?`,
+          Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Confirm', 'confirm_send')],
+            [Markup.button.callback('❌ Cancel', 'cancel_send')],
+          ])
+        );
+        return;
+      }
+    }
+
+    // Partial parse — show what we found
+    const found: string[] = [];
+    if (receipt.amount) found.push(`Amount: ₦${receipt.amount.toLocaleString()}`);
+    if (receipt.bankName) found.push(`Bank: ${receipt.bankName}`);
+    if (receipt.accountNumber) found.push(`Account: ${receipt.accountNumber}`);
+    if (receipt.recipientName) found.push(`Name: ${receipt.recipientName}`);
+
+    if (found.length > 0) {
+      await finishLoading(ctx, loading.message_id, `📝 I found some details:\n\n${found.join('\n')}\n\nBut I'm missing some info to send money.`, 'Markdown');
+    } else {
+      await finishLoading(ctx, loading.message_id, `📝 I can see text in the image, but couldn't find payment details.\n\nTry sending a clearer screenshot of the bank app or payment request.`);
+    }
+
+    await ctx.reply('Menu:', mainMenu);
+  } catch (err: any) {
+    console.error('[OCR] Error:', err);
+    await finishLoading(ctx, loading.message_id, '❌ Could not process image. Please try again or type the details manually.');
+    await ctx.reply('Menu:', mainMenu);
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // SHOW VIRTUAL ACCOUNT (PAJ On-Ramp)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -2480,6 +2570,13 @@ async function executeSendCore(
     recipientAccountName: finalAccountName,
   });
 
+  // Index for semantic search
+  await indexTransaction(userId, txId, `Sent ₦${txData.amountNgn} to ${finalAccountName} at ${finalBankName}`, {
+    amount: txData.amountNgn,
+    bank: finalBankName,
+    recipient: finalAccountName,
+  });
+
   let offRampRef = 'MOCK-' + Math.random().toString(36).substring(2, 8).toUpperCase();
   let solanaTxHash: string | undefined;
 
@@ -2545,6 +2642,12 @@ async function executeSendCore(
             fromMint: SOLANA_TOKENS.USDC.mint, fromAmount: swapAmountUsdc.toString(),
             toMint: SOLANA_TOKENS.USDT.mint, toAmount: outAmountUsdt.toString(),
             solanaTxHash: swapTxHash,
+          });
+          await indexTransaction(userId, swapTxId, `Swapped ${swapAmountUsdc.toFixed(2)} USDC to ${outAmountUsdt.toFixed(2)} USDT`, {
+            fromAmount: swapAmountUsdc,
+            toAmount: outAmountUsdt,
+            fromToken: 'USDC',
+            toToken: 'USDT',
           });
           tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
         }
@@ -2779,16 +2882,23 @@ async function executeSwap(
 
     // Record in DB
     const txId = generateTxId();
+    const fromAmt = Number(quote.inAmount) / Math.pow(10, getTokenBySymbol(fromSymbol)!.decimals);
     await db.insert(transactions).values({
       id: txId,
       userId,
       type: 'swap',
       status: 'completed',
       fromMint: pt.fromMint,
-      fromAmount: (Number(quote.inAmount) / Math.pow(10, getTokenBySymbol(fromSymbol)!.decimals)).toString(),
+      fromAmount: fromAmt.toString(),
       toMint: pt.toMint,
       toAmount: outAmount.toString(),
       solanaTxHash: txHash,
+    });
+    await indexTransaction(userId, txId, `Swapped ${fromAmt.toFixed(2)} ${fromSymbol} to ${outAmount.toFixed(2)} ${toSymbol}`, {
+      fromAmount: fromAmt,
+      toAmount: outAmount,
+      fromToken: fromSymbol,
+      toToken: toSymbol,
     });
 
     setSession(userId, { state: ConversationState.IDLE });
@@ -4346,6 +4456,16 @@ async function main() {
     process.exit(1);
   }
   console.log('✅ Database connected');
+
+  // Initialize QVAC local AI stack
+  try {
+    await initQVAC();
+    const qvacStatus = getQVACStatus();
+    console.log('🧠 QVAC AI stack initialized');
+    console.log('   Models:', JSON.stringify(qvacStatus.models));
+  } catch (err: any) {
+    console.warn('⚠️  QVAC init failed:', err.message);
+  }
 
   const pajClient = await getPAJClient();
   if (pajClient) {

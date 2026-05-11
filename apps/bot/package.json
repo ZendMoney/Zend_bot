@@ -4,11 +4,12 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@qvac/sdk": "^0.10.2",
+    "@zend/chainrails-client": "workspace:*",
     "@zend/db": "workspace:*",
     "@zend/paj-client": "workspace:*",
     "@zend/shared": "workspace:*",
     "@zend/solana": "workspace:*",
-    "@zend/chainrails-client": "workspace:*",
     "bs58": "^6.0.0",
     "dotenv": "^16.4.7",
     "telegraf": "^4.16.3"
