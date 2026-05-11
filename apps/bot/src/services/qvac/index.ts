@@ -24,15 +24,19 @@ import {
 import * as registryModels from '@qvac/sdk/dist/models/registry/models.js';
 
 const QWEN3_4B_INST_Q4_K_M = (registryModels as any).QWEN3_4B_INST_Q4_K_M;
+const LLAMA_3_2_1B_INST_Q4_0 = (registryModels as any).LLAMA_3_2_1B_INST_Q4_0;
 const WHISPER_TINY_Q8_0 = (registryModels as any).WHISPER_TINY_Q8_0;
 const EMBEDDINGGEMMA_300M_Q4_0 = (registryModels as any).EMBEDDINGGEMMA_300M_Q4_0;
 const OCR_0_6B_MULTIMODAL_Q4_K_M = (registryModels as any).OCR_0_6B_MULTIMODAL_Q4_K_M;
 const AFRICAN_4B_TRANSLATION_Q4_K_M = (registryModels as any).AFRICAN_4B_TRANSLATION_Q4_K_M;
 
-// ─── Model Configuration ───
+// ─── Environment-aware Model Selection ───
+// Set QVAC_USE_LIGHT_MODELS=true for Railway / resource-constrained deploys
+
+const USE_LIGHT_MODELS = process.env.QVAC_USE_LIGHT_MODELS === 'true';
 
 export const MODELS = {
-  llm: QWEN3_4B_INST_Q4_K_M,
+  llm: USE_LIGHT_MODELS ? LLAMA_3_2_1B_INST_Q4_0 : QWEN3_4B_INST_Q4_K_M,
   whisper: WHISPER_TINY_Q8_0,
   embed: EMBEDDINGGEMMA_300M_Q4_0,
   ocr: OCR_0_6B_MULTIMODAL_Q4_K_M,
@@ -84,13 +88,17 @@ export async function initQVAC(): Promise<void> {
 
   _initPromise = (async () => {
     console.log('[QVAC] Initializing local AI stack...');
+    if (USE_LIGHT_MODELS) {
+      console.log('[QVAC] Using lightweight models for deployment (QVAC_USE_LIGHT_MODELS=true)');
+    }
 
     await Promise.all([
       loadModelOnce('llm', 'llm', { ctx_size: 4096, temp: 0.7 }),
       loadModelOnce('whisper', 'whisper', { language: 'en' }),
       loadModelOnce('embed', 'embeddings'),
       loadModelOnce('ocr', 'ocr'),
-      loadModelOnce('translation', 'nmt'),
+      // Translation is heavy — lazy-load only when needed
+      // loadModelOnce('translation', 'nmt'),
     ]);
 
     console.log('[QVAC] Initialization complete.');

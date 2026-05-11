@@ -1,11 +1,15 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "ffmpeg", "gnumake", "gcc", "cmake"]
+nixPkgs = ["nodejs_22", "ffmpeg", "gnumake", "gcc", "cmake", "python3"]
 
 [phases.build]
 cmds = [
   "pnpm install",
-  "bash apps/bot/src/services/whisper/setup.sh"
 ]
+
+# NOTE: QVAC models are downloaded automatically on first use.
+# For production, pre-download models during build to avoid startup timeouts:
+#   "npx tsx apps/bot/scripts/download-qvac-models.ts"
+# Models total ~3-5GB. Ensure your deployment target has enough disk space.
 
 [start]
 cmd = "pnpm db:migrate && pnpm exec tsx apps/bot/src/index.ts"
