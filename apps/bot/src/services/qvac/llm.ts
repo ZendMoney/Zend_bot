@@ -48,7 +48,8 @@ export async function callQVACLLM(options: LLMOptions): Promise<string | null> {
     });
 
     const result = await run.final;
-    const text = result.content || '';
+    // QVAC CompletionFinal uses contentText, not content
+    const text = result.contentText || result.raw?.fullText || '';
     return text.trim();
   } catch (err: any) {
     console.error('[QVAC LLM] Inference failed:', err.message || err);
