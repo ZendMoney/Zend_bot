@@ -7,7 +7,11 @@
 import { writeFile, unlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import { ocr, getOCRModelId } from './index.js';
+
+const execAsync = promisify(exec);
 
 export interface ParsedReceipt {
   amount?: number;
@@ -23,8 +27,18 @@ async function saveTempImage(buffer: Buffer): Promise<string> {
   return path;
 }
 
+async function convertImageToBmp(inputPath: string): Promise<string> {
+  const bmpPath = inputPath.replace(/\.jpg$/, '.bmp');
+  await execAsync(
+    `ffmpeg -y -i "${inputPath}" -pix_fmt rgb24 "${bmpPath}"`,
+    { timeout: 15000 }
+  );
+  return bmpPath;
+}
+
 /**
  * Extract text from an image buffer using QVAC ONNX OCR.
+ * Converts image to BMP first (ONNX OCR is picky about formats).
  */
 export async function extractTextFromImage(imageBuffer: Buffer): Promise<string> {
   const modelId = await getOCRModelId();
@@ -32,12 +46,15 @@ export async function extractTextFromImage(imageBuffer: Buffer): Promise<string>
     throw new Error('QVAC OCR model not loaded. Run initQVAC() first.');
   }
 
-  const tempPath = await saveTempImage(imageBuffer);
+  const jpgPath = await saveTempImage(imageBuffer);
+  let bmpPath: string | undefined;
 
   try {
+    bmpPath = await convertImageToBmp(jpgPath);
+
     const { blocks } = ocr({
       modelId,
-      image: tempPath,
+      image: bmpPath,
       options: { paragraph: false },
     });
 
@@ -48,7 +65,8 @@ export async function extractTextFromImage(imageBuffer: Buffer): Promise<string>
     console.error('[QVAC OCR] Failed:', err.message || err);
     throw new Error(`QVAC OCR failed: ${err.message || err}`);
   } finally {
-    try { await unlink(tempPath); } catch { /* ignore */ }
+    try { if (jpgPath) await unlink(jpgPath); } catch { /* ignore */ }
+    try { if (bmpPath) await unlink(bmpPath); } catch { /* ignore */ }
   }
 }
 
