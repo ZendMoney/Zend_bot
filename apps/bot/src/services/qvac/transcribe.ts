@@ -33,6 +33,15 @@ async function convertToWav(oggPath: string): Promise<string> {
   return wavPath;
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
 /**
  * Transcribe Telegram voice message (OGG Opus → WAV → Whisper).
  */
@@ -48,14 +57,23 @@ export async function transcribeWithQVAC(audioBuffer: Buffer): Promise<string> {
   try {
     // Save OGG buffer to temp file
     oggPath = await saveTemp(audioBuffer, 'ogg');
-    // Convert to WAV for whisper
-    wavPath = await convertToWav(oggPath);
 
-    const text = await transcribe({
-      modelId,
-      audioChunk: wavPath,
-      prompt: 'This is a Nigerian Pidgin English voice message about money transfer or banking.',
-    });
+    // Convert to WAV for whisper
+    const t0 = Date.now();
+    wavPath = await convertToWav(oggPath);
+    console.log(`[QVAC Transcribe] WAV conversion took ${Date.now() - t0}ms`);
+
+    const t1 = Date.now();
+    const text = await withTimeout(
+      transcribe({
+        modelId,
+        audioChunk: wavPath,
+        prompt: 'This is a Nigerian Pidgin English voice message about money transfer or banking.',
+      }),
+      30000,
+      'Whisper transcription'
+    ) as string;
+    console.log(`[QVAC Transcribe] Inference took ${Date.now() - t1}ms`);
 
     return text.trim();
   } catch (err: any) {

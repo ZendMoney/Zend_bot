@@ -4,7 +4,7 @@
  * using QVAC's native ONNX OCR model (OCR_LATIN_RECOGNIZER_1).
  */
 
-import { writeFile, unlink } from 'fs/promises';
+import { writeFile, unlink, readFile, appendFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { exec } from 'child_process';
@@ -36,6 +36,15 @@ async function convertImageToBmp(inputPath: string): Promise<string> {
   return bmpPath;
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
 /**
  * Extract text from an image buffer using QVAC ONNX OCR.
  * Converts image to BMP first (ONNX OCR is picky about formats).
@@ -50,15 +59,20 @@ export async function extractTextFromImage(imageBuffer: Buffer): Promise<string>
   let bmpPath: string | undefined;
 
   try {
+    const t0 = Date.now();
     bmpPath = await convertImageToBmp(jpgPath);
+    console.log(`[QVAC OCR] BMP conversion took ${Date.now() - t0}ms`);
 
+    const t1 = Date.now();
     const { blocks } = ocr({
       modelId,
       image: bmpPath,
       options: { paragraph: false },
     });
 
-    const result = await blocks;
+    const result = await withTimeout(blocks, 25000, 'OCR inference') as { text: string }[];
+    console.log(`[QVAC OCR] Inference took ${Date.now() - t1}ms`);
+
     const text = result.map((b: { text: string }) => b.text).join('\n');
     return text.trim();
   } catch (err: any) {

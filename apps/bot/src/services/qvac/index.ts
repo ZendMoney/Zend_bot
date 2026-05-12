@@ -98,11 +98,11 @@ export async function initQVAC(): Promise<void> {
       loadModelOnce('embed', 'llamacpp-embedding'),
       loadModelOnce('ocr', 'ocr', {
         langList: ['en'],
-        magRatio: 1.5,
-        defaultRotationAngles: [90, 180, 270],
+        magRatio: 1.0,
         contrastRetry: false,
         lowConfidenceThreshold: 0.5,
         recognizerBatchSize: 1,
+        timeout: 30000,
       }),
       // Translation is heavy — lazy-load only when needed
       // loadModelOnce('translation', 'nmt'),
@@ -162,11 +162,11 @@ export async function getEmbedModelId(): Promise<string | null> {
 export async function getOCRModelId(): Promise<string | null> {
   return loadModelOnce('ocr', 'ocr', {
     langList: ['en'],
-    magRatio: 1.5,
-    defaultRotationAngles: [90, 180, 270],
+    magRatio: 1.0,
     contrastRetry: false,
     lowConfidenceThreshold: 0.5,
     recognizerBatchSize: 1,
+    timeout: 30000,
   });
 }
 

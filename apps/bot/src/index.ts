@@ -2110,12 +2110,14 @@ bot.on(message('voice'), async (ctx) => {
     const fileLink = await ctx.telegram.getFileLink(ctx.message.voice.file_id);
     const response = await fetch(fileLink.toString());
     const audioBuffer = Buffer.from(await response.arrayBuffer());
+    console.log(`[Voice] Downloaded ${audioBuffer.length} bytes`);
 
     await updateLoading(ctx, loadingVoice.message_id, 'Transcribing with QVAC Whisper...');
 
     // Step 1: STT
+    const t0 = Date.now();
     const text = await transcribeVoice(audioBuffer);
-    console.log('[Voice] Transcribed:', text);
+    console.log(`[Voice] Transcribed in ${Date.now() - t0}ms: "${text}"`);
     if (!text.trim()) {
       await finishLoading(ctx, loadingVoice.message_id, '❌ Could not hear anything. Please speak clearly and try again.');
       await ctx.reply('Menu:', mainMenu);
@@ -2262,8 +2264,12 @@ bot.on(message('voice'), async (ctx) => {
     }
 
   } catch (err: any) {
-    console.error('[Voice] Error:', err);
-    await finishLoading(ctx, loadingVoice.message_id, '❌ Could not process voice note. Please type your command or use the menu below.');
+    console.error('[Voice] Error:', err.message || err);
+    try {
+      await finishLoading(ctx, loadingVoice.message_id, '❌ Could not process voice note. Please type your command or use the menu below.');
+    } catch {
+      await ctx.reply('❌ Could not process voice note. Please type your command or use the menu below.', mainMenu);
+    }
     await ctx.reply('Menu:', mainMenu);
   }
 });
@@ -2351,15 +2357,19 @@ bot.on(message('photo'), async (ctx) => {
   }
 
   const loading = await showLoading(ctx, 'Reading your screenshot with QVAC OCR...');
+  const startTime = Date.now();
 
   try {
     // Get the largest photo
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
+    console.log(`[Photo] Downloading image ${photo.file_id} (${photo.width}x${photo.height})`);
     const fileLink = await ctx.telegram.getFileLink(photo.file_id);
     const response = await fetch(fileLink.toString());
     const imageBuffer = Buffer.from(await response.arrayBuffer());
+    console.log(`[Photo] Downloaded ${imageBuffer.length} bytes in ${Date.now() - startTime}ms`);
 
     const receipt = await parseReceiptWithQVAC(imageBuffer);
+    console.log(`[Photo] Parsed receipt in ${Date.now() - startTime}ms:`, receipt);
 
     if (!receipt || !receipt.rawText) {
       await finishLoading(ctx, loading.message_id, '❌ Could not read text from this image. Try a clearer screenshot.');
@@ -2420,8 +2430,12 @@ bot.on(message('photo'), async (ctx) => {
 
     await ctx.reply('Menu:', mainMenu);
   } catch (err: any) {
-    console.error('[OCR] Error:', err);
-    await finishLoading(ctx, loading.message_id, '❌ Could not process image. Please try again or type the details manually.');
+    console.error('[OCR] Error:', err.message || err);
+    try {
+      await finishLoading(ctx, loading.message_id, '❌ Could not process image. Please try again or type the details manually.');
+    } catch {
+      await ctx.reply('❌ Could not process image. Please try again or type the details manually.', mainMenu);
+    }
     await ctx.reply('Menu:', mainMenu);
   }
 });
