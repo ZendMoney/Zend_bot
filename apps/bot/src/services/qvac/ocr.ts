@@ -1,14 +1,13 @@
 /**
  * QVAC OCR Service
- * Extracts text from images using the multimodal LLM (completion + attachments).
- * The OCR model is a llamacpp-completion model, not onnx-ocr, so we use
- * completion() with image attachments instead of the ocr() SDK call.
+ * Extracts text from images (screenshots, receipts, payment requests)
+ * using QVAC's native ONNX OCR model (OCR_LATIN_RECOGNIZER_1).
  */
 
 import { writeFile, unlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { completion, getOCRModelId } from './index.js';
+import { ocr, getOCRModelId } from './index.js';
 
 export interface ParsedReceipt {
   amount?: number;
@@ -18,17 +17,14 @@ export interface ParsedReceipt {
   rawText: string;
 }
 
-/**
- * Save buffer to a temp file and return the path.
- */
-async function bufferToTempFile(buffer: Buffer, ext = 'png'): Promise<string> {
-  const tempPath = join(tmpdir(), `qvac_ocr_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`);
-  await writeFile(tempPath, buffer);
-  return tempPath;
+async function saveTempImage(buffer: Buffer): Promise<string> {
+  const path = join(tmpdir(), `qvac_ocr_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
+  await writeFile(path, buffer);
+  return path;
 }
 
 /**
- * Extract text from an image buffer using the multimodal completion model.
+ * Extract text from an image buffer using QVAC ONNX OCR.
  */
 export async function extractTextFromImage(imageBuffer: Buffer): Promise<string> {
   const modelId = await getOCRModelId();
@@ -36,39 +32,22 @@ export async function extractTextFromImage(imageBuffer: Buffer): Promise<string>
     throw new Error('QVAC OCR model not loaded. Run initQVAC() first.');
   }
 
-  const tempPath = await bufferToTempFile(imageBuffer, 'jpg');
+  const tempPath = await saveTempImage(imageBuffer);
 
   try {
-    const run = completion({
+    const { blocks } = ocr({
       modelId,
-      history: [
-        {
-          role: 'system',
-          content: 'You are an OCR engine. Extract all visible text from the attached image. Return ONLY the raw text. Do not add explanations, summaries, or markdown formatting.',
-        },
-        {
-          role: 'user',
-          content: 'Extract all text from this image:',
-          attachments: [{ path: tempPath }],
-        },
-      ],
-      stream: false,
-      generationParams: {
-        temp: 0.1,
-        predict: 1024,
-        top_p: 0.9,
-        top_k: 40,
-      },
+      image: tempPath,
+      options: { paragraph: false },
     });
 
-    const result = await run.final;
-    const text = result.contentText || result.raw?.fullText || '';
+    const result = await blocks;
+    const text = result.map((b: { text: string }) => b.text).join('\n');
     return text.trim();
   } catch (err: any) {
     console.error('[QVAC OCR] Failed:', err.message || err);
     throw new Error(`QVAC OCR failed: ${err.message || err}`);
   } finally {
-    // Clean up temp file (best effort)
     try { await unlink(tempPath); } catch { /* ignore */ }
   }
 }

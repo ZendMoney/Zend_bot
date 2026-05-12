@@ -27,8 +27,7 @@ const QWEN3_4B_INST_Q4_K_M = registryModels.QWEN3_4B_INST_Q4_K_M;
 const LLAMA_3_2_1B_INST_Q4_0 = registryModels.LLAMA_3_2_1B_INST_Q4_0;
 const WHISPER_TINY_Q8_0 = registryModels.WHISPER_TINY_Q8_0;
 const EMBEDDINGGEMMA_300M_Q4_0 = registryModels.EMBEDDINGGEMMA_300M_Q4_0;
-const OCR_0_6B_MULTIMODAL_Q4_K_M = registryModels.OCR_0_6B_MULTIMODAL_Q4_K_M;
-const MMPROJ_OCR_0_6B_MULTIMODAL_F16 = registryModels.MMPROJ_OCR_0_6B_MULTIMODAL_F16;
+const OCR_LATIN_RECOGNIZER_1 = registryModels.OCR_LATIN_RECOGNIZER_1;
 const AFRICAN_4B_TRANSLATION_Q4_K_M = registryModels.AFRICAN_4B_TRANSLATION_Q4_K_M;
 
 // ─── Environment-aware Model Selection ───
@@ -40,7 +39,7 @@ export const MODELS = {
   llm: USE_LIGHT_MODELS ? LLAMA_3_2_1B_INST_Q4_0 : QWEN3_4B_INST_Q4_K_M,
   whisper: WHISPER_TINY_Q8_0,
   embed: EMBEDDINGGEMMA_300M_Q4_0,
-  ocr: OCR_0_6B_MULTIMODAL_Q4_K_M,
+  ocr: OCR_LATIN_RECOGNIZER_1,
   translation: AFRICAN_4B_TRANSLATION_Q4_K_M,
 } as const;
 
@@ -97,9 +96,13 @@ export async function initQVAC(): Promise<void> {
       loadModelOnce('llm', 'llamacpp-completion', { ctx_size: 4096, temp: 0.7 }),
       loadModelOnce('whisper', 'whispercpp-transcription', { language: 'en' }),
       loadModelOnce('embed', 'llamacpp-embedding'),
-      loadModelOnce('ocr', 'llamacpp-completion', {
-        ctx_size: 4096,
-        projectionModelSrc: MMPROJ_OCR_0_6B_MULTIMODAL_F16,
+      loadModelOnce('ocr', 'ocr', {
+        langList: ['en'],
+        magRatio: 1.5,
+        defaultRotationAngles: [90, 180, 270],
+        contrastRetry: false,
+        lowConfidenceThreshold: 0.5,
+        recognizerBatchSize: 1,
       }),
       // Translation is heavy — lazy-load only when needed
       // loadModelOnce('translation', 'nmt'),
@@ -157,9 +160,13 @@ export async function getEmbedModelId(): Promise<string | null> {
 }
 
 export async function getOCRModelId(): Promise<string | null> {
-  return loadModelOnce('ocr', 'llamacpp-completion', {
-    ctx_size: 4096,
-    projectionModelSrc: MMPROJ_OCR_0_6B_MULTIMODAL_F16,
+  return loadModelOnce('ocr', 'ocr', {
+    langList: ['en'],
+    magRatio: 1.5,
+    defaultRotationAngles: [90, 180, 270],
+    contrastRetry: false,
+    lowConfidenceThreshold: 0.5,
+    recognizerBatchSize: 1,
   });
 }
 
