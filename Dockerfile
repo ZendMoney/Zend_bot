@@ -19,20 +19,26 @@ WORKDIR /app
 # Install pnpm
 RUN npm install -g pnpm
 
-# Copy workspace files
-COPY package.json pnpm-workspace.yaml ./
+# Copy workspace root files
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+
+# Copy all workspace package.json files (preserve directory structure)
 COPY apps/bot/package.json apps/bot/package.json
 COPY apps/api/package.json apps/api/package.json
-COPY packages/*/package.json packages/*/
+COPY packages/shared/package.json packages/shared/package.json
+COPY packages/db/package.json packages/db/package.json
+COPY packages/solana/package.json packages/solana/package.json
+COPY packages/paj-client/package.json packages/paj-client/package.json
+COPY packages/chainrails-client/package.json packages/chainrails-client/package.json
+COPY packages/nlu/package.json packages/nlu/package.json
 
-# Install dependencies (including QVAC native builds)
-RUN pnpm install --frozen-lockfile
+# Install dependencies (QVAC compiles native addons during install)
+RUN pnpm install
 
 # Copy source code
 COPY . .
 
-# Build if needed (QVAC compiles native addons during install)
-# Models download on first use — set QVAC_MODEL_DIR to persist them
+# Build if needed
 ENV QVAC_MODEL_DIR=/app/models
 ENV QVAC_USE_LIGHT_MODELS=true
 ENV NODE_ENV=production
