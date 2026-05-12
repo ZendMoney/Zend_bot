@@ -98,7 +98,7 @@ export async function initQVAC(): Promise<void> {
       loadModelOnce('whisper', 'whispercpp-transcription', { language: 'en' }),
       loadModelOnce('embed', 'llamacpp-embedding'),
       loadModelOnce('ocr', 'llamacpp-completion', {
-        ctx_size: 1024,
+        ctx_size: 4096,
         projectionModelSrc: MMPROJ_OCR_0_6B_MULTIMODAL_F16,
       }),
       // Translation is heavy — lazy-load only when needed
@@ -158,7 +158,7 @@ export async function getEmbedModelId(): Promise<string | null> {
 
 export async function getOCRModelId(): Promise<string | null> {
   return loadModelOnce('ocr', 'llamacpp-completion', {
-    ctx_size: 1024,
+    ctx_size: 4096,
     projectionModelSrc: MMPROJ_OCR_0_6B_MULTIMODAL_F16,
   });
 }
