@@ -36,6 +36,11 @@ import {
 import crypto from 'crypto';
 import { rateLimitMiddleware } from './middleware/rateLimit.js';
 import { getAdminStats, isSuperAdmin, isAdminUser } from './services/admin.js';
+import {
+  buyAirtime, buyData, buyElectricity, buyCable,
+  NETWORKS, DISCOS, CABLE_PROVIDERS, getDataPlans, validateMeter, validateSmartCard,
+  isDemoMode, type DataPlan,
+} from './services/bills/index.js';
 
 const BOT_TOKEN = process.env.BOT_TOKEN!;
 const SOLANA_RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
@@ -107,6 +112,21 @@ interface ZendSession {
     sourceChain: string;
     token: string;
     tokenIn: string;
+  };
+  billData?: {
+    type?: 'airtime' | 'data' | 'electricity' | 'cable';
+    network?: string;
+    phone?: string;
+    planCode?: string;
+    planAmount?: number;
+    disco?: string;
+    meterNumber?: string;
+    meterType?: 'prepaid' | 'postpaid';
+    provider?: string;
+    smartCardNumber?: string;
+    bouquetCode?: string;
+    bouquetAmount?: number;
+    amount?: number;
   };
 }
 
@@ -484,10 +504,19 @@ const mainMenu = Markup.keyboard([
   ['💵 Add Naira', '💴 Cash Out'],
   ['🔄 Swap', '📥 Receive'],
   ['📅 Schedule', '📋 History'],
-  ['⚙️ Settings', '🌐 Community'],
+  ['💳 Bills', '⚙️ Settings'],
+  ['🌐 Community'],
 ]).resize();
 
 const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
+
+const billsMenu = Markup.keyboard([
+  ['📱 Airtime', '🌐 Data'],
+  ['⚡ Electricity', '📺 Cable TV'],
+  ['🔙 Back to Menu'],
+]).resize();
+
+const billsBackKeyboard = Markup.keyboard([['🔙 Back to Menu']]).resize();
 
 const adminMenu = Markup.keyboard([
   ['📊 Stats', '👤 Users'],
@@ -925,7 +954,8 @@ bot.on(message('text'), async (ctx, next) => {
   // ─── Pass menu buttons to bot.hears() handlers ───
   const menuButtons = ['💰 Balance', '💵 Add Naira', '📤 Send', '💴 Cash Out', '📥 Receive', '🔄 Swap', '📅 Schedule', '📋 History', '⚙️ Settings', '🌐 Community'];
   const adminButtons = ['📊 Stats', '👤 Users', '💸 Transactions', '🏦 Bank Accounts', '📅 Scheduled', '🤖 QVAC Status', '🔙 Back to Menu'];
-  if (menuButtons.includes(text) || adminButtons.includes(text)) {
+  const billsButtons = ['📱 Airtime', '🌐 Data', '⚡ Electricity', '📺 Cable TV'];
+  if (menuButtons.includes(text) || adminButtons.includes(text) || billsButtons.includes(text)) {
     return next();
   }
 
@@ -1531,6 +1561,120 @@ bot.on(message('text'), async (ctx, next) => {
   // ─── SWAP: AWAITING_SWAP_AMOUNT ───
   if (session.state === ConversationState.AWAITING_SWAP_AMOUNT) {
     await handleSwapAmount(ctx, userId, text);
+    return;
+  }
+
+  // ─── BILL PAYMENTS ───
+  if (session.state === ConversationState.BILL_ENTER_PHONE) {
+    const phone = text.trim().replace(/\D/g, '');
+    if (phone.length < 10 || phone.length > 15) {
+      await ctx.reply('❌ Please enter a valid phone number (10-15 digits).', cancelKeyboard);
+      return;
+    }
+    session.billData = { ...session.billData, phone };
+
+    if (session.billData?.type === 'airtime') {
+      session.state = ConversationState.BILL_ENTER_AMOUNT;
+      setSession(userId, session);
+      await ctx.reply('💵 Enter amount in Naira (e.g., 500, 1000, 2000):', cancelKeyboard);
+      return;
+    }
+
+    if (session.billData?.type === 'data') {
+      // Fetch and show data plans
+      const loading = await showLoading(ctx, 'Fetching data plans...');
+      try {
+        const plans = await getDataPlans(session.billData.network!);
+        if (plans.length === 0) {
+          await finishLoading(ctx, loading.message_id, '❌ No data plans found.');
+          setSession(userId, { state: ConversationState.IDLE });
+          await ctx.reply('Menu:', mainMenu);
+          return;
+        }
+        const rows = plans.map((p: DataPlan) =>
+          [Markup.button.callback(`${p.name} — ₦${p.amount.toLocaleString()} (${p.validity})`, `bill_plan_${p.planCode}_${p.amount}`)]
+        );
+        await finishLoading(ctx, loading.message_id, `🌐 Select a data plan for ${session.billData.phone}:`);
+        await ctx.reply('Choose a plan:', Markup.inlineKeyboard(rows));
+        setSession(userId, session);
+      } catch (err: any) {
+        await finishLoading(ctx, loading.message_id, '❌ Could not fetch plans. Please try again.');
+        setSession(userId, { state: ConversationState.IDLE });
+        await ctx.reply('Menu:', mainMenu);
+      }
+      return;
+    }
+
+    setSession(userId, { state: ConversationState.IDLE });
+    await ctx.reply('❌ Unknown bill type. Please start over.', mainMenu);
+    return;
+  }
+
+  if (session.state === ConversationState.BILL_ENTER_AMOUNT) {
+    const amount = parseInt(text.replace(/[^0-9]/g, ''), 10);
+    if (!amount || amount < 50) {
+      await ctx.reply('❌ Minimum amount is ₦50. Enter a valid amount:', cancelKeyboard);
+      return;
+    }
+
+    const bill = session.billData;
+    if (!bill) {
+      setSession(userId, { state: ConversationState.IDLE });
+      await ctx.reply('❌ Session expired. Please start over.', mainMenu);
+      return;
+    }
+
+    bill.amount = amount;
+    session.billData = bill;
+    setSession(userId, session);
+
+    // Show confirmation
+    const usdtAmount = amount / 1400; // TODO: use live rate
+    await ctx.reply(
+      `💳 *Confirm Purchase*\n\n` +
+      `Type: ${bill.type === 'airtime' ? '📱 Airtime' : '💡 Electricity'}\n` +
+      `${bill.network ? `Network: ${bill.network.toUpperCase()}\n` : ''}` +
+      `${bill.disco ? `Disco: ${bill.disco}\n` : ''}` +
+      `${bill.phone ? `Phone: ${bill.phone}\n` : ''}` +
+      `${bill.meterNumber ? `Meter: ${bill.meterNumber}\n` : ''}` +
+      `Amount: ₦${amount.toLocaleString()}\n` +
+      `≈ ${usdtAmount.toFixed(4)} USDT\n\n` +
+      `Tap Confirm to complete.`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('✅ Confirm', 'bill_confirm')],
+          [Markup.button.callback('❌ Cancel', 'cancel_send')],
+        ]),
+      }
+    );
+    return;
+  }
+
+  if (session.state === ConversationState.BILL_ENTER_METER) {
+    const meter = text.trim().replace(/\D/g, '');
+    if (meter.length < 5 || meter.length > 20) {
+      await ctx.reply('❌ Please enter a valid meter number.', cancelKeyboard);
+      return;
+    }
+    session.billData = { ...session.billData, meterNumber: meter };
+    session.state = ConversationState.BILL_ENTER_AMOUNT;
+    setSession(userId, session);
+    await ctx.reply('💵 Enter amount in Naira (e.g., 1000, 5000):', cancelKeyboard);
+    return;
+  }
+
+  if (session.state === ConversationState.BILL_ENTER_SMARTCARD) {
+    const card = text.trim().replace(/\D/g, '');
+    if (card.length < 5 || card.length > 20) {
+      await ctx.reply('❌ Please enter a valid smart card number.', cancelKeyboard);
+      return;
+    }
+    session.billData = { ...session.billData, smartCardNumber: card };
+    // For cable, we'd fetch bouquets here. For MVP, ask amount directly.
+    session.state = ConversationState.BILL_ENTER_AMOUNT;
+    setSession(userId, session);
+    await ctx.reply('💵 Enter subscription amount in Naira:', cancelKeyboard);
     return;
   }
 
@@ -4110,6 +4254,194 @@ bot.command('stats', async (ctx) => {
     console.error('Stats error:', err);
     await ctx.reply('❌ Could not fetch stats. Please try again.', mainMenu);
   }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 💳 BILL PAYMENTS — Airtime, Data, Electricity, Cable TV
+// ═════════════════════════════════════════════════════════════════════════════
+
+bot.hears('💳 Bills', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  if (user.length === 0) {
+    await ctx.reply('Please run /start first.', mainMenu);
+    return;
+  }
+  setSession(userId, { state: ConversationState.BILL_SELECT_TYPE });
+  await ctx.reply(
+    `💳 *Bills & Airtime*\n\n` +
+    `Pay for airtime, data, electricity, and cable TV with your USDT balance.\n\n` +
+    `Select a service:`,
+    { parse_mode: 'Markdown', ...billsMenu }
+  );
+});
+
+bot.hears('📱 Airtime', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const session = getSession(userId);
+  session.billData = { type: 'airtime' };
+  setSession(userId, session);
+
+  const rows = NETWORKS.map((n) => [Markup.button.callback(n.name, `bill_airtime_${n.code}`)]);
+  await ctx.reply('📱 Select network:', Markup.inlineKeyboard(rows));
+});
+
+bot.hears('🌐 Data', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const session = getSession(userId);
+  session.billData = { type: 'data' };
+  setSession(userId, session);
+
+  const rows = NETWORKS.map((n) => [Markup.button.callback(n.name, `bill_data_${n.code}`)]);
+  await ctx.reply('🌐 Select network:', Markup.inlineKeyboard(rows));
+});
+
+bot.hears('⚡ Electricity', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const session = getSession(userId);
+  session.billData = { type: 'electricity' };
+  setSession(userId, session);
+
+  const rows = DISCOS.map((d) => [Markup.button.callback(d.name, `bill_electricity_${d.code}`)]);
+  await ctx.reply('⚡ Select electricity distribution company:', Markup.inlineKeyboard(rows));
+});
+
+bot.hears('📺 Cable TV', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const session = getSession(userId);
+  session.billData = { type: 'cable' };
+  setSession(userId, session);
+
+  const rows = CABLE_PROVIDERS.map((p) => [Markup.button.callback(p.name, `bill_cable_${p.code}`)]);
+  await ctx.reply('📺 Select cable TV provider:', Markup.inlineKeyboard(rows));
+});
+
+// ─── Airtime Network Selected ───
+bot.action(/^bill_airtime_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const network = ctx.match![1];
+  const session = getSession(userId);
+  session.billData = { ...session.billData, type: 'airtime', network };
+  session.state = ConversationState.BILL_ENTER_PHONE;
+  setSession(userId, session);
+  await ctx.editMessageText(`📱 ${network.toUpperCase()} Airtime\n\nEnter the phone number:`);
+  await ctx.reply('Enter recipient phone number:', cancelKeyboard);
+});
+
+// ─── Data Network Selected ───
+bot.action(/^bill_data_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const network = ctx.match![1];
+  const session = getSession(userId);
+  session.billData = { ...session.billData, type: 'data', network };
+  session.state = ConversationState.BILL_ENTER_PHONE;
+  setSession(userId, session);
+  await ctx.editMessageText(`🌐 ${network.toUpperCase()} Data\n\nEnter the phone number:`);
+  await ctx.reply('Enter recipient phone number:', cancelKeyboard);
+});
+
+// ─── Data Plan Selected ───
+bot.action(/^bill_plan_(.+)_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const planCode = ctx.match![1];
+  const planAmount = parseInt(ctx.match![2], 10);
+  const session = getSession(userId);
+  session.billData = { ...session.billData, planCode, planAmount };
+  setSession(userId, session);
+
+  const usdtAmount = planAmount / 1400;
+  await ctx.editMessageText(
+    `🌐 *Confirm Data Purchase*\n\n` +
+    `Phone: ${session.billData?.phone}\n` +
+    `Plan: ${planCode}\n` +
+    `Amount: ₦${planAmount.toLocaleString()}\n` +
+    `≈ ${usdtAmount.toFixed(4)} USDT`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Confirm', 'bill_confirm')],
+        [Markup.button.callback('❌ Cancel', 'cancel_send')],
+      ]),
+    }
+  );
+});
+
+// ─── Electricity Disco Selected ───
+bot.action(/^bill_electricity_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const disco = ctx.match![1];
+  const session = getSession(userId);
+  session.billData = { ...session.billData, type: 'electricity', disco };
+  session.state = ConversationState.BILL_ENTER_METER;
+  setSession(userId, session);
+  await ctx.editMessageText(`⚡ ${disco.replace(/-/g, ' ').toUpperCase()}\n\nEnter your meter number:`);
+  await ctx.reply('Enter meter number:', cancelKeyboard);
+});
+
+// ─── Cable Provider Selected ───
+bot.action(/^bill_cable_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const provider = ctx.match![1];
+  const session = getSession(userId);
+  session.billData = { ...session.billData, type: 'cable', provider };
+  session.state = ConversationState.BILL_ENTER_SMARTCARD;
+  setSession(userId, session);
+  await ctx.editMessageText(`📺 ${provider.toUpperCase()}\n\nEnter your smart card number:`);
+  await ctx.reply('Enter smart card number:', cancelKeyboard);
+});
+
+// ─── Confirm Bill Purchase ───
+bot.action('bill_confirm', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+  const bill = session.billData;
+
+  if (!bill) {
+    await ctx.editMessageText('❌ Session expired. Please start over.');
+    await ctx.reply('Menu:', mainMenu);
+    setSession(userId, { state: ConversationState.IDLE });
+    return;
+  }
+
+  const loading = await showLoading(ctx, 'Processing your purchase...');
+
+  try {
+    let result;
+    if (bill.type === 'airtime' && bill.phone && bill.amount && bill.network) {
+      result = await buyAirtime(userId, { phone: bill.phone, amount: bill.amount, network: bill.network });
+    } else if (bill.type === 'data' && bill.phone && bill.planCode && bill.network && bill.planAmount) {
+      result = await buyData(userId, { phone: bill.phone, planCode: bill.planCode, network: bill.network }, bill.planAmount);
+    } else if (bill.type === 'electricity' && bill.meterNumber && bill.amount && bill.disco) {
+      result = await buyElectricity(userId, { meterNumber: bill.meterNumber, amount: bill.amount, disco: bill.disco, meterType: bill.meterType || 'prepaid' });
+    } else if (bill.type === 'cable' && bill.smartCardNumber && bill.amount && bill.provider) {
+      result = await buyCable(userId, { smartCardNumber: bill.smartCardNumber, bouquetCode: bill.bouquetCode || 'basic', provider: bill.provider }, bill.amount);
+    } else {
+      throw new Error('Invalid bill data');
+    }
+
+    if (result.success) {
+      let msg = `✅ *Purchase Successful!*\n\n${result.message}`;
+      if (result.token) msg += `\n\n🔑 *Token:* \`${result.token}\``;
+      if (result.units) msg += `\n⚡ *Units:* ${result.units}`;
+      if (result.commission) msg += `\n💰 *Commission:* ₦${result.commission}`;
+      if (isDemoMode()) msg += `\n\n_(Demo mode — no real transaction occurred)_`;
+      await finishLoading(ctx, loading.message_id, msg, 'Markdown');
+    } else {
+      await finishLoading(ctx, loading.message_id, `❌ Purchase failed: ${result.message}`);
+    }
+  } catch (err: any) {
+    console.error('[Bill] Purchase error:', err);
+    await finishLoading(ctx, loading.message_id, '❌ Could not complete purchase. Please try again.');
+  }
+
+  setSession(userId, { state: ConversationState.IDLE });
+  await ctx.reply('Menu:', mainMenu);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════

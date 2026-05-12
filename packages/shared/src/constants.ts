@@ -80,6 +80,19 @@ export enum ConversationState {
   AWAITING_BANK_ACCOUNT_NAME = 'awaiting_bank_account_name',
   AWAITING_ONRAMP_AMOUNT = 'awaiting_onramp_amount',
   AWAITING_BRIDGE_AMOUNT = 'awaiting_bridge_amount',
+  // Bill payments
+  BILL_SELECT_TYPE = 'bill_select_type',
+  BILL_SELECT_NETWORK = 'bill_select_network',
+  BILL_SELECT_DATA_PLAN = 'bill_select_data_plan',
+  BILL_ENTER_PHONE = 'bill_enter_phone',
+  BILL_ENTER_AMOUNT = 'bill_enter_amount',
+  BILL_SELECT_DISCO = 'bill_select_disco',
+  BILL_ENTER_METER = 'bill_enter_meter',
+  BILL_SELECT_METER_TYPE = 'bill_select_meter_type',
+  BILL_SELECT_CABLE_PROVIDER = 'bill_select_cable_provider',
+  BILL_ENTER_SMARTCARD = 'bill_enter_smartcard',
+  BILL_SELECT_BOUQUET = 'bill_select_bouquet',
+  BILL_CONFIRM = 'bill_confirm',
 }
 
 // Transaction Types

@@ -154,6 +154,25 @@ export const referrals = pgTable('referrals', {
   completedAt: timestamp('completed_at', { withTimezone: true }),
 });
 
+// Bill payments (airtime, data, electricity, cable TV)
+export const billPayments = pgTable('bill_payments', {
+  id: serial('id').primaryKey(),
+  userId: varchar('user_id', { length: 50 }).notNull().references((): any => users.id),
+  type: varchar('type', { length: 20 }).notNull(), // airtime | data | electricity | cable
+  provider: varchar('provider', { length: 50 }).notNull(), // mtn | airtel | glo | ikeja_electric | dstv
+  recipient: varchar('recipient', { length: 50 }).notNull(), // phone | meter | smartcard
+  amountNgn: decimal('amount_ngn', { precision: 20, scale: 2 }).notNull(),
+  amountUsdt: decimal('amount_usdt', { precision: 20, scale: 9 }),
+  status: varchar('status', { length: 20 }).notNull().default('pending'), // pending | success | failed
+  reference: varchar('reference', { length: 100 }).notNull(),
+  externalReference: varchar('external_reference', { length: 100 }), // VTpass reference
+  commissionNgn: decimal('commission_ngn', { precision: 20, scale: 2 }),
+  token: varchar('token', { length: 255 }), // electricity token or data PIN
+  metadata: jsonb('metadata'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  completedAt: timestamp('completed_at', { withTimezone: true }),
+});
+
 // Audit log (immutable)
 export const auditLogs = pgTable('audit_logs', {
   id: serial('id').primaryKey(),
