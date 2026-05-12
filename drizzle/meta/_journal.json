@@ -36,6 +36,13 @@
       "when": 1778107340201,
       "tag": "0004_gorgeous_hawkeye",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1778580932982,
+      "tag": "0005_clammy_warlock",
+      "breakpoints": true
     }
   ]
 }

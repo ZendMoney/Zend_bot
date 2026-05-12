@@ -29,6 +29,9 @@ export const users = pgTable('users', {
   voiceInputEnabled: boolean('voice_input_enabled').default(true).notNull(),
   transactionPin: varchar('transaction_pin', { length: 255 }), // hashed
   
+  // Admin
+  isAdmin: boolean('is_admin').default(false).notNull(),
+
   // Referral
   referralCode: varchar('referral_code', { length: 20 }).unique(),
   referredBy: varchar('referred_by', { length: 50 }).references((): any => users.id),
