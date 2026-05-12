@@ -87,6 +87,9 @@ importers:
       '@zend/solana':
         specifier: workspace:*
         version: link:../../packages/solana
+      bare-runtime-linux-x64:
+        specifier: ^1.28.5
+        version: 1.28.5(bare-url@2.4.3)
       bs58:
         specifier: ^6.0.0
         version: 6.0.0
@@ -5385,7 +5388,6 @@ snapshots:
       require-asset: 1.2.2(bare-url@2.4.3)
     transitivePeerDependencies:
       - bare-url
-    optional: true
 
   bare-runtime-win32-arm64@1.28.5(bare-url@2.4.3):
     dependencies:
@@ -7331,7 +7333,6 @@ snapshots:
       bare-module-resolve: 1.12.2(bare-url@2.4.3)
     transitivePeerDependencies:
       - bare-url
-    optional: true
 
   require-directory@2.1.1: {}
 

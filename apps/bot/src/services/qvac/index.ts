@@ -93,10 +93,10 @@ export async function initQVAC(): Promise<void> {
     }
 
     await Promise.all([
-      loadModelOnce('llm', 'llm', { ctx_size: 4096, temp: 0.7 }),
-      loadModelOnce('whisper', 'whisper', { language: 'en' }),
-      loadModelOnce('embed', 'embeddings'),
-      loadModelOnce('ocr', 'ocr'),
+      loadModelOnce('llm', 'llamacpp-completion', { ctx_size: 4096, temp: 0.7 }),
+      loadModelOnce('whisper', 'whispercpp-transcription', { language: 'en' }),
+      loadModelOnce('embed', 'llamacpp-embedding'),
+      loadModelOnce('ocr', 'onnx-ocr'),
       // Translation is heavy — lazy-load only when needed
       // loadModelOnce('translation', 'nmt'),
     ]);
@@ -141,23 +141,23 @@ export async function shutdownQVAC(): Promise<void> {
 // ─── Lazy Getters ───
 
 export async function getLLMModelId(): Promise<string | null> {
-  return loadModelOnce('llm', 'llm', { ctx_size: 4096 });
+  return loadModelOnce('llm', 'llamacpp-completion', { ctx_size: 4096 });
 }
 
 export async function getWhisperModelId(): Promise<string | null> {
-  return loadModelOnce('whisper', 'whisper', { language: 'en' });
+  return loadModelOnce('whisper', 'whispercpp-transcription', { language: 'en' });
 }
 
 export async function getEmbedModelId(): Promise<string | null> {
-  return loadModelOnce('embed', 'embeddings');
+  return loadModelOnce('embed', 'llamacpp-embedding');
 }
 
 export async function getOCRModelId(): Promise<string | null> {
-  return loadModelOnce('ocr', 'ocr');
+  return loadModelOnce('ocr', 'onnx-ocr');
 }
 
 export async function getTranslationModelId(): Promise<string | null> {
-  return loadModelOnce('translation', 'nmt');
+  return loadModelOnce('translation', 'nmtcpp-translation');
 }
 
 // ─── Convenience Exports ───
