@@ -28,6 +28,7 @@ const LLAMA_3_2_1B_INST_Q4_0 = registryModels.LLAMA_3_2_1B_INST_Q4_0;
 const WHISPER_TINY_Q8_0 = registryModels.WHISPER_TINY_Q8_0;
 const EMBEDDINGGEMMA_300M_Q4_0 = registryModels.EMBEDDINGGEMMA_300M_Q4_0;
 const OCR_0_6B_MULTIMODAL_Q4_K_M = registryModels.OCR_0_6B_MULTIMODAL_Q4_K_M;
+const MMPROJ_OCR_0_6B_MULTIMODAL_F16 = registryModels.MMPROJ_OCR_0_6B_MULTIMODAL_F16;
 const AFRICAN_4B_TRANSLATION_Q4_K_M = registryModels.AFRICAN_4B_TRANSLATION_Q4_K_M;
 
 // ─── Environment-aware Model Selection ───
@@ -96,7 +97,10 @@ export async function initQVAC(): Promise<void> {
       loadModelOnce('llm', 'llamacpp-completion', { ctx_size: 4096, temp: 0.7 }),
       loadModelOnce('whisper', 'whispercpp-transcription', { language: 'en' }),
       loadModelOnce('embed', 'llamacpp-embedding'),
-      loadModelOnce('ocr', 'llamacpp-completion'),
+      loadModelOnce('ocr', 'llamacpp-completion', {
+        ctx_size: 1024,
+        projectionModelSrc: MMPROJ_OCR_0_6B_MULTIMODAL_F16,
+      }),
       // Translation is heavy — lazy-load only when needed
       // loadModelOnce('translation', 'nmt'),
     ]);
@@ -153,7 +157,10 @@ export async function getEmbedModelId(): Promise<string | null> {
 }
 
 export async function getOCRModelId(): Promise<string | null> {
-  return loadModelOnce('ocr', 'llamacpp-completion');
+  return loadModelOnce('ocr', 'llamacpp-completion', {
+    ctx_size: 1024,
+    projectionModelSrc: MMPROJ_OCR_0_6B_MULTIMODAL_F16,
+  });
 }
 
 export async function getTranslationModelId(): Promise<string | null> {
