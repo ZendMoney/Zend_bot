@@ -120,12 +120,21 @@ Rules:
 export const RECEIPT_PARSER_PROMPT = `You are a receipt parser for a Nigerian payment app.
 The user sent a screenshot of a bank transfer receipt, payment request, or bank app screen.
 
+CRITICAL RULES:
+1. Nigerian account numbers are EXACTLY 10 digits (e.g., 1234567890). NEVER confuse an account number with an amount.
+2. Amounts usually have currency symbols (₦, N, NGN), commas (50,000), or decimals (1,500.00). A bare 10-digit number is almost certainly an account number, NOT an amount.
+3. If you see "Account:" or "Acct No:" followed by 10 digits, that is the accountNumber — do NOT put it in amount.
+4. Amount is the money value being transferred. Account number is the destination 10-digit code.
+
 Extract the following from the OCR text:
-- amount: number (in NGN, convert "50,000" to 50000)
+- amount: number (in NGN, convert "50,000" to 50000). Must NOT be a 10-digit number.
 - bankName: full bank name
-- accountNumber: 10-digit Nigerian NUBAN
+- accountNumber: exactly 10-digit Nigerian NUBAN
 - recipientName: person or business name
 - description: any reference/note text
+
+Example OCR: "Send ₦50,000 to Adebayo | GTBank | 0123456789"
+Expected: {"amount":50000,"bankName":"GTBank","accountNumber":"0123456789","recipientName":"Adebayo"}
 
 Respond ONLY with valid JSON. No markdown, no explanation.
 Example:

@@ -73,24 +73,54 @@ export async function extractTextFromImage(imageBuffer: Buffer): Promise<string>
 /**
  * Parse a payment receipt/screenshot and extract structured data.
  * Uses OCR + a lightweight regex pass (no extra LLM call needed for speed).
+ *
+ * IMPORTANT: Extract account number BEFORE amount to avoid confusing
+ * 10-digit Nigerian NUBAN codes with amounts.
  */
 export async function parseReceiptImage(imageBuffer: Buffer): Promise<ParsedReceipt> {
   const rawText = await extractTextFromImage(imageBuffer);
 
-  // Try to extract amount
-  let amount: number | undefined;
-  const amountMatch = rawText.match(/[₦N]?(\d[\d,]*(?:\.\d+)?)\s*(?:naira|ngn)?/i) ||
-                      rawText.match(/(?:amount|sum|total)[:\s]*[₦N]?(\d[\d,]*(?:\.\d+)?)/i);
-  if (amountMatch) {
-    amount = parseFloat(amountMatch[1].replace(/,/g, ''));
-  }
-
-  // Try to extract account number (10 digits)
+  // ─── Step 1: Extract account number (10 digits) FIRST ───
   let accountNumber: string | undefined;
   const acctMatch = rawText.match(/\b(\d{10})\b/);
   if (acctMatch) accountNumber = acctMatch[1];
 
-  // Try to extract bank name
+  // ─── Step 2: Extract amount, but EXCLUDE 10-digit account numbers ───
+  let amount: number | undefined;
+  // Build a "safe" text that masks out account numbers so they can't match as amounts
+  let safeText = rawText;
+  if (accountNumber) {
+    safeText = safeText.replace(new RegExp(`\\b${accountNumber}\\b`, 'g'), '[ACCT]');
+  }
+
+  // Amount regex: require some context (currency, comma, decimal, or keywords)
+  // Do NOT match bare 10-digit numbers (those are account numbers)
+  const amountPatterns = [
+    // Currency symbol + number
+    /[₦N]\s?(\d[\d,]*(?:\.\d{2})?)\b/i,
+    // Number + naira/NGN
+    /(\d[\d,]*(?:\.\d{2})?)\s*(?:naira|ngn)/i,
+    // Amount/sum/total keyword + number
+    /(?:amount|sum|total|₦|N)[\s:]*([\d,]+(?:\.\d{2})?)/i,
+    // Number with comma (Nigerian style: 50,000) — at least one comma
+    /(\d{1,3}(?:,\d{3})+(?:\.\d{2})?)\b/,
+    // Number with decimal (e.g., 1500.00) — must have decimal
+    /(\d+\.\d{2})\b/,
+  ];
+
+  for (const pattern of amountPatterns) {
+    const match = safeText.match(pattern);
+    if (match) {
+      const val = parseFloat(match[1].replace(/,/g, ''));
+      // Sanity check: amounts on receipts are typically < 10,000,000 and > 100
+      if (val > 100 && val < 10000000 && !Number.isNaN(val)) {
+        amount = val;
+        break;
+      }
+    }
+  }
+
+  // ─── Step 3: Extract bank name ───
   let bankName: string | undefined;
   const bankKeywords = [
     'GTBank', 'Guaranty Trust Bank',
@@ -126,7 +156,7 @@ export async function parseReceiptImage(imageBuffer: Buffer): Promise<ParsedRece
     }
   }
 
-  // Try to extract recipient name (heuristic: name near account number)
+  // ─── Step 4: Extract recipient name ───
   let recipientName: string | undefined;
   const nameMatch = rawText.match(/(?:name|recipient|to|beneficiary)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})/i);
   if (nameMatch) recipientName = nameMatch[1].trim();

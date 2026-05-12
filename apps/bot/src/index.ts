@@ -2367,6 +2367,11 @@ bot.on(message('photo'), async (ctx) => {
       return;
     }
 
+    // Guard: if amount equals account number, LLM/parser confused them
+    if (receipt.amount && receipt.accountNumber && receipt.amount.toString() === receipt.accountNumber) {
+      receipt.amount = undefined;
+    }
+
     // If we got structured data, offer to send
     if (receipt.amount && receipt.accountNumber && receipt.bankName) {
       await finishLoading(ctx, loading.message_id, `📝 I found payment details!\n\nAmount: ₦${receipt.amount.toLocaleString()}\nBank: ${receipt.bankName}\nAccount: ${receipt.accountNumber}\nName: ${receipt.recipientName || 'Unknown'}`, 'Markdown');

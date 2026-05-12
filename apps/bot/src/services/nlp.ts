@@ -534,10 +534,24 @@ export async function parseReceiptWithQVAC(imageBuffer: Buffer): Promise<ParsedR
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
 
+    let amount = parsed.amount ? Number(parsed.amount) : undefined;
+    const accountNumber = sanitizeAccountNumber(parsed.accountNumber) || undefined;
+
+    // Guard: if amount equals account number, the LLM confused them — clear amount
+    if (amount && accountNumber && amount.toString() === accountNumber) {
+      console.warn('[Receipt] LLM confused amount with account number:', amount);
+      amount = undefined;
+    }
+    // Guard: a 10-digit amount without commas/decimals is likely an account number
+    if (amount && Number.isInteger(amount) && amount.toString().length === 10) {
+      console.warn('[Receipt] Amount looks like a 10-digit account number:', amount);
+      amount = undefined;
+    }
+
     return {
-      amount: parsed.amount ? Number(parsed.amount) : undefined,
+      amount,
       bankName: parsed.bankName || undefined,
-      accountNumber: sanitizeAccountNumber(parsed.accountNumber) || undefined,
+      accountNumber,
       recipientName: parsed.recipientName || undefined,
       rawText,
     };
