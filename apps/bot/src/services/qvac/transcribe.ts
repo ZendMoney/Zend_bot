@@ -3,7 +3,7 @@
  * Converts Telegram OGG Opus voice messages to WAV, then transcribes via QVAC Whisper.
  */
 
-import { writeFile, unlink } from 'fs/promises';
+import { writeFile, unlink, readFile, appendFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { exec } from 'child_process';
@@ -22,9 +22,14 @@ async function convertToWav(oggPath: string): Promise<string> {
   const wavPath = oggPath.replace(/\.ogg$/, '.wav');
   // Convert OGG Opus → 16kHz mono WAV (whisper optimal format)
   await execAsync(
-    `ffmpeg -y -i "${oggPath}" -ar 16000 -ac 1 -c:a pcm_s16le "${wavPath}"`,
+    `ffmpeg -y -i "${oggPath}" -ar 16000 -ac 1 -c:a pcm_s16le -f wav "${wavPath}"`,
     { timeout: 30000 }
   );
+  // Ensure WAV data chunk has even byte count (s16le requires multiples of 2)
+  const stat = await readFile(wavPath);
+  if (stat.length % 2 !== 0) {
+    await appendFile(wavPath, Buffer.from([0x00]));
+  }
   return wavPath;
 }
 
