@@ -924,7 +924,8 @@ bot.on(message('text'), async (ctx, next) => {
 
   // ─── Pass menu buttons to bot.hears() handlers ───
   const menuButtons = ['💰 Balance', '💵 Add Naira', '📤 Send', '💴 Cash Out', '📥 Receive', '🔄 Swap', '📅 Schedule', '📋 History', '⚙️ Settings', '🌐 Community'];
-  if (menuButtons.includes(text)) {
+  const adminButtons = ['📊 Stats', '👤 Users', '💸 Transactions', '🏦 Bank Accounts', '📅 Scheduled', '🤖 QVAC Status', '🔙 Back to Menu'];
+  if (menuButtons.includes(text) || adminButtons.includes(text)) {
     return next();
   }
 
