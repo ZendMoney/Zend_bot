@@ -17,18 +17,18 @@ import {
   type OCRTextBlock,
 } from '@qvac/sdk';
 
-// QVAC model constants are exported at runtime via barrel files.
-// TypeScript's NodeNext resolution cannot trace through them, so we
-// @ts-ignore the import and cast to any at the usage sites.
-// @ts-ignore
-import * as registryModels from '@qvac/sdk/dist/models/registry/models.js';
+// Model constants are exported at runtime from the main SDK entry,
+// but TypeScript's NodeNext resolution cannot trace through barrel files.
+// We import the main SDK namespace and cast to any to access them.
+import * as qvacSdk from '@qvac/sdk';
+const registryModels = qvacSdk as any;
 
-const QWEN3_4B_INST_Q4_K_M = (registryModels as any).QWEN3_4B_INST_Q4_K_M;
-const LLAMA_3_2_1B_INST_Q4_0 = (registryModels as any).LLAMA_3_2_1B_INST_Q4_0;
-const WHISPER_TINY_Q8_0 = (registryModels as any).WHISPER_TINY_Q8_0;
-const EMBEDDINGGEMMA_300M_Q4_0 = (registryModels as any).EMBEDDINGGEMMA_300M_Q4_0;
-const OCR_0_6B_MULTIMODAL_Q4_K_M = (registryModels as any).OCR_0_6B_MULTIMODAL_Q4_K_M;
-const AFRICAN_4B_TRANSLATION_Q4_K_M = (registryModels as any).AFRICAN_4B_TRANSLATION_Q4_K_M;
+const QWEN3_4B_INST_Q4_K_M = registryModels.QWEN3_4B_INST_Q4_K_M;
+const LLAMA_3_2_1B_INST_Q4_0 = registryModels.LLAMA_3_2_1B_INST_Q4_0;
+const WHISPER_TINY_Q8_0 = registryModels.WHISPER_TINY_Q8_0;
+const EMBEDDINGGEMMA_300M_Q4_0 = registryModels.EMBEDDINGGEMMA_300M_Q4_0;
+const OCR_0_6B_MULTIMODAL_Q4_K_M = registryModels.OCR_0_6B_MULTIMODAL_Q4_K_M;
+const AFRICAN_4B_TRANSLATION_Q4_K_M = registryModels.AFRICAN_4B_TRANSLATION_Q4_K_M;
 
 // ─── Environment-aware Model Selection ───
 // Set QVAC_USE_LIGHT_MODELS=true for Railway / resource-constrained deploys

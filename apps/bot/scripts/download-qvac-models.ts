@@ -8,14 +8,16 @@
  */
 
 import { loadModel, unloadModel } from '@qvac/sdk';
-// @ts-ignore
-import * as registryModels from '@qvac/sdk/dist/models/registry/models.js';
 
-const QWEN3_4B_INST_Q4_K_M = (registryModels as any).QWEN3_4B_INST_Q4_K_M;
-const WHISPER_TINY_Q8_0 = (registryModels as any).WHISPER_TINY_Q8_0;
-const EMBEDDINGGEMMA_300M_Q4_0 = (registryModels as any).EMBEDDINGGEMMA_300M_Q4_0;
-const OCR_0_6B_MULTIMODAL_Q4_K_M = (registryModels as any).OCR_0_6B_MULTIMODAL_Q4_K_M;
-const AFRICAN_4B_TRANSLATION_Q4_K_M = (registryModels as any).AFRICAN_4B_TRANSLATION_Q4_K_M;
+// Model constants are exported at runtime from the main SDK entry.
+import * as qvacSdk from '@qvac/sdk';
+const registryModels = qvacSdk as any;
+
+const QWEN3_4B_INST_Q4_K_M = registryModels.QWEN3_4B_INST_Q4_K_M;
+const WHISPER_TINY_Q8_0 = registryModels.WHISPER_TINY_Q8_0;
+const EMBEDDINGGEMMA_300M_Q4_0 = registryModels.EMBEDDINGGEMMA_300M_Q4_0;
+const OCR_0_6B_MULTIMODAL_Q4_K_M = registryModels.OCR_0_6B_MULTIMODAL_Q4_K_M;
+const AFRICAN_4B_TRANSLATION_Q4_K_M = registryModels.AFRICAN_4B_TRANSLATION_Q4_K_M;
 
 const MODELS = [
   { name: 'LLM (Qwen3 4B)', descriptor: QWEN3_4B_INST_Q4_K_M, type: 'llm' },
