@@ -16,10 +16,9 @@ import {
 import bs58 from 'bs58';
 import { message } from 'telegraf/filters';
 import { db, checkConnection } from '@zend/db';
-import { users, transactions, savedBankAccounts, scheduledTransfers, bitrefillOrders } from '@zend/db';
+import { users, transactions, savedBankAccounts, scheduledTransfers } from '@zend/db';
 import { eq, sql, and } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
-import { BitRefillClient } from '@zend/bitrefill-client';
 import { parseCommand, transcribeVoice, chatWithKimi, analyzeVoiceWithKimi, parseMenuInputWithAI, type ParsedCommand } from './services/nlp.js';
 import type { PAJClient } from '@zend/paj-client';
 import {
@@ -102,21 +101,6 @@ interface ZendSession {
     sourceChain: string;
     token: string;
     tokenIn: string;
-  };
-  shopData?: {
-    productId?: string;
-    productName?: string;
-    category?: string;
-    amount?: number;
-    currency?: string;
-    phoneNumber?: string;
-    invoiceId?: string;
-    paymentUri?: string;
-    paymentAddress?: string;
-    cryptoAmount?: string;
-    cryptoCurrency?: string;
-    bitrefillPriceUsd?: number;
-    totalUsdt?: number;
   };
 }
 
@@ -207,19 +191,6 @@ setInterval(async () => {
 
 // ─── Services ───
 const walletService = new WalletService(SOLANA_RPC);
-const bitrefillClient = process.env.BITREFILL_API_KEY
-  ? new BitRefillClient(process.env.BITREFILL_API_KEY)
-  : null;
-
-const bitrefillBusinessClient = (process.env.BITREFILL_BUSINESS_API_ID && process.env.BITREFILL_BUSINESS_API_SECRET)
-  ? new BitRefillClient(process.env.BITREFILL_BUSINESS_API_ID, process.env.BITREFILL_BUSINESS_API_SECRET)
-  : null;
-
-const BITREFILL_MARKUP_BPS = parseInt(process.env.BITREFILL_MARKUP_BPS || '150');
-const ZEND_TREASURY_WALLET = process.env.ZEND_TREASURY_WALLET || ''; // receives shop USDT payments
-
-// Dev wallet for gas sponsorship (supports ZEND_DEV_WALLET_SECRET or PV_KEY)
-const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_KEY || '';
 
 const MIN_SOL_FOR_GAS = 0.0005; // ~0.00008 base fee + buffer for bundled tx
 const GAS_SPONSORSHIP_FEE_BPS = 50; // 0.5% extra for gasless users
@@ -229,13 +200,14 @@ async function fundSolIfNeeded(walletAddress: string): Promise<boolean> {
   const hasGas = await walletService.hasEnoughSolForGas(walletAddress, MIN_SOL_FOR_GAS);
   if (hasGas) return false;
 
-  if (!DEV_WALLET_SECRET) {
-    console.warn('[Gas] No dev wallet secret set (ZEND_DEV_WALLET_SECRET or PV_KEY) — cannot fund SOL');
+  const devSecret = process.env.ZEND_DEV_WALLET_SECRET;
+  if (!devSecret) {
+    console.warn('[Gas] No ZEND_DEV_WALLET_SECRET set — cannot fund SOL');
     return false;
   }
 
   try {
-    const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+    const devKeypair = Keypair.fromSecretKey(bs58.decode(devSecret));
     await walletService.sendSol(devKeypair, walletAddress, MIN_SOL_FOR_GAS);
     console.log('[Gas] Funded', MIN_SOL_FOR_GAS, 'SOL from dev wallet to', walletAddress);
     return true;
@@ -390,7 +362,7 @@ async function getPAJRates(): Promise<{ onRampRate: number; offRampRate: number 
 let _pajBankCache: Array<{ id: string; name: string; code: string }> | null = null;
 let _pajBankCacheTime = 0;
 
-async function getPajBankList(sessionToken: string, userId?: string): Promise<Array<{ id: string; name: string; code: string }>> {
+async function getPajBankList(sessionToken: string): Promise<Array<{ id: string; name: string; code: string }>> {
   if (_pajBankCache && Date.now() - _pajBankCacheTime < 3600000) {
     return _pajBankCache;
   }
@@ -401,11 +373,8 @@ async function getPajBankList(sessionToken: string, userId?: string): Promise<Ar
     _pajBankCache = banks.map((b: any) => ({ id: b.id, name: b.name, code: b.code || '' }));
     _pajBankCacheTime = Date.now();
     return _pajBankCache || [];
-  } catch (err: any) {
+  } catch (err) {
     console.error('[PAJ] Failed to fetch bank list:', err);
-    if (isPajSessionError(err) && userId) {
-      await clearPajSession(userId);
-    }
     return _pajBankCache || [];
   }
 }
@@ -463,42 +432,18 @@ function scoreBankMatch(pajName: string, ourCode: string): number {
   return 0;
 }
 
-// ─── PAJ Session Helpers ───
-
-function isPajSessionError(err: any): boolean {
-  const msg = (err?.message || '').toLowerCase();
-  const status = err?.statusCode || err?.status || err?.response?.status;
-  return status === 401 ||
-    msg.includes('session is invalid') ||
-    msg.includes('session expired') ||
-    msg.includes('unauthorized') ||
-    msg.includes('invalid token');
-}
-
-async function clearPajSession(userId: string) {
-  console.log('[PAJ] Clearing expired session for user:', userId);
-  try {
-    await db.update(users)
-      .set({ pajSessionToken: null, pajSessionExpiresAt: null, pajContact: null })
-      .where(eq(users.id, userId));
-  } catch (e) {
-    console.error('[PAJ] Failed to clear session:', e);
-  }
-}
-
 async function verifyBankAccount(
   sessionToken: string,
   ourBankCode: string,
-  accountNumber: string,
-  userId?: string
-): Promise<{ verified: boolean; accountName?: string; error?: string; sessionExpired?: boolean }> {
+  accountNumber: string
+): Promise<{ verified: boolean; accountName?: string; error?: string }> {
   const pajClient = await getPAJClient();
   if (!pajClient) {
     return { verified: false, error: 'PAJ not available' };
   }
 
   try {
-    const pajBanks = await getPajBankList(sessionToken, userId);
+    const pajBanks = await getPajBankList(sessionToken);
     const ourBank = NIGERIAN_BANKS.find(b => b.code === ourBankCode);
     if (!ourBank) {
       return { verified: false, error: 'Unknown bank code' };
@@ -523,10 +468,6 @@ async function verifyBankAccount(
     return { verified: true, accountName: result.accountName };
   } catch (err: any) {
     console.error('[PAJ] Bank verification failed:', err);
-    if (isPajSessionError(err) && userId) {
-      await clearPajSession(userId);
-      return { verified: false, error: 'Your PAJ session expired. Please re-link in Settings.', sessionExpired: true };
-    }
     return { verified: false, error: err.message || 'Could not verify account' };
   }
 }
@@ -537,8 +478,7 @@ const mainMenu = Markup.keyboard([
   ['💵 Add Naira', '💴 Cash Out'],
   ['🔄 Swap', '📥 Receive'],
   ['📅 Schedule', '📋 History'],
-  ['🎁 Shop', '⚙️ Settings'],
-  ['🌐 Community'],
+  ['⚙️ Settings', '🌐 Community'],
 ]).resize();
 
 const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
@@ -599,7 +539,6 @@ bot.on(message('text'), async (ctx, next) => {
     ConversationState.AWAITING_EMAIL,
     ConversationState.AWAITING_SEND_RECIPIENT,
     ConversationState.AWAITING_BANK_DETAILS,
-    ConversationState.AWAITING_SHOP_PHONE,
   ];
   if (sensitiveStates.includes(session.state)) {
     trackMessage(ctx.chat.id, ctx.message.message_id, session.state === ConversationState.AWAITING_PIN || session.state === ConversationState.AWAITING_PIN_VERIFY);
@@ -727,9 +666,6 @@ bot.command('start', async (ctx) => {
     `💡 Tap *💵 Add Naira* to get your virtual bank account.`,
     { parse_mode: 'Markdown', ...mainMenu }
   );
-  await ctx.reply('📋 Tap to copy your address:', Markup.inlineKeyboard([
-    [{ text: '📋 Copy Address', copy_text: { text: wallet.publicKey } } as any]
-  ]));
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -750,735 +686,18 @@ bot.command('wallet', async (ctx) => {
     `👛 *Your Account*\n\n` +
     `*Your Address:*\n\n` +
     `${u.walletAddress}\n\n` +
+    `Tap and hold the address above to copy it.\n\n` +
     `*Currencies:* SOL, USDT, USDC\n\n` +
     `⚠️ To view your secret code, go to *⚙️ Settings*.`;
-
-  const copyBtn = Markup.inlineKeyboard([
-    [{ text: '📋 Copy Address', copy_text: { text: u.walletAddress } } as any]
-  ]);
 
   if (isGroupChat(ctx)) {
     const name = ctx.from?.first_name || 'there';
     await ctx.reply(`📩 ${name}, check your DM for your address.`);
-    await ctx.telegram.sendMessage(ctx.from!.id, msg, { parse_mode: 'Markdown', ...copyBtn });
+    await ctx.telegram.sendMessage(ctx.from!.id, msg, { parse_mode: 'Markdown' });
     return;
   }
 
-  await ctx.reply(msg, { parse_mode: 'Markdown', ...copyBtn });
-});
-
-// ═════════════════════════════════════════════════════════════════════════════
-// 🎁 SHOP — BitRefill Integration
-// ═════════════════════════════════════════════════════════════════════════════
-
-// Cache for BitRefill products (TTL: 10 minutes)
-const bitrefillProductCache = new Map<string, { products: any[]; fetchedAt: number }>();
-const BITREFILL_CACHE_TTL = 10 * 60 * 1000;
-
-async function getCachedProducts(country: string, category?: string): Promise<any[]> {
-  const key = `${country}:${category || 'all'}`;
-  const cached = bitrefillProductCache.get(key);
-  if (cached && Date.now() - cached.fetchedAt < BITREFILL_CACHE_TTL) {
-    return cached.products;
-  }
-  if (!bitrefillClient) return [];
-  try {
-    const res = await bitrefillClient.getProducts({ country, category, limit: 50 });
-    const products = res.data || [];
-    bitrefillProductCache.set(key, { products, fetchedAt: Date.now() });
-    return products;
-  } catch (err) {
-    console.error('[BitRefill] Failed to fetch products:', err);
-    return [];
-  }
-}
-
-// ─── Shop entry ───
-bot.command('shop', async (ctx) => {
-  await showShop(ctx);
-});
-
-bot.hears('🎁 Shop', async (ctx) => {
-  await showShop(ctx);
-});
-
-async function showShop(ctx: ZendContext) {
-  if (!bitrefillClient) {
-    await ctx.reply(
-      '🎁 *Shop*\n\n' +
-      'Shopping is temporarily unavailable. Please try again later.',
-      { parse_mode: 'Markdown', ...mainMenu }
-    );
-    return;
-  }
-
-  await ctx.reply(
-    '🛒 *Shop with Crypto*\n\n' +
-    'What do you want to buy?',
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('📱 Airtime', 'shop_cat:refill')],
-        [Markup.button.callback('📶 Data Bundles', 'shop_cat:data')],
-        [Markup.button.callback('🌍 Gift Cards', 'shop_cat:gift-card')],
-        [Markup.button.callback('🌐 eSIM', 'shop_cat:esim')],
-        [Markup.button.callback('📦 My Orders', 'shop_orders')],
-      ]),
-    }
-  );
-}
-
-// ─── Category selection ───
-bot.action(/shop_cat:(.+)/, async (ctx) => {
-  const category = ctx.match[1];
-  const userId = ctx.from!.id.toString();
-
-  await ctx.answerCbQuery('Loading products...');
-
-  const products = await getCachedProducts('NG', category === 'data' ? 'refill' : category);
-  // Filter by keyword for data bundles if needed
-  let filtered = products.filter((p: any) => p.in_stock !== false);
-  if (category === 'data') {
-    filtered = filtered.filter((p: any) =>
-      p.name.toLowerCase().includes('data') ||
-      p.name.toLowerCase().includes('bundle') ||
-      p.name.toLowerCase().includes('internet')
-    );
-  }
-
-  if (!filtered.length) {
-    await ctx.editMessageText(
-      '🎁 *Shop*\n\n' +
-      'No products available in this category right now.\n\n' +
-      'Please try again later.',
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
-        [Markup.button.callback('⬅️ Back', 'shop_back')],
-      ]) }
-    );
-    return;
-  }
-
-  const buttons = filtered.slice(0, 10).map((p: any) =>
-    [Markup.button.callback(p.name, `shop_product:${p.id}`)]
-  );
-  buttons.push([Markup.button.callback('⬅️ Back', 'shop_back')]);
-
-  await ctx.editMessageText(
-    `🛒 *Shop — ${category === 'refill' ? 'Airtime' : category === 'gift-card' ? 'Gift Cards' : category === 'esim' ? 'eSIM' : 'Data Bundles'}*\n\n` +
-    `Choose a product:`,
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
-  );
-});
-
-// ─── Product selection ───
-bot.action(/shop_product:(.+)/, async (ctx) => {
-  const productId = ctx.match[1];
-  const userId = ctx.from!.id.toString();
-
-  await ctx.answerCbQuery('Loading...');
-
-  if (!bitrefillClient) return;
-
-  try {
-    const product = await bitrefillClient.getProduct(productId);
-    const session = getSession(userId);
-    session.shopData = {
-      productId: product.id,
-      productName: product.name,
-      category: product.category,
-    };
-
-    // Build amount buttons
-    const buttons: any[] = [];
-
-    if (product.packages && product.packages.length > 0) {
-      // Fixed packages
-      for (const pkg of product.packages.slice(0, 8)) {
-        buttons.push([Markup.button.callback(
-          `${pkg.value} ${pkg.currency} — ~$${pkg.price}`,
-          `shop_pkg:${pkg.package_id}`
-        )]);
-      }
-    } else if (product.range) {
-      // Variable amount
-      const presets = [500, 1000, 2000, 5000, 10000];
-      const validPresets = presets.filter(a =>
-        a >= product.range!.min && a <= product.range!.max
-      );
-      for (const amt of validPresets.slice(0, 5)) {
-        buttons.push([Markup.button.callback(
-          `${product.currency} ${amt.toLocaleString()}`,
-          `shop_amount:${amt}`
-        )]);
-      }
-      buttons.push([Markup.button.callback('✏️ Custom Amount', 'shop_custom_amount')]);
-    }
-
-    buttons.push([Markup.button.callback('⬅️ Back', 'shop_back')]);
-
-    await ctx.editMessageText(
-      `🛒 *${product.name}*\n\n` +
-      `${product.in_stock ? '✅ In Stock' : '❌ Out of Stock'}\n` +
-      `Country: ${product.country || 'Nigeria'}\n` +
-      `Currency: ${product.currency}\n\n` +
-      `Choose an amount:`,
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
-    );
-  } catch (err) {
-    console.error('[Shop] Product fetch error:', err);
-    await ctx.editMessageText(
-      '❌ Could not load product details. Please try again.',
-      Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'shop_back')]])
-    );
-  }
-});
-
-// ─── Package selection ───
-bot.action(/shop_pkg:(.+)/, async (ctx) => {
-  const packageId = ctx.match[1];
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-
-  if (!session.shopData) return;
-
-  // Find package details from cache
-  const products = await getCachedProducts('NG');
-  const product = products.find((p: any) => p.id === session.shopData!.productId);
-  const pkg = product?.packages?.find((p: any) => p.package_id === packageId);
-
-  session.shopData.amount = pkg?.value || 0;
-  session.shopData.currency = pkg?.currency || product?.currency || 'NGN';
-
-  await askForPhoneNumber(ctx, userId);
-});
-
-// ─── Amount selection ───
-bot.action(/shop_amount:(.+)/, async (ctx) => {
-  const amount = parseFloat(ctx.match[1]);
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-
-  if (!session.shopData) return;
-
-  session.shopData.amount = amount;
-
-  const products = await getCachedProducts('NG');
-  const product = products.find((p: any) => p.id === session.shopData!.productId);
-  session.shopData.currency = product?.currency || 'NGN';
-
-  await askForPhoneNumber(ctx, userId);
-});
-
-// ─── Custom amount ───
-bot.action('shop_custom_amount', async (ctx) => {
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-
-  if (!session.shopData) return;
-
-  session.state = ConversationState.AWAITING_SHOP_AMOUNT;
-
-  await ctx.editMessageText(
-    `🛒 *${session.shopData.productName}*\n\n` +
-    `Enter the amount you want to buy (in ${session.shopData.currency || 'NGN'}):`,
-    { parse_mode: 'Markdown' }
-  );
-});
-
-// ─── Handle custom amount text input ───
-bot.use(async (ctx, next) => {
-  if (!ctx.message || !('text' in ctx.message)) return next();
-
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-
-  if (session.state === ConversationState.AWAITING_SHOP_AMOUNT) {
-    const text = ctx.message.text.trim().replace(/,/g, '');
-    const amount = parseFloat(text);
-
-    if (isNaN(amount) || amount <= 0) {
-      await ctx.reply('❌ Please enter a valid amount.', mainMenu);
-      return;
-    }
-
-    session.shopData!.amount = amount;
-    session.state = ConversationState.IDLE;
-
-    const products = await getCachedProducts('NG');
-    const product = products.find((p: any) => p.id === session.shopData!.productId);
-    session.shopData!.currency = product?.currency || 'NGN';
-
-    await askForPhoneNumber(ctx, userId);
-    return;
-  }
-
-  return next();
-});
-
-// ─── Ask for phone number ───
-async function askForPhoneNumber(ctx: ZendContext, userId: string) {
-  const session = getSession(userId);
-  session.state = ConversationState.AWAITING_SHOP_PHONE;
-
-  const isAirtime = session.shopData?.category === 'refill' ||
-                    session.shopData?.productName?.toLowerCase().includes('mtn') ||
-                    session.shopData?.productName?.toLowerCase().includes('airtel');
-
-  await ctx.reply(
-    `🛒 *${session.shopData!.productName}*\n\n` +
-    `Amount: *${session.shopData!.currency} ${session.shopData!.amount!.toLocaleString()}*\n\n` +
-    `${isAirtime ? '📱 Enter the phone number to recharge:' : '📧 Enter your email (optional) or type "skip":'}`,
-    { parse_mode: 'Markdown', ...cancelKeyboard }
-  );
-}
-
-// ─── Handle phone number input ───
-bot.use(async (ctx, next) => {
-  if (!ctx.message || !('text' in ctx.message)) return next();
-
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-
-  if (session.state === ConversationState.AWAITING_SHOP_PHONE) {
-    const text = ctx.message.text.trim();
-
-    if (text === '❌ Cancel') {
-      session.state = ConversationState.IDLE;
-      session.shopData = undefined;
-      await ctx.reply('❌ Order cancelled.', mainMenu);
-      return;
-    }
-
-    // Simple phone validation for Nigeria
-    const phoneRegex = /^\+?234\d{10}$|^0\d{10}$/;
-    const isAirtime = session.shopData?.category === 'refill' ||
-                      session.shopData?.productName?.toLowerCase().includes('mtn') ||
-                      session.shopData?.productName?.toLowerCase().includes('airtel');
-
-    if (isAirtime && !phoneRegex.test(text)) {
-      await ctx.reply(
-        '❌ Please enter a valid Nigerian phone number.\n\n' +
-        'Examples: `+2348012345678` or `08012345678`',
-        { parse_mode: 'Markdown', ...cancelKeyboard }
-      );
-      return;
-    }
-
-    session.shopData!.phoneNumber = text;
-    session.state = ConversationState.IDLE;
-
-    await showShopConfirm(ctx, userId);
-    return;
-  }
-
-  return next();
-});
-
-// ─── Show order confirmation ───
-async function showShopConfirm(ctx: ZendContext, userId: string) {
-  const session = getSession(userId);
-  const sd = session.shopData!;
-
-  await ctx.reply('⏳ Calculating price...');
-
-  try {
-    const cachedProducts = await getCachedProducts('NG');
-    const product = cachedProducts.find((p: any) => p.id === sd.productId);
-    const pkg = product?.packages?.find((p: any) => p.value === sd.amount);
-
-    // Calculate BitRefill price in USD
-    let bitrefillPriceUsd = 0;
-    if (pkg) {
-      bitrefillPriceUsd = pkg.price;
-    } else if (product?.range && sd.amount) {
-      // Estimate: use amount as proxy for USD (NGN is ~1600:1, but BitRefill might price differently)
-      // For variable products, we'll need to create an invoice to get exact price
-      bitrefillPriceUsd = sd.amount / 1600; // rough estimate for display
-    }
-
-    // Add Zend margin
-    const marginMultiplier = 1 + BITREFILL_MARKUP_BPS / 10000;
-    const totalUsdt = bitrefillPriceUsd * marginMultiplier;
-
-    sd.bitrefillPriceUsd = bitrefillPriceUsd;
-    sd.totalUsdt = totalUsdt;
-
-    const canUseBalance = !!bitrefillBusinessClient && !!ZEND_TREASURY_WALLET;
-
-    const buttons: any[] = [];
-    if (canUseBalance) {
-      buttons.push([Markup.button.callback(`✅ Pay $${totalUsdt.toFixed(2)} USDT`, 'shop_pay_balance')]);
-    }
-    buttons.push([Markup.button.callback('💳 Pay with Crypto (External)', 'shop_pay_crypto')]);
-    buttons.push([Markup.button.callback('❌ Cancel', 'shop_cancel')]);
-
-    await ctx.reply(
-      `🧾 *Order Summary*\n\n` +
-      `Product: ${sd.productName}\n` +
-      `Amount: ${sd.currency} ${sd.amount?.toLocaleString()}\n` +
-      `${sd.phoneNumber ? `Phone: \`${sd.phoneNumber}\`\n` : ''}` +
-      `\n` +
-      `Base Price: ~$${bitrefillPriceUsd.toFixed(2)} USDT\n` +
-      `Zend Fee (${(BITREFILL_MARKUP_BPS / 100).toFixed(2)}%): ~$${(totalUsdt - bitrefillPriceUsd).toFixed(4)} USDT\n` +
-      `*Total: $${totalUsdt.toFixed(2)} USDT*\n\n` +
-      `${canUseBalance
-        ? 'Pay instantly from your Zend balance — no external wallet needed.'
-        : 'Pay directly with your crypto wallet.'}`,
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
-    );
-  } catch (err: any) {
-    console.error('[Shop] Confirm error:', err);
-    await ctx.reply('❌ Could not calculate price. Please try again.', mainMenu);
-    session.shopData = undefined;
-  }
-}
-
-// ─── Pay with Zend Balance (Phase 2) ───
-bot.action('shop_pay_balance', async (ctx) => {
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-  const sd = session.shopData;
-
-  if (!sd || !bitrefillBusinessClient || !ZEND_TREASURY_WALLET) {
-    await ctx.answerCbQuery('Not available');
-    return;
-  }
-
-  await ctx.answerCbQuery('Processing...');
-  await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
-
-  try {
-    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-    if (!user.length) {
-      await ctx.reply('❌ User not found.', mainMenu);
-      session.shopData = undefined;
-      return;
-    }
-
-    const walletAddress = user[0].walletAddress;
-
-    // Check USDT balance
-    const usdtBalance = await walletService.getTokenBalance(walletAddress, SOLANA_TOKENS.USDT.mint);
-    if (usdtBalance < (sd.totalUsdt || 0)) {
-      await ctx.reply(
-        `❌ *Insufficient Balance*\n\n` +
-        `You need *$${(sd.totalUsdt || 0).toFixed(2)} USDT* but only have *$${usdtBalance.toFixed(2)} USDT*.\n\n` +
-        `Tap 💵 *Add Naira* or 📥 *Receive* to top up.`,
-        { parse_mode: 'Markdown', ...mainMenu }
-      );
-      session.shopData = undefined;
-      return;
-    }
-
-    // Check SOL for gas
-    const hasGas = await walletService.hasEnoughSolForGas(walletAddress, MIN_SOL_FOR_GAS);
-    if (!hasGas) {
-      const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
-      await walletService.sendSol(devKeypair, walletAddress, MIN_SOL_FOR_GAS);
-      console.log('[Gas] Funded SOL for shop purchase');
-    }
-
-    // Deduct USDT from user wallet → treasury
-    const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
-    const keypair = Keypair.fromSecretKey(secretKey);
-
-    await ctx.reply('⏳ Sending USDT payment...');
-    const txHash = await walletService.sendUsdt(keypair, ZEND_TREASURY_WALLET, sd.totalUsdt || 0);
-    console.log('[Shop] USDT payment sent:', txHash);
-
-    // Create BitRefill invoice with auto_pay
-    await ctx.reply('⏳ Fulfilling your order via BitRefill...');
-
-    const products: any[] = [{
-      product_id: sd.productId,
-      quantity: 1,
-    }];
-
-    const cachedProducts = await getCachedProducts('NG');
-    const product = cachedProducts.find((p: any) => p.id === sd.productId);
-    const pkg = product?.packages?.find((p: any) => p.value === sd.amount);
-
-    if (pkg) {
-      products[0].package_id = pkg.package_id;
-    } else {
-      products[0].value = sd.amount;
-    }
-
-    if (sd.phoneNumber && sd.phoneNumber !== 'skip') {
-      products[0].phone_number = sd.phoneNumber;
-    }
-
-    const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || '';
-    const webhookUrl = webhookBaseUrl ? `${webhookBaseUrl.replace(/\/$/, '')}/webhooks/bitrefill` : undefined;
-
-    const invoice = await bitrefillBusinessClient.createInvoice({
-      products,
-      payment_method: 'balance',
-      auto_pay: true,
-      webhook_url: webhookUrl,
-      email: user[0]?.email || undefined,
-    });
-
-    // Save order
-    await db.insert(bitrefillOrders).values({
-      userId,
-      bitrefillInvoiceId: invoice.id,
-      productId: sd.productId!,
-      productName: sd.productName!,
-      category: sd.category || 'refill',
-      amountFiat: String(sd.amount || 0),
-      currencyFiat: sd.currency,
-      amountCrypto: String(sd.totalUsdt || 0),
-      cryptoCurrency: 'USDT',
-      status: invoice.status === 'complete' ? 'complete' : 'pending',
-      recipientPhone: sd.phoneNumber,
-      recipientEmail: user[0]?.email,
-      metadata: invoice,
-    });
-
-    // If invoice is already complete, deliver immediately
-    if (invoice.status === 'complete' && invoice.orders?.length) {
-      const orderId = invoice.orders[0].id;
-      const order = await bitrefillBusinessClient.getOrder(orderId);
-
-      await db.update(bitrefillOrders)
-        .set({
-          status: 'complete',
-          codes: order.redemption_info ? [order.redemption_info] : [],
-          completedAt: new Date(),
-        })
-        .where(eq(bitrefillOrders.bitrefillInvoiceId, invoice.id));
-
-      const codeText = order.redemption_info
-        ? order.redemption_info.pin
-          ? `Code: \`${order.redemption_info.code}\`\nPin: \`${order.redemption_info.pin}\``
-          : `Code: \`${order.redemption_info.code}\``
-        : '✅ Your order has been fulfilled.';
-
-      await ctx.reply(
-        `🎉 *Order Complete!*\n\n` +
-        `${sd.productName}\n` +
-        `${sd.currency} ${sd.amount?.toLocaleString()}\n\n` +
-        `${codeText}\n\n` +
-        `Paid: $${(sd.totalUsdt || 0).toFixed(2)} USDT\n` +
-        `Ref: \`${invoice.id}\``,
-        { parse_mode: 'Markdown', ...mainMenu }
-      );
-    } else {
-      await ctx.reply(
-        `⏳ *Order Processing*\n\n` +
-        `${sd.productName}\n` +
-        `Amount: ${sd.currency} ${sd.amount?.toLocaleString()}\n\n` +
-        `Paid: $${(sd.totalUsdt || 0).toFixed(2)} USDT\n` +
-        `You'll receive a notification when it's ready.`,
-        { parse_mode: 'Markdown', ...mainMenu }
-      );
-    }
-
-    session.shopData = undefined;
-
-  } catch (err: any) {
-    console.error('[Shop] Balance payment failed:', err);
-    await ctx.reply(
-      `❌ *Payment Failed*\n\n` +
-      `Error: ${err.message || 'Unknown error'}\n\n` +
-      `If USDT was deducted, it will be refunded. Please try again.`,
-      { parse_mode: 'Markdown', ...mainMenu }
-    );
-    session.shopData = undefined;
-  }
-});
-
-// ─── Pay with Crypto (Phase 1 fallback) ───
-bot.action('shop_pay_crypto', async (ctx) => {
-  const userId = ctx.from!.id.toString();
-  await ctx.answerCbQuery('Creating invoice...');
-  await createBitRefillInvoice(ctx, userId);
-});
-
-// ─── Cancel order ───
-bot.action('shop_cancel', async (ctx) => {
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-  session.shopData = undefined;
-  await ctx.answerCbQuery('Cancelled');
-  await ctx.editMessageText('❌ Order cancelled.');
-});
-
-// ─── Create invoice (Phase 1 — direct crypto payment) ───
-async function createBitRefillInvoice(ctx: ZendContext, userId: string) {
-  const session = getSession(userId);
-  const sd = session.shopData!;
-
-  if (!bitrefillClient) {
-    await ctx.reply('❌ Shop is not configured. Please try again later.', mainMenu);
-    return;
-  }
-
-  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-  const email = user[0]?.email || undefined;
-
-  await ctx.reply('⏳ Creating your invoice...');
-
-  try {
-    const products: any[] = [{
-      product_id: sd.productId,
-      quantity: 1,
-    }];
-
-    const cachedProducts = await getCachedProducts('NG');
-    const product = cachedProducts.find((p: any) => p.id === sd.productId);
-    const pkg = product?.packages?.find((p: any) => p.value === sd.amount);
-
-    if (pkg) {
-      products[0].package_id = pkg.package_id;
-    } else {
-      products[0].value = sd.amount;
-    }
-
-    if (sd.phoneNumber && sd.phoneNumber !== 'skip') {
-      products[0].phone_number = sd.phoneNumber;
-    }
-
-    const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || '';
-    const webhookUrl = webhookBaseUrl ? `${webhookBaseUrl.replace(/\/$/, '')}/webhooks/bitrefill` : undefined;
-
-    const invoice = await bitrefillClient.createInvoice({
-      products,
-      payment_method: 'bitcoin',
-      refund_address: user[0]?.walletAddress,
-      webhook_url: webhookUrl,
-      email,
-    });
-
-    await db.insert(bitrefillOrders).values({
-      userId,
-      bitrefillInvoiceId: invoice.id,
-      productId: sd.productId!,
-      productName: sd.productName!,
-      category: sd.category || 'refill',
-      amountFiat: String(sd.amount || 0),
-      currencyFiat: sd.currency,
-      status: 'pending',
-      recipientPhone: sd.phoneNumber,
-      recipientEmail: email,
-      paymentAddress: invoice.payment?.address,
-      paymentUri: invoice.payment?.BIP21,
-      cryptoCurrency: invoice.crypto_currency || invoice.payment?.currency,
-      amountCrypto: invoice.crypto_amount || invoice.payment?.amount,
-      metadata: invoice,
-    });
-
-    const paymentText = invoice.payment?.BIP21
-      ? `[Pay with Bitcoin](${invoice.payment.BIP21})`
-      : invoice.payment?.address
-        ? `Address: \`${invoice.payment.address}\``
-        : 'Payment details will be sent shortly.';
-
-    await ctx.reply(
-      `🧾 *Invoice Created*\n\n` +
-      `Product: ${sd.productName}\n` +
-      `Amount: ${sd.currency} ${sd.amount?.toLocaleString()}\n` +
-      `${sd.phoneNumber ? `Phone: \`${sd.phoneNumber}\`\n` : ''}` +
-      `\n` +
-      `*Payment Required:*\n` +
-      `Amount: ${invoice.crypto_amount || invoice.payment?.amount || '...'} ${invoice.crypto_currency || invoice.payment?.currency || 'BTC'}\n` +
-      `${paymentText}\n\n` +
-      `⏱️ Your order will be processed once payment is confirmed.\n` +
-      `You'll receive a notification here when it's ready.`,
-      { parse_mode: 'Markdown', ...mainMenu }
-    );
-
-    session.shopData = undefined;
-
-  } catch (err: any) {
-    console.error('[Shop] Invoice creation failed:', err);
-    await ctx.reply(
-      `❌ *Order Failed*\n\n` +
-      `Could not create invoice.\n` +
-      `Error: ${err.message || 'Unknown error'}\n\n` +
-      `Please try again later.`,
-      { parse_mode: 'Markdown', ...mainMenu }
-    );
-    session.shopData = undefined;
-  }
-}
-
-// ─── My Orders ───
-bot.action('shop_orders', async (ctx) => {
-  const userId = ctx.from!.id.toString();
-
-  await ctx.answerCbQuery('Loading orders...');
-
-  const orders = await db.select().from(bitrefillOrders)
-    .where(eq(bitrefillOrders.userId, userId))
-    .orderBy(bitrefillOrders.createdAt)
-    .limit(10);
-
-  if (!orders.length) {
-    await ctx.editMessageText(
-      '📦 *My Orders*\n\n' +
-      'You have no orders yet.\n\n' +
-      'Tap 🎁 *Shop* to get started!',
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
-        [Markup.button.callback('🎁 Go to Shop', 'shop_back')],
-      ]) }
-    );
-    return;
-  }
-
-  let msg = '📦 *My Orders*\n\n';
-  const buttons: any[] = [];
-
-  for (let i = 0; i < orders.length; i++) {
-    const o = orders[i];
-    const statusEmoji = o.status === 'complete' ? '✅' : o.status === 'pending' ? '⏳' : '❌';
-    msg += `${i + 1}. ${statusEmoji} *${o.productName}* — ${o.currencyFiat} ${o.amountFiat}\n`;
-    if (o.status === 'complete' && o.codes) {
-      buttons.push([Markup.button.callback(`📋 Copy ${o.productName} Code`, `shop_copy:${o.id}`)]);
-    }
-  }
-
-  buttons.push([Markup.button.callback('⬅️ Back to Shop', 'shop_back')]);
-
-  await ctx.editMessageText(msg, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
-});
-
-// ─── Copy code from order ───
-bot.action(/shop_copy:(.+)/, async (ctx) => {
-  const orderId = parseInt(ctx.match[1]);
-  const userId = ctx.from!.id.toString();
-
-  const orders = await db.select().from(bitrefillOrders)
-    .where(and(eq(bitrefillOrders.id, orderId), eq(bitrefillOrders.userId, userId)))
-    .limit(1);
-
-  if (!orders.length) {
-    await ctx.answerCbQuery('Order not found');
-    return;
-  }
-
-  const codes = orders[0].codes as any[];
-  if (!codes?.length) {
-    await ctx.answerCbQuery('No code available');
-    return;
-  }
-
-  const codeText = codes.map((c: any) => c.pin ? `${c.code} (Pin: ${c.pin})` : c.code).join('\n');
-
-  await ctx.reply(
-    `📋 *Your Code*\n\n` +
-    `${orders[0].productName}\n\n` +
-    `\`${codeText}\``,
-    { parse_mode: 'Markdown' }
-  );
-  await ctx.answerCbQuery('Code sent!');
-});
-
-// ─── Back button ───
-bot.action('shop_back', async (ctx) => {
-  await ctx.answerCbQuery();
-  await showShop(ctx);
+  await ctx.reply(msg, { parse_mode: 'Markdown' });
 });
 
 // ─── Export key helper (called after PIN is verified) ───
@@ -1860,9 +1079,6 @@ bot.on(message('text'), async (ctx, next) => {
         `Reference: \`${txId}\``,
         { parse_mode: 'Markdown', ...mainMenu }
       );
-      await ctx.reply('📋 Tap to copy the address:', Markup.inlineKeyboard([
-        [{ text: '📋 Copy Address', copy_text: { text: intent.intent_address } } as any]
-      ]));
     } catch (err: any) {
       console.error('[Bridge] Failed:', err);
       await ctx.reply(
@@ -2214,21 +1430,10 @@ bot.on(message('text'), async (ctx, next) => {
 
     if (user[0]?.pajSessionToken) {
       verifyMsg = await showLoading(ctx, 'Verifying account...');
-      const verification = await verifyBankAccount(user[0].pajSessionToken, bankCode, accountNumber, userId);
+      const verification = await verifyBankAccount(user[0].pajSessionToken, bankCode, accountNumber);
       if (verification.verified && verification.accountName) {
         verifiedName = verification.accountName;
         verifiedStatus = 'verified';
-      } else if (verification.sessionExpired) {
-        await ctx.reply(
-          `⚠️ *PAJ Session Expired*\n\n` +
-          `Your bank verification link has expired.\n` +
-          `Please go to *⚙️ Settings → 🔗 Link PAJ* to reconnect.`,
-          { parse_mode: 'Markdown', ...mainMenu }
-        );
-        session.state = ConversationState.IDLE;
-        session.pendingTransaction = undefined;
-        setSession(userId, session);
-        return;
       } else {
         console.log('[Verify] Failed:', verification.error);
       }
@@ -2383,7 +1588,7 @@ bot.on(message('text'), async (ctx, next) => {
         let verifiedStatus: 'verified' | 'unverified' | 'no_paj' = 'unverified';
 
         if (parsed.bankCode && parsed.accountNumber && user[0]?.pajSessionToken) {
-          const verification = await verifyBankAccount(user[0].pajSessionToken, parsed.bankCode, parsed.accountNumber, userId);
+          const verification = await verifyBankAccount(user[0].pajSessionToken, parsed.bankCode, parsed.accountNumber);
           if (verification.verified && verification.accountName) {
             verifiedName = verification.accountName;
             verifiedStatus = 'verified';
@@ -2435,11 +1640,9 @@ bot.on(message('text'), async (ctx, next) => {
           `Rate: ${formatNgn(rate)} per Dollar\n\n` +
           `Confirm?`;
 
-        const addressToCopy = parsed.accountNumber || parsed.walletAddress;
         await ctx.reply(msg, {
           parse_mode: 'Markdown',
           ...Markup.inlineKeyboard([
-            [{ text: '📋 Copy Account/Address', copy_text: { text: addressToCopy } } as any],
             [Markup.button.callback('✅ Confirm', 'confirm_send')],
             [Markup.button.callback('❌ Cancel', 'cancel_send')],
           ]),
@@ -2668,7 +1871,7 @@ bot.on(message('text'), async (ctx, next) => {
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     if (user[0]?.pajSessionToken) {
       try {
-        const verification = await verifyBankAccount(user[0].pajSessionToken, bank.code, accountNumber, userId);
+        const verification = await verifyBankAccount(user[0].pajSessionToken, bank.code, accountNumber);
         if (verification.verified && verification.accountName) {
           accountName = verification.accountName;
         }
@@ -3174,16 +2377,6 @@ async function showVirtualAccount(
       console.log('[PAJ] Virtual account created:', order.accountNumber, 'for ₦', fiatAmount);
     } catch (err: any) {
       console.error('[PAJ] createOnramp failed:', err);
-      if (isPajSessionError(err)) {
-        await clearPajSession(userId);
-        await finishLoading(ctx, loadingVA.message_id, '⚠️ Your PAJ session expired. Please re-link in Settings.');
-        await ctx.reply(
-          `⚠️ *PAJ Session Expired*\n\n` +
-          `Go to *⚙️ Settings → 🔗 Link PAJ* to reconnect.`,
-          { parse_mode: 'Markdown', ...mainMenu }
-        );
-        return;
-      }
       await finishLoading(ctx, loadingVA.message_id, `❌ Could not create virtual account.\nError: ${err.message || 'Unknown error'}`);
       await ctx.reply('Menu:', mainMenu);
       return;
@@ -3204,12 +2397,10 @@ async function showVirtualAccount(
     `🔢 \`${virtualAccount.accountNumber}\`\n` +
     `👤 *${virtualAccount.accountName}*\n\n` +
     `⏱️ Arrives in: 2-5 minutes\n\n` +
+    `📋 Tap to copy account number\n\n` +
     `⚠️ *Important:* Send from a bank account in your name.`,
     { parse_mode: 'Markdown', ...mainMenu }
   );
-  await ctx.reply('📋 Tap to copy account number:', Markup.inlineKeyboard([
-    [{ text: '📋 Copy Account Number', copy_text: { text: virtualAccount.accountNumber } } as any]
-  ]));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -3434,10 +2625,6 @@ async function executeSendCore(
     return { success: true, txId, solanaTxHash, offRampRef };
   } catch (err: any) {
     console.error('Off-ramp failed:', err);
-    if (isPajSessionError(err)) {
-      await clearPajSession(userId);
-      return { success: false, txId, error: 'Your PAJ session expired. Please re-link in Settings.' };
-    }
     await db.update(transactions)
       .set({ status: 'failed' })
       .where(eq(transactions.id, txId));
@@ -3723,7 +2910,7 @@ async function prepareSendConfirmation(
   let verifiedStatus: 'verified' | 'unverified' | 'no_paj' = 'unverified';
 
   if (user[0]?.pajSessionToken) {
-    const verification = await verifyBankAccount(user[0].pajSessionToken, bankCode, recipientAccountNumber, userId);
+    const verification = await verifyBankAccount(user[0].pajSessionToken, bankCode, recipientAccountNumber);
     if (verification.verified && verification.accountName) {
       verifiedName = verification.accountName;
       verifiedStatus = 'verified';
@@ -3868,16 +3055,11 @@ async function showReceive(ctx: ZendContext, userId: string) {
   msg += `💡 *Crypto arrives instantly*\n`;
   msg += `⏱️ *Naira takes 2–5 minutes* after bank transfer`;
 
-  const kbRows: any[] = [];
-  kbRows.push([{ text: '📋 Copy Crypto Address', copy_text: { text: walletAddress } } as any]);
-  if (hasVA) {
-    kbRows.push([{ text: '📋 Copy Account Number', copy_text: { text: virtualAccount.accountNumber } } as any]);
-  }
-  kbRows.push([Markup.button.callback('🌉 Receive from Other Apps', 'bridge_start')]);
-
   await ctx.reply(msg, {
     parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard(kbRows),
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('🌉 Receive from Other Apps', 'bridge_start')],
+    ]),
   });
 }
 
@@ -4590,7 +3772,6 @@ async function showSettings(ctx: ZendContext, userId: string) {
 
     // Build dynamic settings menu — hide items already done
     const buttons: any[] = [];
-    buttons.push([{ text: '📋 Copy Address', copy_text: { text: u.walletAddress } } as any]);
     if (!u.email) {
       buttons.push([Markup.button.callback('📧 Add Email', 'settings_email')]);
     }
@@ -4839,69 +4020,6 @@ bot.catch((err, ctx) => {
 // ═════════════════════════════════════════════════════════════════════════════
 
 // ═════════════════════════════════════════════════════════════════════════════
-// BALANCE CHANGE DETECTOR — notifies users of direct Solana deposits
-// ═════════════════════════════════════════════════════════════════════════════
-
-const balanceSnapshots = new Map<string, { sol: number; usdt: number; usdc: number }>();
-
-async function checkBalanceChanges(botInstance: Telegraf<any>) {
-  try {
-    const allUsers = await db.select({ id: users.id, walletAddress: users.walletAddress }).from(users);
-    for (const user of allUsers) {
-      try {
-        const balances = await walletService.getAllBalances(user.walletAddress);
-        const current = {
-          sol: balances.find((b: any) => b.symbol === 'SOL')?.amount || 0,
-          usdt: balances.find((b: any) => b.symbol === 'USDT')?.amount || 0,
-          usdc: balances.find((b: any) => b.symbol === 'USDC')?.amount || 0,
-        };
-
-        const prev = balanceSnapshots.get(user.id);
-        if (prev) {
-          const solDiff = current.sol - prev.sol;
-          const usdtDiff = current.usdt - prev.usdt;
-          const usdcDiff = current.usdc - prev.usdc;
-
-          if (solDiff > 0.000001) {
-            await botInstance.telegram.sendMessage(
-              user.id,
-              `🎉 *Funds Received!*\n\n` +
-              `*+${solDiff.toFixed(6)} SOL* has arrived in your Zend wallet.\n\n` +
-              `New balance: *${current.sol.toFixed(6)} SOL*`,
-              { parse_mode: 'Markdown' }
-            );
-          }
-          if (usdtDiff > 0.000001) {
-            await botInstance.telegram.sendMessage(
-              user.id,
-              `🎉 *Funds Received!*\n\n` +
-              `*+${usdtDiff.toFixed(2)} USDT* has arrived in your Zend wallet.\n\n` +
-              `New balance: *${current.usdt.toFixed(2)} USDT*`,
-              { parse_mode: 'Markdown' }
-            );
-          }
-          if (usdcDiff > 0.000001) {
-            await botInstance.telegram.sendMessage(
-              user.id,
-              `🎉 *Funds Received!*\n\n` +
-              `*+${usdcDiff.toFixed(2)} USDC* has arrived in your Zend wallet.\n\n` +
-              `New balance: *${current.usdc.toFixed(2)} USDC*`,
-              { parse_mode: 'Markdown' }
-            );
-          }
-        }
-
-        balanceSnapshots.set(user.id, current);
-      } catch (err) {
-        console.error(`[BalancePoll] Error checking user ${user.id}:`, err);
-      }
-    }
-  } catch (err) {
-    console.error('[BalancePoll] Error fetching users:', err);
-  }
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
 // WEBHOOK SERVER (runs alongside bot for PAJ callbacks)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -4944,25 +4062,6 @@ function startWebhookServer(botInstance: Telegraf<any>) {
               await db.update(transactions)
                 .set({ status: 'completed', completedAt: new Date() })
                 .where(eq(transactions.pajReference, event.reference));
-
-              // Notify user
-              try {
-                const txRows = await db.select().from(transactions)
-                  .where(eq(transactions.pajReference, event.reference))
-                  .limit(1);
-                if (txRows.length > 0) {
-                  const userId = txRows[0].userId;
-                  await botInstance.telegram.sendMessage(
-                    userId,
-                    `🎉 *Naira Deposit Received!*\n\n` +
-                    `Your bank transfer has been confirmed and Dollars (USDT) have been credited to your Zend account.\n\n` +
-                    `Reference: \`${event.reference}\``,
-                    { parse_mode: 'Markdown' }
-                  );
-                }
-              } catch (notifyErr) {
-                console.log('[PAJ Webhook] Could not notify user:', notifyErr);
-              }
               break;
             }
             case 'onramp.deposit.failed': {
@@ -4975,25 +4074,6 @@ function startWebhookServer(botInstance: Telegraf<any>) {
               await db.update(transactions)
                 .set({ status: 'completed', completedAt: new Date() })
                 .where(eq(transactions.pajReference, event.reference));
-
-              // Notify user
-              try {
-                const txRows = await db.select().from(transactions)
-                  .where(eq(transactions.pajReference, event.reference))
-                  .limit(1);
-                if (txRows.length > 0) {
-                  const userId = txRows[0].userId;
-                  await botInstance.telegram.sendMessage(
-                    userId,
-                    `✅ *Cash Out Complete!*\n\n` +
-                    `Your Naira has been settled to your bank account.\n\n` +
-                    `Reference: \`${event.reference}\``,
-                    { parse_mode: 'Markdown' }
-                  );
-                }
-              } catch (notifyErr) {
-                console.log('[PAJ Webhook] Could not notify user:', notifyErr);
-              }
               break;
             }
             case 'offramp.settlement.failed': {
@@ -5097,83 +4177,6 @@ function startWebhookServer(botInstance: Telegraf<any>) {
           res.end(JSON.stringify({ received: true }));
         } catch (err: any) {
           console.error('ChainRails webhook error:', err);
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: err.message }));
-        }
-      });
-      return;
-    }
-
-    // BitRefill Webhooks
-    if (url === '/webhooks/bitrefill' && method === 'POST') {
-      let body = '';
-      req.on('data', chunk => body += chunk);
-      req.on('end', async () => {
-        try {
-          const event = JSON.parse(body);
-          console.log('📩 BitRefill Webhook:', event.event, event.invoice_id);
-
-          // Find our order record
-          const orders = await db.select().from(bitrefillOrders)
-            .where(eq(bitrefillOrders.bitrefillInvoiceId, event.invoice_id))
-            .limit(1);
-
-          if (!orders.length) {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ received: true }));
-            return;
-          }
-
-          const order = orders[0];
-          const userId = order.userId;
-
-          if (event.event === 'invoice.complete' || event.status === 'complete') {
-            await db.update(bitrefillOrders)
-              .set({
-                status: 'complete',
-                codes: event.codes || event.redemption_codes || [],
-                completedAt: new Date(),
-              })
-              .where(eq(bitrefillOrders.id, order.id));
-
-            const codes = event.codes || event.redemption_codes || [];
-            let codesText = '';
-            if (codes.length) {
-              codesText = '\n\n' + codes.map((c: any) =>
-                c.pin
-                  ? `Code: \`${c.code}\`\nPin: \`${c.pin}\``
-                  : `Code: \`${c.code}\``
-              ).join('\n\n');
-            }
-
-            await botInstance.telegram.sendMessage(
-              userId,
-              `🎉 *Order Complete!*\n\n` +
-              `${order.productName}\n` +
-              `${order.currencyFiat} ${order.amountFiat}` +
-              `${codesText}\n\n` +
-              `Reference: \`${order.id}\``,
-              { parse_mode: 'Markdown' }
-            );
-          } else if (event.event === 'invoice.failed' || event.status === 'failed') {
-            await db.update(bitrefillOrders)
-              .set({ status: 'failed', metadata: event })
-              .where(eq(bitrefillOrders.id, order.id));
-
-            await botInstance.telegram.sendMessage(
-              userId,
-              `❌ *Order Failed*\n\n` +
-              `${order.productName} could not be fulfilled.\n\n` +
-              `If you paid, a refund will be processed to your wallet.\n` +
-              `Reference: \`${order.id}\``,
-              { parse_mode: 'Markdown' }
-            );
-          }
-
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ received: true }));
-        } catch (err: any) {
-          console.error('[BitRefill Webhook] Error:', err);
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: err.message }));
         }
@@ -5386,13 +4389,9 @@ async function main() {
     } catch (webhookErr: any) {
       console.error('[Bot] Failed to set webhook:', webhookErr.message);
       console.log('🤖 Falling back to polling mode...');
-      // CRITICAL: delete webhook before polling or Telegram rate-limits (429)
-      try { await bot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch (e) { /* ignore */ }
       bot.launch({ dropPendingUpdates: true });
     }
   } else {
-    console.log('🤖 Falling back to polling mode...');
-    try { await bot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch (e) { /* ignore */ }
     bot.launch({ dropPendingUpdates: true });
     console.log('🤖 Zend bot running in polling mode...');
   }
@@ -5400,13 +4399,6 @@ async function main() {
   // Start scheduled transfer executor (every 60 seconds)
   setInterval(runScheduledTransfers, 60000);
   console.log('📅 Scheduled transfer executor started (every 60s)');
-
-  // Start balance change detector (every 2 minutes)
-  setInterval(() => checkBalanceChanges(bot), 120000);
-  console.log('🔔 Balance change detector started (every 2m)');
-
-  // Seed initial balances silently so we don't notify on startup
-  checkBalanceChanges(bot).catch(console.error);
 
   // Handle 409 conflict from polling loop (Railway deploy overlap)
   // Only relevant in polling mode; webhooks don't have 409s

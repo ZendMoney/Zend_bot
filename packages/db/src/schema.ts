@@ -151,29 +151,6 @@ export const referrals = pgTable('referrals', {
   completedAt: timestamp('completed_at', { withTimezone: true }),
 });
 
-// BitRefill orders (gift cards, airtime, eSIMs)
-export const bitrefillOrders = pgTable('bitrefill_orders', {
-  id: serial('id').primaryKey(),
-  userId: varchar('user_id', { length: 50 }).notNull().references(() => users.id),
-  bitrefillInvoiceId: varchar('bitrefill_invoice_id', { length: 100 }).notNull(),
-  productId: varchar('product_id', { length: 100 }).notNull(),
-  productName: varchar('product_name', { length: 200 }).notNull(),
-  category: varchar('category', { length: 50 }).notNull(),
-  amountFiat: decimal('amount_fiat', { precision: 20, scale: 2 }),
-  currencyFiat: varchar('currency_fiat', { length: 10 }),
-  amountCrypto: decimal('amount_crypto', { precision: 30, scale: 9 }),
-  cryptoCurrency: varchar('crypto_currency', { length: 20 }),
-  status: varchar('status', { length: 20 }).notNull().default('pending'),
-  codes: jsonb('codes'),
-  recipientPhone: varchar('recipient_phone', { length: 20 }),
-  recipientEmail: varchar('recipient_email', { length: 255 }),
-  paymentAddress: varchar('payment_address', { length: 100 }),
-  paymentUri: text('payment_uri'),
-  metadata: jsonb('metadata'),
-  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
-  completedAt: timestamp('completed_at', { withTimezone: true }),
-});
-
 // Audit log (immutable)
 export const auditLogs = pgTable('audit_logs', {
   id: serial('id').primaryKey(),
