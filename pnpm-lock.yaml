@@ -69,6 +69,9 @@ importers:
 
   apps/bot:
     dependencies:
+      '@zend/bitrefill-client':
+        specifier: workspace:*
+        version: link:../../packages/bitrefill-client
       '@zend/chainrails-client':
         specifier: workspace:*
         version: link:../../packages/chainrails-client
@@ -93,6 +96,8 @@ importers:
       telegraf:
         specifier: ^4.16.3
         version: 4.16.3
+
+  packages/bitrefill-client: {}
 
   packages/chainrails-client: {}
 
