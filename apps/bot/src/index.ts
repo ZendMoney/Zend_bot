@@ -5386,9 +5386,13 @@ async function main() {
     } catch (webhookErr: any) {
       console.error('[Bot] Failed to set webhook:', webhookErr.message);
       console.log('🤖 Falling back to polling mode...');
+      // CRITICAL: delete webhook before polling or Telegram rate-limits (429)
+      try { await bot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch (e) { /* ignore */ }
       bot.launch({ dropPendingUpdates: true });
     }
   } else {
+    console.log('🤖 Falling back to polling mode...');
+    try { await bot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch (e) { /* ignore */ }
     bot.launch({ dropPendingUpdates: true });
     console.log('🤖 Zend bot running in polling mode...');
   }
