@@ -12,6 +12,21 @@ config({ path: resolve(__dirname, '../../../.env') });
 const app = new Hono();
 const PORT = parseInt(process.env.API_PORT || '3001');
 
+// ─── Helper: send Telegram notification ───
+async function notifyUser(userId: string, text: string) {
+  const token = process.env.BOT_TOKEN;
+  if (!token) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: userId, text, parse_mode: 'Markdown' }),
+    });
+  } catch (err) {
+    console.log('[API] Could not notify user:', err);
+  }
+}
+
 // Health check
 app.get('/health', (c) => c.json({ status: 'ok', time: new Date().toISOString() }));
 
@@ -31,9 +46,22 @@ app.post('/webhooks/paj', async (c) => {
     case 'onramp.deposit.confirmed': {
       // User sent NGN → PAJ detected → USDT credited
       // Update transaction, notify user
+      const txRows = await db.select().from(transactions)
+        .where(eq(transactions.pajReference, event.reference))
+        .limit(1);
+
       await db.update(transactions)
         .set({ status: 'completed', completedAt: new Date() })
         .where(eq(transactions.pajReference, event.reference));
+
+      if (txRows.length > 0) {
+        await notifyUser(
+          txRows[0].userId,
+          `🎉 *Naira Deposit Received!*\n\n` +
+          `Your bank transfer has been confirmed and Dollars (USDT) have been credited to your Zend account.\n\n` +
+          `Reference: \`${event.reference}\``
+        );
+      }
       break;
     }
 
@@ -46,9 +74,22 @@ app.post('/webhooks/paj', async (c) => {
 
     case 'offramp.settlement.confirmed': {
       // PAJ settled NGN to bank
+      const txRows = await db.select().from(transactions)
+        .where(eq(transactions.pajReference, event.reference))
+        .limit(1);
+
       await db.update(transactions)
         .set({ status: 'completed', completedAt: new Date() })
         .where(eq(transactions.pajReference, event.reference));
+
+      if (txRows.length > 0) {
+        await notifyUser(
+          txRows[0].userId,
+          `✅ *Cash Out Complete!*\n\n` +
+          `Your Naira has been settled to your bank account.\n\n` +
+          `Reference: \`${event.reference}\``
+        );
+      }
       break;
     }
 
