@@ -5401,23 +5401,11 @@ async function main() {
       isWebhookMode = true;
     } catch (webhookErr: any) {
       console.error('[Bot] Failed to set webhook:', webhookErr.message);
-
-      if (isRailway) {
-        // On Railway: webhook is required. Don't poll — it burns credits and causes 429s.
-        console.error('[Bot] Webhook is required on Railway. Polling is disabled.');
-        console.error('[Bot] Fix your WEBHOOK_BASE_URL or RAILWAY_PUBLIC_DOMAIN env var.');
-        console.error('[Bot] Exiting in 5 seconds...');
-        await new Promise(r => setTimeout(r, 5000));
-        process.exit(1);
-      }
-
-      // Local dev: clear webhook and fall back to polling
       console.log('🤖 Falling back to polling mode...');
       await clearWebhook();
       bot.launch({ dropPendingUpdates: true });
     }
   } else {
-    // No webhook configured — local dev polling mode
     console.log('🤖 Bot running in polling mode (local dev)...');
     await clearWebhook();
     bot.launch({ dropPendingUpdates: true });
@@ -5427,12 +5415,11 @@ async function main() {
   setInterval(runScheduledTransfers, 60000);
   console.log('📅 Scheduled transfer executor started (every 60s)');
 
-  // Start balance change detector (every 2 minutes)
-  setInterval(() => checkBalanceChanges(bot), 120000);
-  console.log('🔔 Balance change detector started (every 2m)');
-
-  // Seed initial balances silently so we don't notify on startup
-  checkBalanceChanges(bot).catch(console.error);
+  // Balance change detector disabled — was hitting Solana RPC rate limits.
+  // Re-enable later with batching + retry logic if needed.
+  // setInterval(() => checkBalanceChanges(bot), 120000);
+  // checkBalanceChanges(bot).catch(console.error);
+  console.log('🔔 Balance change detector: DISABLED (RPC rate limit protection)');
 
   // Handle 409 conflict from polling loop (Railway deploy overlap)
   // Only relevant in polling mode; webhooks don't have 409s
