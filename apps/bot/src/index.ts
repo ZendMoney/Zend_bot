@@ -5372,9 +5372,25 @@ async function main() {
   // Start webhook server (runs alongside bot)
   startWebhookServer(bot);
 
-  // Launch bot — prefer webhooks on Railway, fallback to polling locally
+  // Launch bot — webhooks in production, polling for local dev only
   const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || process.env.RAILWAY_PUBLIC_DOMAIN;
+  const isRailway = !!process.env.RAILWAY_PUBLIC_DOMAIN;
   let isWebhookMode = false;
+
+  // Always clear any existing webhook first to prevent 429 conflicts
+  async function clearWebhook(retries = 3): Promise<boolean> {
+    for (let i = 0; i < retries; i++) {
+      try {
+        await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+        console.log('[Bot] Webhook cleared successfully');
+        return true;
+      } catch (err: any) {
+        console.warn(`[Bot] Failed to clear webhook (attempt ${i + 1}/${retries}):`, err.message);
+        if (i < retries - 1) await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+    return false;
+  }
 
   if (webhookBaseUrl) {
     const telegramWebhookUrl = `${webhookBaseUrl.replace(/\/$/, '')}/webhook/telegram`;
@@ -5385,16 +5401,26 @@ async function main() {
       isWebhookMode = true;
     } catch (webhookErr: any) {
       console.error('[Bot] Failed to set webhook:', webhookErr.message);
+
+      if (isRailway) {
+        // On Railway: webhook is required. Don't poll — it burns credits and causes 429s.
+        console.error('[Bot] Webhook is required on Railway. Polling is disabled.');
+        console.error('[Bot] Fix your WEBHOOK_BASE_URL or RAILWAY_PUBLIC_DOMAIN env var.');
+        console.error('[Bot] Exiting in 5 seconds...');
+        await new Promise(r => setTimeout(r, 5000));
+        process.exit(1);
+      }
+
+      // Local dev: clear webhook and fall back to polling
       console.log('🤖 Falling back to polling mode...');
-      // CRITICAL: delete webhook before polling or Telegram rate-limits (429)
-      try { await bot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch (e) { /* ignore */ }
+      await clearWebhook();
       bot.launch({ dropPendingUpdates: true });
     }
   } else {
-    console.log('🤖 Falling back to polling mode...');
-    try { await bot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch (e) { /* ignore */ }
+    // No webhook configured — local dev polling mode
+    console.log('🤖 Bot running in polling mode (local dev)...');
+    await clearWebhook();
     bot.launch({ dropPendingUpdates: true });
-    console.log('🤖 Zend bot running in polling mode...');
   }
 
   // Start scheduled transfer executor (every 60 seconds)
