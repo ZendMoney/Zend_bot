@@ -185,3 +185,27 @@ export const auditLogs = pgTable('audit_logs', {
   userAgent: text('user_agent'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
+
+// ─── Landing page form submissions ───
+
+export const ambassadorApplications = pgTable('ambassador_applications', {
+  id: serial('id').primaryKey(),
+  name: varchar('name', { length: 80 }).notNull(),
+  tgHandle: varchar('tg_handle', { length: 40 }).notNull(),
+  isStudent: varchar('is_student', { length: 10 }).notNull(),
+  focus: varchar('focus', { length: 120 }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const deviceSuspensionRequests = pgTable('device_suspension_requests', {
+  id: serial('id').primaryKey(),
+  fullName: varchar('full_name', { length: 100 }).notNull(),
+  email: varchar('email', { length: 255 }).notNull(),
+  phone: varchar('phone', { length: 30 }).notNull(),
+  handle: varchar('handle', { length: 50 }).notNull(),
+  deviceLost: varchar('device_lost', { length: 100 }).notNull(),
+  lastUsed: varchar('last_used', { length: 50 }).notNull(),
+  reason: varchar('reason', { length: 20 }).notNull(),
+  details: text('details'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});

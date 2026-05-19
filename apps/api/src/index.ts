@@ -3,7 +3,7 @@ import { resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
-import { db, transactions } from '@zend/db';
+import { db, transactions, ambassadorApplications, deviceSuspensionRequests } from '@zend/db';
 import { eq } from 'drizzle-orm';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -109,6 +109,58 @@ app.post('/webhooks/chain-rails', async (c) => {
   const body = await c.req.json();
   console.log('📩 ChainRails Webhook:', body);
   return c.json({ received: true });
+});
+
+// ─── Landing page forms ───
+
+app.post('/api/ambassador', async (c) => {
+  const body = await c.req.json();
+  const { name, tgHandle, isStudent, focus } = body;
+
+  if (!name || !tgHandle || !isStudent || !focus) {
+    return c.json({ error: 'All fields are required' }, 400);
+  }
+
+  try {
+    await db.insert(ambassadorApplications).values({
+      name: String(name).trim(),
+      tgHandle: String(tgHandle).trim(),
+      isStudent: String(isStudent).trim(),
+      focus: String(focus).trim(),
+    });
+    console.log('📩 Ambassador application received:', name, tgHandle);
+    return c.json({ success: true });
+  } catch (err) {
+    console.error('[API] Ambassador insert error:', err);
+    return c.json({ error: 'Failed to save application' }, 500);
+  }
+});
+
+app.post('/api/device-suspend', async (c) => {
+  const body = await c.req.json();
+  const { fullName, email, phone, handle, deviceLost, lastUsed, reason, details } = body;
+
+  if (!fullName || !email || !phone || !handle || !deviceLost || !lastUsed || !reason) {
+    return c.json({ error: 'Required fields missing' }, 400);
+  }
+
+  try {
+    await db.insert(deviceSuspensionRequests).values({
+      fullName: String(fullName).trim(),
+      email: String(email).trim(),
+      phone: String(phone).trim(),
+      handle: String(handle).trim(),
+      deviceLost: String(deviceLost).trim(),
+      lastUsed: String(lastUsed).trim(),
+      reason: String(reason).trim(),
+      details: details ? String(details).trim() : null,
+    });
+    console.log('📩 Device suspension request received:', fullName, email);
+    return c.json({ success: true });
+  } catch (err) {
+    console.error('[API] Device suspension insert error:', err);
+    return c.json({ error: 'Failed to save request' }, 500);
+  }
 });
 
 // Start server

@@ -16,7 +16,7 @@ import {
 import bs58 from 'bs58';
 import { message } from 'telegraf/filters';
 import { db, checkConnection } from '@zend/db';
-import { users, transactions, savedBankAccounts, scheduledTransfers, bitrefillOrders } from '@zend/db';
+import { users, transactions, savedBankAccounts, scheduledTransfers, bitrefillOrders, ambassadorApplications, deviceSuspensionRequests } from '@zend/db';
 import { eq, sql, and } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
 import { BitRefillClient } from '@zend/bitrefill-client';
@@ -533,12 +533,9 @@ async function verifyBankAccount(
 
 // ─── Keyboards ───
 const mainMenu = Markup.keyboard([
-  ['💰 Balance', '📤 Send'],
-  ['💵 Add Naira', '💴 Cash Out'],
-  ['🔄 Swap', '📥 Receive'],
-  ['📅 Schedule', '📋 History'],
-  ['🎁 Shop', '⚙️ Settings'],
-  ['🌐 Community'],
+  ['💰 Balance', '📤 Send', '🔄 Swap'],
+  ['📥 Receive', '🎁 Shop', '📋 History'],
+  ['⚙️ Settings', '🌐 Community'],
 ]).resize();
 
 const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
@@ -1633,8 +1630,7 @@ bot.hears('💰 Balance', async (ctx) => {
 // 💵 ADD NAIRA (On-Ramp) — With PAJ OTP Flow
 // ═════════════════════════════════════════════════════════════════════════════
 
-bot.hears('💵 Add Naira', async (ctx) => {
-  const userId = ctx.from.id.toString();
+async function startAddNaira(ctx: ZendContext, userId: string) {
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
 
   if (user.length === 0) {
@@ -1659,6 +1655,15 @@ bot.hears('💵 Add Naira', async (ctx) => {
     `Enter the amount (numbers only):`,
     { parse_mode: 'Markdown', ...cancelKeyboard }
   );
+}
+
+bot.hears('💵 Add Naira', async (ctx) => {
+  await startAddNaira(ctx, ctx.from.id.toString());
+});
+
+bot.action('add_naira_start', async (ctx) => {
+  await ctx.answerCbQuery();
+  await startAddNaira(ctx, ctx.from!.id.toString());
 });
 
 // Handle PAJ email/phone input
@@ -1668,7 +1673,7 @@ bot.on(message('text'), async (ctx, next) => {
   const session = getSession(userId);
 
   // ─── Pass menu buttons to bot.hears() handlers ───
-  const menuButtons = ['💰 Balance', '💵 Add Naira', '📤 Send', '💴 Cash Out', '📥 Receive', '🔄 Swap', '📅 Schedule', '📋 History', '⚙️ Settings', '🌐 Community'];
+  const menuButtons = ['💰 Balance', '📤 Send', '📥 Receive', '🔄 Swap', '🎁 Shop', '📋 History', '⚙️ Settings', '🌐 Community'];
   if (menuButtons.includes(text)) {
     return next();
   }
@@ -3813,7 +3818,6 @@ bot.hears('💴 Cash Out', async (ctx) => {
     await promptPrivateChat(ctx, 'cash out');
     return;
   }
-  await ctx.reply('💴 Cash Out uses the same flow as Send. Redirecting...');
   const userId = ctx.from.id.toString();
   setSession(userId, {
     state: ConversationState.AWAITING_SEND_AMOUNT,
@@ -3859,7 +3863,7 @@ async function showReceive(ctx: ZendContext, userId: string) {
   } else {
     msg += `*🇳🇬 Naira (Bank Transfer)*\n`;
     msg += `You don't have a virtual account yet.\n`;
-    msg += `Tap 💵 *Add Naira* to create one.\n\n`;
+    msg += `Tap *💵 Add Naira* below to create one.\n\n`;
   }
 
   msg += `\n*🌉 From Other Apps*\n`;
@@ -3872,6 +3876,8 @@ async function showReceive(ctx: ZendContext, userId: string) {
   kbRows.push([{ text: '📋 Copy Crypto Address', copy_text: { text: walletAddress } } as any]);
   if (hasVA) {
     kbRows.push([{ text: '📋 Copy Account Number', copy_text: { text: virtualAccount.accountNumber } } as any]);
+  } else {
+    kbRows.push([Markup.button.callback('💵 Add Naira', 'add_naira_start')]);
   }
   kbRows.push([Markup.button.callback('🌉 Receive from Other Apps', 'bridge_start')]);
 
@@ -3972,8 +3978,7 @@ bot.action('cancel_swap', async (ctx) => {
 // 📅 SCHEDULED TRANSFERS
 // ═════════════════════════════════════════════════════════════════════════════
 
-bot.hears('📅 Schedule', async (ctx) => {
-  const userId = ctx.from.id.toString();
+async function showScheduleMenu(ctx: ZendContext, userId: string) {
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
 
   if (user.length === 0) {
@@ -4003,6 +4008,15 @@ bot.hears('📅 Schedule', async (ctx) => {
       : `You don't have any saved recipients yet.\n\nTap *➕ Add New Recipient* to add one.`),
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }
   );
+}
+
+bot.hears('📅 Schedule', async (ctx) => {
+  await showScheduleMenu(ctx, ctx.from.id.toString());
+});
+
+bot.action('schedule_start', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showScheduleMenu(ctx, ctx.from!.id.toString());
 });
 
 bot.action('schedule_add_recipient', async (ctx) => {
@@ -4603,6 +4617,7 @@ async function showSettings(ctx: ZendContext, userId: string) {
       buttons.push([Markup.button.callback('🔢 Change PIN', 'settings_pin')]);
     }
     buttons.push([Markup.button.callback('🔑 Show Secret Code', 'export_key')]);
+    buttons.push([Markup.button.callback('📅 Schedule Transfer', 'schedule_start')]);
 
     await finishLoading(ctx, loading.message_id, msg, 'Markdown');
     await ctx.reply('Menu:', {
@@ -5200,6 +5215,71 @@ function startWebhookServer(botInstance: Telegraf<any>) {
       return;
     }
 
+    // ─── Landing page forms ───
+    if (url === '/api/ambassador' && method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', async () => {
+        try {
+          const data = JSON.parse(body);
+          const { name, tgHandle, isStudent, focus } = data;
+          if (!name || !tgHandle || !isStudent || !focus) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'All fields are required' }));
+            return;
+          }
+          await db.insert(ambassadorApplications).values({
+            name: String(name).trim(),
+            tgHandle: String(tgHandle).trim(),
+            isStudent: String(isStudent).trim(),
+            focus: String(focus).trim(),
+          });
+          console.log('📩 Ambassador application received:', name, tgHandle);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true }));
+        } catch (err: any) {
+          console.error('[Webhook] Ambassador error:', err);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Failed to save application' }));
+        }
+      });
+      return;
+    }
+
+    if (url === '/api/device-suspend' && method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', async () => {
+        try {
+          const data = JSON.parse(body);
+          const { fullName, email, phone, handle, deviceLost, lastUsed, reason, details } = data;
+          if (!fullName || !email || !phone || !handle || !deviceLost || !lastUsed || !reason) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Required fields missing' }));
+            return;
+          }
+          await db.insert(deviceSuspensionRequests).values({
+            fullName: String(fullName).trim(),
+            email: String(email).trim(),
+            phone: String(phone).trim(),
+            handle: String(handle).trim(),
+            deviceLost: String(deviceLost).trim(),
+            lastUsed: String(lastUsed).trim(),
+            reason: String(reason).trim(),
+            details: details ? String(details).trim() : null,
+          });
+          console.log('📩 Device suspension request received:', fullName, email);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true }));
+        } catch (err: any) {
+          console.error('[Webhook] Device suspension error:', err);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Failed to save request' }));
+        }
+      });
+      return;
+    }
+
     // 404
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));
@@ -5210,7 +5290,10 @@ function startWebhookServer(botInstance: Telegraf<any>) {
     console.log(`🌐 Webhook server running on http://${host}`);
     console.log(`   PAJ webhook URL: https://${host}/webhooks/paj`);
     console.log(`   ChainRails webhook URL: https://${host}/webhooks/chain-rails`);
+    console.log(`   BitRefill webhook URL: https://${host}/webhooks/bitrefill`);
     console.log(`   Telegram webhook URL: https://${host}/webhook/telegram`);
+    console.log(`   Ambassador API: https://${host}/api/ambassador`);
+    console.log(`   Device Suspend API: https://${host}/api/device-suspend`);
   });
 
   return server;
