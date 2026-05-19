@@ -136,6 +136,7 @@ export const TIER_LIMITS = {
 // PAJ Constants
 export const PAJ_FEE_BPS = 80; // 0.8%
 export const PAJ_MIN_DEPOSIT_NGN = 1_000;
+export const PAJ_MAX_DEPOSIT_NGN = 10_000_000; // ₦10M max per deposit
 
 // Auto-save rates (in basis points)
 export const AUTO_SAVE_RATES = [100, 200, 300, 500, 1000] as const; // 1%, 2%, 3%, 5%, 10%

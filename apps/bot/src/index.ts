@@ -27,6 +27,7 @@ import {
   SOLANA_TOKENS,
   NIGERIAN_BANKS,
   PAJ_MIN_DEPOSIT_NGN,
+  PAJ_MAX_DEPOSIT_NGN,
 } from '@zend/shared';
 
 import crypto from 'crypto';
@@ -540,6 +541,11 @@ const mainMenu = Markup.keyboard([
 
 const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
 
+// Escape Telegram legacy Markdown special chars in user-generated / AI text
+function escapeTelegramMarkdown(text: string): string {
+  return text.replace(/([_*\[\`])/g, '\\$1');
+}
+
 // ─── Bot ───
 const bot = new Telegraf<ZendContext>(BOT_TOKEN);
 
@@ -832,7 +838,8 @@ bot.action(/shop_cat:(.+)/, async (ctx) => {
 
   await ctx.answerCbQuery('Loading products...');
 
-  const products = await getCachedProducts('NG', category === 'data' ? 'refill' : category);
+  const bitrefillCategory = category === 'data' ? 'refill' : category === 'gift-card' ? undefined : category;
+  const products = await getCachedProducts('NG', bitrefillCategory);
   // Filter by keyword for data bundles if needed
   let filtered = products.filter((p: any) => p.in_stock !== false);
   if (category === 'data') {
@@ -840,6 +847,13 @@ bot.action(/shop_cat:(.+)/, async (ctx) => {
       p.name.toLowerCase().includes('data') ||
       p.name.toLowerCase().includes('bundle') ||
       p.name.toLowerCase().includes('internet')
+    );
+  }
+  if (category === 'gift-card') {
+    filtered = filtered.filter((p: any) =>
+      p.category?.toLowerCase().includes('gift') ||
+      p.name.toLowerCase().includes('gift card') ||
+      p.type === 'gift_card'
     );
   }
 
@@ -1702,6 +1716,14 @@ bot.on(message('text'), async (ctx, next) => {
       );
       return;
     }
+    if (amount > PAJ_MAX_DEPOSIT_NGN) {
+      await ctx.reply(
+        `❌ Amount too large.\n` +
+        `Maximum deposit is ${formatNgn(PAJ_MAX_DEPOSIT_NGN)}.`,
+        cancelKeyboard
+      );
+      return;
+    }
 
     const pajClient = await getPAJClient();
     if (!pajClient) {
@@ -2311,7 +2333,7 @@ bot.on(message('text'), async (ctx, next) => {
             `The user said: "${text}". They want to send money but didn't specify an amount. ` +
             `Respond conversationally in Nigerian Pidgin style. Ask how much they want to send.`
           );
-          await ctx.reply(reply?.reply || 'How much do you want to send?', { parse_mode: 'Markdown', ...cancelKeyboard });
+          await ctx.reply(escapeTelegramMarkdown(reply?.reply || 'How much do you want to send?'), { parse_mode: 'Markdown', ...cancelKeyboard });
           setSession(userId, { state: ConversationState.AWAITING_SEND_AMOUNT, pendingTransaction: { recipientName: parsed.recipientName } });
           return;
         }
@@ -2454,6 +2476,13 @@ bot.on(message('text'), async (ctx, next) => {
 
       case 'add_naira': {
         // Simulate clicking Add Naira
+        if (parsed.amount && parsed.amount > PAJ_MAX_DEPOSIT_NGN) {
+          await ctx.reply(
+            `❌ Amount too large.\nMaximum deposit is ${formatNgn(PAJ_MAX_DEPOSIT_NGN)}.`,
+            mainMenu
+          );
+          return;
+        }
         await ctx.reply(`💵 *Add Naira*\n\n` +
           (parsed.amount
             ? `Amount: ${formatNgn(parsed.amount)}\n\nHow much do you want to add? (Minimum ₦1,000)`
@@ -2914,6 +2943,13 @@ bot.on(message('voice'), async (ctx) => {
           await ctx.reply('❌ PAJ service is not configured. Please contact support.', mainMenu);
           return;
         }
+        if (analysis.amount && analysis.amount > PAJ_MAX_DEPOSIT_NGN) {
+          await ctx.reply(
+            `❌ Amount too large.\nMaximum deposit is ${formatNgn(PAJ_MAX_DEPOSIT_NGN)}.`,
+            mainMenu
+          );
+          return;
+        }
         setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampAmount: analysis.amount || undefined });
         await ctx.reply(
           `💵 *Add Naira*\n\n` +
@@ -3124,7 +3160,7 @@ async function showVirtualAccount(
   const walletAddress = user[0].walletAddress;
 
   // Use provided amount or default to minimum
-  const fiatAmount = amount && amount >= PAJ_MIN_DEPOSIT_NGN ? amount : PAJ_MIN_DEPOSIT_NGN;
+  const fiatAmount = amount && amount >= PAJ_MIN_DEPOSIT_NGN && amount <= PAJ_MAX_DEPOSIT_NGN ? amount : PAJ_MIN_DEPOSIT_NGN;
 
   // Get rate if not provided
   let _rate = rate || 1550;
