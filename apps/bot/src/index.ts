@@ -3404,13 +3404,23 @@ async function executeSendCore(
     if (pajClient && user[0].pajSessionToken) {
       const pajBanks = await getPajBankList(user[0].pajSessionToken);
       const ourBank = NIGERIAN_BANKS.find(b => b.code === finalBankCode);
-      const pajBank = pajBanks.find(pb =>
-        pb.name.toLowerCase().includes(ourBank?.name.toLowerCase() || '') ||
-        (ourBank?.name.toLowerCase() || '').includes(pb.name.toLowerCase())
-      );
-      if (!pajBank) {
+
+      // Use the same robust scoring as verifyBankAccount
+      let bestMatch: { bank: any; score: number } | null = null;
+      for (const pb of pajBanks) {
+        const score = scoreBankMatch(pb.name, finalBankCode);
+        if (score > 0 && (!bestMatch || score > bestMatch.score)) {
+          bestMatch = { bank: pb, score };
+        }
+      }
+
+      if (!bestMatch || bestMatch.score < 20) {
+        console.log('[PAJ] Available banks for send:', pajBanks.map(b => b.name).join(', '));
         throw new Error(`Bank "${ourBank?.name}" not found on PAJ`);
       }
+
+      const pajBank = bestMatch.bank;
+      console.log(`[PAJ] Send bank matched: ${ourBank?.name} → ${pajBank.name} (score: ${bestMatch.score})`);
 
       const webhookUrl = process.env.WEBHOOK_BASE_URL
         ? `${process.env.WEBHOOK_BASE_URL.replace(/\/$/, '')}/webhooks/paj`
