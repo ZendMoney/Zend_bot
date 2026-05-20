@@ -3221,13 +3221,15 @@ async function showVirtualAccount(
   const hasCachedVA = virtualAccount?.accountNumber && virtualAccount?.bankName && vaAge < VA_MAX_AGE_MS;
 
   const webhookUrl = process.env.WEBHOOK_BASE_URL
-    ? `${process.env.WEBHOOK_BASE_URL}/webhooks/paj`
+    ? `${process.env.WEBHOOK_BASE_URL.replace(/\/$/, '')}/webhooks/paj`
     : 'https://example.com/webhook';
+
+  let order: any;
 
   if (!hasCachedVA) {
     const loadingVA = await showLoading(ctx, 'Creating your virtual bank account...');
     try {
-      const order = await pajClient.createOnramp({
+      order = await pajClient.createOnramp({
         fiatAmount,
         currency: Currency.NGN,
         recipient: walletAddress,
@@ -3272,13 +3274,32 @@ async function showVirtualAccount(
     console.log('[PAJ] Reusing cached virtual account:', virtualAccount.accountNumber);
   }
 
+  const txId = generateTxId();
+  await db.insert(transactions).values({
+    id: txId,
+    userId,
+    type: 'ngn_receive',
+    status: 'pending',
+    ngnAmount: String(fiatAmount),
+    ngnRate: String(order?.rate || _rate),
+    fromAmount: String(order?.amount || usdtAmount),
+    pajReference: order?.id || virtualAccount.orderId,
+    pajPoolAddress: walletAddress,
+    recipientWalletAddress: walletAddress,
+    metadata: { virtualAccount, source: hasCachedVA ? 'cached' : 'fresh' },
+  });
+
+  const displayRate = order?.rate || _rate;
+  const displayFee = order?.fee || _fee;
+  const displayReceive = order?.amount || usdtAmount;
+
   await ctx.reply(
     `💵 *Add Naira*\n\n` +
     `*Deposit Details:*\n` +
     `Amount: ${formatNgn(fiatAmount)}\n` +
-    `Rate: ₦${_rate.toLocaleString()}/USD\n` +
-    `Fee: ${formatNgn(_fee)}\n` +
-    `You receive: ~${usdtAmount.toFixed(2)} Dollars\n\n` +
+    `Rate: ₦${displayRate.toLocaleString()}/USD\n` +
+    `Fee: ${formatNgn(displayFee)}\n` +
+    `You receive: ~${Number(displayReceive).toFixed(2)} Dollars\n\n` +
     `*Send bank transfer to:*\n` +
     `🏦 *${virtualAccount.bankName}*\n` +
     `🔢 \`${virtualAccount.accountNumber}\`\n` +
@@ -3392,7 +3413,7 @@ async function executeSendCore(
       }
 
       const webhookUrl = process.env.WEBHOOK_BASE_URL
-        ? `${process.env.WEBHOOK_BASE_URL}/webhooks/paj`
+        ? `${process.env.WEBHOOK_BASE_URL.replace(/\/$/, '')}/webhooks/paj`
         : 'https://example.com/webhook';
       const order = await pajClient.createOfframp({
         bank: pajBank.id,
@@ -5065,15 +5086,40 @@ function startWebhookServer(botInstance: Telegraf<any>) {
 
           switch (event.type) {
             case 'onramp.deposit.confirmed': {
-              await db.update(transactions)
-                .set({ status: 'completed', completedAt: new Date() })
-                .where(eq(transactions.pajReference, event.reference));
+              // Find or create transaction
+              let txRows = await db.select().from(transactions)
+                .where(eq(transactions.pajReference, event.reference))
+                .limit(1);
+
+              if (txRows.length === 0) {
+                // Try to find user by virtual account orderId
+                const userRows = await db.select().from(users)
+                  .where(sql`virtual_account->>'orderId' = ${event.reference}`)
+                  .limit(1);
+                if (userRows.length > 0) {
+                  const fallbackTxId = generateTxId();
+                  await db.insert(transactions).values({
+                    id: fallbackTxId,
+                    userId: userRows[0].id,
+                    type: 'ngn_receive',
+                    status: 'completed',
+                    pajReference: event.reference,
+                    pajPoolAddress: userRows[0].walletAddress,
+                    recipientWalletAddress: userRows[0].walletAddress,
+                    completedAt: new Date(),
+                  });
+                  txRows = [{ id: fallbackTxId, userId: userRows[0].id } as any];
+                } else {
+                  console.warn('[PAJ Webhook] No transaction or user found for reference:', event.reference);
+                }
+              } else {
+                await db.update(transactions)
+                  .set({ status: 'completed', completedAt: new Date() })
+                  .where(eq(transactions.pajReference, event.reference));
+              }
 
               // Notify user
               try {
-                const txRows = await db.select().from(transactions)
-                  .where(eq(transactions.pajReference, event.reference))
-                  .limit(1);
                 if (txRows.length > 0) {
                   const userId = txRows[0].userId;
                   await botInstance.telegram.sendMessage(
@@ -5090,9 +5136,16 @@ function startWebhookServer(botInstance: Telegraf<any>) {
               break;
             }
             case 'onramp.deposit.failed': {
-              await db.update(transactions)
-                .set({ status: 'failed' })
-                .where(eq(transactions.pajReference, event.reference));
+              const txRows = await db.select().from(transactions)
+                .where(eq(transactions.pajReference, event.reference))
+                .limit(1);
+              if (txRows.length > 0) {
+                await db.update(transactions)
+                  .set({ status: 'failed' })
+                  .where(eq(transactions.pajReference, event.reference));
+              } else {
+                console.warn('[PAJ Webhook] No transaction found for failed deposit:', event.reference);
+              }
               break;
             }
             case 'offramp.settlement.confirmed': {
