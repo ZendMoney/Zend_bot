@@ -3300,10 +3300,11 @@ async function showVirtualAccount(
   const displayFee = order?.fee || _fee;
   const displayReceive = order?.amount || usdtAmount;
 
+  const isExactAmount = amount && amount >= PAJ_MIN_DEPOSIT_NGN;
   await ctx.reply(
     `💵 *Add Naira*\n\n` +
     `*Deposit Details:*\n` +
-    `Amount: ${formatNgn(fiatAmount)}\n` +
+    (isExactAmount ? `Amount: ${formatNgn(fiatAmount)}\n` : `Minimum: ${formatNgn(PAJ_MIN_DEPOSIT_NGN)}\n`) +
     `Rate: ₦${displayRate.toLocaleString()}/USD\n` +
     `Fee: ${formatNgn(displayFee)}\n` +
     `You receive: ~${Number(displayReceive).toFixed(2)} Dollars\n\n` +
@@ -3315,9 +3316,8 @@ async function showVirtualAccount(
     `⚠️ *Important:* Send from a bank account in your name.`,
     { parse_mode: 'Markdown', ...mainMenu }
   );
-  await ctx.reply('📋 Tap to copy account number:', Markup.inlineKeyboard([
-    [{ text: '📋 Copy Account Number', copy_text: { text: virtualAccount.accountNumber } } as any]
-  ]));
+  // Send account number as plain text for easy copying
+  await ctx.reply(virtualAccount.accountNumber);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
