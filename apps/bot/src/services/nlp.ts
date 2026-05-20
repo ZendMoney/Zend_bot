@@ -505,19 +505,23 @@ export async function parseMenuInputWithAI(text: string): Promise<MenuParseResul
 
 // ─── Conversational AI (Smart Assistant) ───
 
-const CHAT_SYSTEM_PROMPT = `You are Zend, a friendly Nigerian payment assistant inside a Telegram bot.
+export interface BotFeature {
+  key: string;
+  name: string;
+  description: string;
+  category: string;
+}
+
+function buildChatSystemPrompt(features: BotFeature[]): string {
+  const activeFeatures = features.filter(f => f.category !== 'disabled');
+  const featureList = activeFeatures.map((f, i) => `${i + 1}. ${f.name} — ${f.description}`).join('\n');
+
+  return `You are Zend, a friendly Nigerian payment assistant inside a Telegram bot.
 
 Your personality: Warm, concise, helpful. Speak like a knowledgeable Nigerian friend. Light Pidgin like "No wahala" or "Sharp sharp" is fine when natural.
 
 EXACT features Zend has (do NOT mention anything else):
-1. Check balance — Dollars (USDT/USDC) and SOL with live Naira rates
-2. Add Naira — bank transfer to a virtual account, get Dollars in your account
-3. Send to Nigerian bank — any bank (GTB, UBA, Access, OPay, Kuda, etc.)
-4. Receive money — crypto address for direct deposit + virtual bank account
-5. Convert currency — exchange SOL ↔ USDT ↔ USDC
-6. Receive from other apps — send Dollars from Binance, MetaMask, Trust Wallet → receive in your Zend account
-7. Transaction history
-8. Voice commands — send a voice note
+${featureList || '1. Check balance — Dollars (USDT/USDC) and SOL with live Naira rates'}
 
 EXACT features Zend does NOT have (never mention these):
 - NO airtime recharge
@@ -527,9 +531,10 @@ EXACT features Zend does NOT have (never mention these):
 - NO betting or gambling
 - NO stocks or investment trading
 
-If asked about fees: 1% Zend fee + small network fee. If you don't have enough for the network fee, we cover it and add 0.5% to the Zend fee (so 1.5% total).
+If asked about fees: 1% Zend fee paid in SOL + small network fee. If you don't have enough SOL for the network fee, we cover it and add 0.5% to the Zend fee (so 1.5% total).
 If asked about security: your account is protected with encryption and PIN. We handle identity verification for compliance.
 Keep replies under 150 words. End with a nudge to try something real.`;
+}
 
 export interface ChatReply {
   reply: string;
@@ -539,8 +544,9 @@ export interface ChatReply {
 /**
  * Get a conversational reply from Kimi when the user's message is not a command.
  */
-export async function chatWithKimi(text: string): Promise<ChatReply | null> {
-  const reply = await callKimi(CHAT_SYSTEM_PROMPT, text, 0.7, 400);
+export async function chatWithKimi(text: string, features?: BotFeature[]): Promise<ChatReply | null> {
+  const systemPrompt = buildChatSystemPrompt(features || []);
+  const reply = await callKimi(systemPrompt, text, 0.7, 400);
   if (!reply) return null;
   return { reply: reply.trim() };
 }

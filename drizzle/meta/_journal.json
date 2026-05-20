@@ -43,6 +43,13 @@
       "when": 1779188916251,
       "tag": "0005_aromatic_wild_child",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1779318445581,
+      "tag": "0006_quick_stone_men",
+      "breakpoints": true
     }
   ]
 }

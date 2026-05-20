@@ -32,7 +32,10 @@ export const users = pgTable('users', {
   // Referral
   referralCode: varchar('referral_code', { length: 20 }).unique(),
   referredBy: varchar('referred_by', { length: 50 }).references((): any => users.id),
-  
+
+  // Admin
+  isAdmin: boolean('is_admin').default(false).notNull(),
+
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
@@ -208,4 +211,19 @@ export const deviceSuspensionRequests = pgTable('device_suspension_requests', {
   reason: varchar('reason', { length: 20 }).notNull(),
   details: text('details'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// ─── Bot Features (AI awareness + admin toggles) ───
+
+export const botFeatures = pgTable('bot_features', {
+  id: serial('id').primaryKey(),
+  key: varchar('key', { length: 50 }).notNull().unique(),
+  name: varchar('name', { length: 100 }).notNull(),
+  description: text('description').notNull(),
+  category: varchar('category', { length: 30 }).notNull(),
+  isActive: boolean('is_active').default(true).notNull(),
+  isAiVisible: boolean('is_ai_visible').default(true).notNull(),
+  sortOrder: integer('sort_order').default(0).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });

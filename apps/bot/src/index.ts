@@ -16,7 +16,7 @@ import {
 import bs58 from 'bs58';
 import { message } from 'telegraf/filters';
 import { db, checkConnection } from '@zend/db';
-import { users, transactions, savedBankAccounts, scheduledTransfers, bitrefillOrders, ambassadorApplications, deviceSuspensionRequests } from '@zend/db';
+import { users, transactions, savedBankAccounts, scheduledTransfers, bitrefillOrders, ambassadorApplications, deviceSuspensionRequests, botFeatures } from '@zend/db';
 import { eq, sql, and } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
 import { BitRefillClient } from '@zend/bitrefill-client';
@@ -387,6 +387,54 @@ async function getPAJRates(): Promise<{ onRampRate: number; offRampRate: number 
   }
 }
 
+// ─── Bot Features (AI awareness) ───
+let _botFeaturesCache: any[] | null = null;
+let _botFeaturesCacheTime = 0;
+
+async function getBotFeatures(): Promise<any[]> {
+  if (_botFeaturesCache && Date.now() - _botFeaturesCacheTime < 300000) {
+    return _botFeaturesCache;
+  }
+  try {
+    const rows = await db.select().from(botFeatures).where(eq(botFeatures.isActive, true));
+    _botFeaturesCache = rows;
+    _botFeaturesCacheTime = Date.now();
+    return rows;
+  } catch (err) {
+    console.log('[Features] DB fetch failed, using cache/empty');
+    return _botFeaturesCache || [];
+  }
+}
+
+async function seedBotFeatures() {
+  try {
+    const existing = await db.select({ count: sql`count(*)` }).from(botFeatures);
+    if (Number(existing[0]?.count) > 0) return;
+
+    const features = [
+      { key: 'balance', name: 'Check Balance', description: 'Dollars (USDT/USDC) and SOL with live Naira rates', category: 'payment', sortOrder: 1 },
+      { key: 'add_naira', name: 'Add Naira', description: 'Bank transfer to a virtual account, get Dollars in your wallet', category: 'payment', sortOrder: 2 },
+      { key: 'send', name: 'Send to Bank', description: 'Send money to any Nigerian bank (GTB, UBA, Access, OPay, Kuda, etc.)', category: 'payment', sortOrder: 3 },
+      { key: 'receive', name: 'Receive Money', description: 'Crypto address for direct deposit + virtual bank account for Naira', category: 'payment', sortOrder: 4 },
+      { key: 'swap', name: 'Convert Currency', description: 'Exchange SOL ↔ USDT ↔ USDC', category: 'payment', sortOrder: 5 },
+      { key: 'deposit_crypto', name: 'Deposit from Other Apps', description: 'Send Dollars from Binance, MetaMask, Trust Wallet → receive in Zend', category: 'payment', sortOrder: 6 },
+      { key: 'history', name: 'Transaction History', description: 'View all past transactions', category: 'info', sortOrder: 7 },
+      { key: 'voice', name: 'Voice Commands', description: 'Send a voice note to execute commands', category: 'info', sortOrder: 8 },
+      { key: 'scheduled', name: 'Scheduled Transfers', description: 'Schedule automatic recurring or one-time future payments', category: 'payment', sortOrder: 9 },
+      { key: 'shop', name: 'Shop (Airtime & Gift Cards)', description: 'Buy airtime, data bundles and retail vouchers via BitRefill', category: 'payment', sortOrder: 10 },
+      { key: 'settings', name: 'Settings', description: 'PIN, language, auto-save, PAJ linking, wallet export', category: 'settings', sortOrder: 11 },
+      { key: 'community', name: 'Community', description: 'Join the Zend Telegram community', category: 'info', sortOrder: 12 },
+    ];
+
+    for (const f of features) {
+      await db.insert(botFeatures).values(f);
+    }
+    console.log('[Features] Seeded', features.length, 'features');
+  } catch (err) {
+    console.error('[Features] Seed failed:', err);
+  }
+}
+
 // ─── Bank Verification ───
 // Cache PAJ bank list to map our bank codes ↔ PAJ bank IDs
 let _pajBankCache: Array<{ id: string; name: string; code: string }> | null = null;
@@ -734,6 +782,98 @@ bot.command('start', async (ctx) => {
   await ctx.reply('📋 Tap to copy your address:', Markup.inlineKeyboard([
     [{ text: '📋 Copy Address', copy_text: { text: wallet.publicKey } } as any]
   ]));
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// /ADMIN — Admin Dashboard
+// ═════════════════════════════════════════════════════════════════════════════
+
+const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID;
+
+async function isAdmin(userId: string): Promise<boolean> {
+  if (ADMIN_TELEGRAM_ID && userId === ADMIN_TELEGRAM_ID) return true;
+  const u = await db.select({ isAdmin: users.isAdmin }).from(users).where(eq(users.id, userId)).limit(1);
+  return u.length > 0 && u[0].isAdmin;
+}
+
+bot.command('admin', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  if (!(await isAdmin(userId))) {
+    await ctx.reply('❌ You do not have permission to access the admin panel.');
+    return;
+  }
+
+  // Stats
+  const userCount = await db.select({ count: sql`count(*)` }).from(users);
+  const txCount = await db.select({ count: sql`count(*)` }).from(transactions);
+  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(amount_ngn), 0)` }).from(transactions).where(eq(transactions.type, 'offramp'));
+  const totalNgnIn = await db.select({ sum: sql`coalesce(sum(amount_ngn), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
+  const activeFeatures = await db.select().from(botFeatures).where(eq(botFeatures.isActive, true));
+
+  const stats =
+    `📊 *Zend Admin Dashboard*\n\n` +
+    `👤 Total Users: ${userCount[0]?.count || 0}\n` +
+    `📋 Total Transactions: ${txCount[0]?.count || 0}\n` +
+    `💰 Total NGN In: ₦${Number(totalNgnIn[0]?.sum || 0).toLocaleString()}\n` +
+    `💸 Total NGN Out: ₦${Number(totalNgnOut[0]?.sum || 0).toLocaleString()}\n` +
+    `✅ Active Features: ${activeFeatures.length}\n\n` +
+    `Tap a feature below to toggle it:`;
+
+  const features = await db.select().from(botFeatures).orderBy(botFeatures.sortOrder);
+  const buttons = features.map(f => [
+    Markup.button.callback(
+      `${f.isActive ? '🟢' : '🔴'} ${f.name}`,
+      `admin_toggle_feature:${f.id}`
+    )
+  ]);
+
+  await ctx.reply(stats, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard(buttons),
+  });
+});
+
+bot.action(/admin_toggle_feature:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  if (!(await isAdmin(userId))) {
+    await ctx.answerCbQuery('❌ Not authorized');
+    return;
+  }
+
+  const featureId = parseInt(ctx.match[1], 10);
+  const feature = await db.select().from(botFeatures).where(eq(botFeatures.id, featureId)).limit(1);
+  if (feature.length === 0) {
+    await ctx.answerCbQuery('Feature not found');
+    return;
+  }
+
+  const newState = !feature[0].isActive;
+  await db.update(botFeatures).set({ isActive: newState }).where(eq(botFeatures.id, featureId));
+
+  // Invalidate cache
+  _botFeaturesCache = null;
+
+  await ctx.answerCbQuery(`${feature[0].name} is now ${newState ? 'ON' : 'OFF'}`);
+
+  // Refresh the admin panel
+  const features = await db.select().from(botFeatures).orderBy(botFeatures.sortOrder);
+  const buttons = features.map(f => [
+    Markup.button.callback(
+      `${f.isActive ? '🟢' : '🔴'} ${f.name}`,
+      `admin_toggle_feature:${f.id}`
+    )
+  ]);
+
+  const activeCount = features.filter(f => f.isActive).length;
+  const updatedText =
+    `📊 *Zend Admin Dashboard*\n\n` +
+    `✅ Active Features: ${activeCount} / ${features.length}\n\n` +
+    `Tap a feature below to toggle it:`;
+
+  await ctx.editMessageText(updatedText, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard(buttons),
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2347,27 +2487,33 @@ bot.on(message('text'), async (ctx, next) => {
 
         // Use Kimi for conversational responses when details are missing
         if (!parsed.amount) {
+          const features = await getBotFeatures();
           const reply = await chatWithKimi(
             `The user said: "${text}". They want to send money but didn't specify an amount. ` +
-            `Respond conversationally in Nigerian Pidgin style. Ask how much they want to send.`
+            `Respond conversationally in Nigerian Pidgin style. Ask how much they want to send.`,
+            features
           );
           await ctx.reply(escapeTelegramMarkdown(reply?.reply || 'How much do you want to send?'), { parse_mode: 'Markdown', ...cancelKeyboard });
           setSession(userId, { state: ConversationState.AWAITING_SEND_AMOUNT, pendingTransaction: { recipientName: parsed.recipientName } });
           return;
         }
         if (parsed.amount < 100) {
+          const features = await getBotFeatures();
           const reply = await chatWithKimi(
             `The user wants to send ${parsed.amount} Naira. Minimum is ₦100. ` +
-            `Respond in Nigerian Pidgin style telling them the minimum.`
+            `Respond in Nigerian Pidgin style telling them the minimum.`,
+            features
           );
           await ctx.reply(reply?.reply || `Minimum send amount is ${formatNgn(100)}.`, cancelKeyboard);
           return;
         }
         if (!parsed.accountNumber && !parsed.walletAddress) {
           // We have amount + recipient name but missing bank/account
+          const features = await getBotFeatures();
           const reply = await chatWithKimi(
             `The user said: "${text}". I understood they want to send ${formatNgn(parsed.amount)} to ${parsed.recipientName || 'someone'}. ` +
-            `But I need the bank name and account number. Respond conversationally in Nigerian Pidgin style.`
+            `But I need the bank name and account number. Respond conversationally in Nigerian Pidgin style.`,
+            features
           );
           await ctx.reply(reply?.reply || `I got that you want to send ${formatNgn(parsed.amount)}. What's the bank and account number?`, cancelKeyboard);
           setSession(userId, {
@@ -2594,7 +2740,8 @@ bot.on(message('text'), async (ctx, next) => {
 
       default: {
         // Try conversational AI for unknown intents
-        const aiReply = await chatWithKimi(text);
+        const features = await getBotFeatures();
+        const aiReply = await chatWithKimi(text, features);
         if (aiReply) {
           await ctx.reply(aiReply.reply, mainMenu);
         } else {
@@ -5630,6 +5777,9 @@ async function main() {
   } else {
     console.warn('⚠️  ChainRails not configured');
   }
+
+  // Seed bot features table for AI awareness
+  await seedBotFeatures();
 
   // Start webhook server (runs alongside bot)
   startWebhookServer(bot);
