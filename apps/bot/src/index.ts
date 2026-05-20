@@ -3217,61 +3217,54 @@ async function showVirtualAccount(
   // Check if we have a cached virtual account to reuse (max 24h old)
   let virtualAccount: any = user[0]?.virtualAccount;
   const VA_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
-  const vaAge = virtualAccount?.createdAt ? Date.now() - new Date(virtualAccount.createdAt).getTime() : Infinity;
-  const hasCachedVA = virtualAccount?.accountNumber && virtualAccount?.bankName && vaAge < VA_MAX_AGE_MS;
-
   const webhookUrl = process.env.WEBHOOK_BASE_URL
     ? `${process.env.WEBHOOK_BASE_URL.replace(/\/$/, '')}/webhooks/paj`
     : 'https://example.com/webhook';
 
+  // Always generate a fresh virtual account — PAJ accounts are one-time use
+  const loadingVA = await showLoading(ctx, 'Creating your virtual bank account...');
   let order: any;
+  try {
+    order = await pajClient.createOnramp({
+      fiatAmount,
+      currency: Currency.NGN,
+      recipient: walletAddress,
+      mint: SOLANA_TOKENS.USDT.mint,
+      chain: Chain.SOLANA,
+      webhookURL: webhookUrl,
+    }, sessionToken);
 
-  if (!hasCachedVA) {
-    const loadingVA = await showLoading(ctx, 'Creating your virtual bank account...');
-    try {
-      order = await pajClient.createOnramp({
-        fiatAmount,
-        currency: Currency.NGN,
-        recipient: walletAddress,
-        mint: SOLANA_TOKENS.USDT.mint,
-        chain: Chain.SOLANA,
-        webhookURL: webhookUrl,
-      }, sessionToken);
+    virtualAccount = {
+      bankCode: 'WEM', // PAJ uses Wema Bank
+      bankName: order.bank,
+      accountNumber: order.accountNumber,
+      accountName: order.accountName,
+      orderId: order.id,
+      amount: fiatAmount,
+      createdAt: new Date().toISOString(),
+    };
 
-      virtualAccount = {
-        bankCode: 'WEM', // PAJ uses Wema Bank
-        bankName: order.bank,
-        accountNumber: order.accountNumber,
-        accountName: order.accountName,
-        orderId: order.id,
-        amount: fiatAmount,
-        createdAt: new Date().toISOString(),
-      };
+    // Cache in DB (overwrite previous)
+    await db.update(users)
+      .set({ virtualAccount })
+      .where(eq(users.id, userId));
 
-      // Cache in DB (overwrite previous)
-      await db.update(users)
-        .set({ virtualAccount })
-        .where(eq(users.id, userId));
-
-      console.log('[PAJ] Virtual account created:', order.accountNumber, 'for ₦', fiatAmount);
-    } catch (err: any) {
-      console.error('[PAJ] createOnramp failed:', err);
-      if (isPajSessionError(err)) {
-        await clearPajSession(userId);
-        await finishLoading(ctx, loadingVA.message_id, '⚠️ Your PAJ session expired. Please re-link in Settings.');
-        await ctx.reply(
-          `⚠️ *PAJ Session Expired*\n\n` +
-          `Go to *⚙️ Settings → 🔗 Link PAJ* to reconnect.`,
-          { parse_mode: 'Markdown', ...mainMenu }
-        );
-        return;
-      }
-      await finishLoading(ctx, loadingVA.message_id, `❌ Could not create virtual account.\nError: ${err.message || 'Unknown error'}`);
-      await ctx.reply('Menu:', mainMenu);
+    console.log('[PAJ] Virtual account created:', order.accountNumber, 'for ₦', fiatAmount, 'bank:', order.bank, 'name:', order.accountName, 'orderId:', order.id, 'fullOrder:', JSON.stringify(order));
+  } catch (err: any) {
+    console.error('[PAJ] createOnramp failed:', err);
+    if (isPajSessionError(err)) {
+      await clearPajSession(userId);
+      await finishLoading(ctx, loadingVA.message_id, '⚠️ Your PAJ session expired. Please re-link in Settings.');
+      await ctx.reply(
+        `⚠️ *PAJ Session Expired*\n\n` +
+        `Go to *⚙️ Settings → 🔗 Link PAJ* to reconnect.`,
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
       return;
     }
-  } else {
-    console.log('[PAJ] Reusing cached virtual account:', virtualAccount.accountNumber);
+    await finishLoading(ctx, loadingVA.message_id, `❌ Could not create virtual account.\nError: ${err.message || 'Unknown error'}`);
+    await ctx.reply('Menu:', mainMenu);
+    return;
   }
 
   const txId = generateTxId();
@@ -3283,10 +3276,10 @@ async function showVirtualAccount(
     ngnAmount: String(fiatAmount),
     ngnRate: String(order?.rate || _rate),
     fromAmount: String(order?.amount || usdtAmount),
-    pajReference: order?.id || virtualAccount.orderId,
+    pajReference: order.id,
     pajPoolAddress: walletAddress,
     recipientWalletAddress: walletAddress,
-    metadata: { virtualAccount, source: hasCachedVA ? 'cached' : 'fresh' },
+    metadata: { virtualAccount, source: 'fresh' },
   });
 
   const displayRate = order?.rate || _rate;
