@@ -839,22 +839,36 @@ bot.action(/shop_cat:(.+)/, async (ctx) => {
 
   await ctx.answerCbQuery('Loading products...');
 
-  const bitrefillCategory = category === 'data' ? 'refill' : category === 'gift-card' ? undefined : category;
-  const products = await getCachedProducts('NG', bitrefillCategory);
-  // Filter by keyword for data bundles if needed
+  // BitRefill Nigeria products don't use standard categories — fetch all and filter client-side
+  const products = await getCachedProducts('NG');
   let filtered = products.filter((p: any) => p.in_stock !== false);
+
   if (category === 'data') {
     filtered = filtered.filter((p: any) =>
       p.name.toLowerCase().includes('data') ||
       p.name.toLowerCase().includes('bundle') ||
       p.name.toLowerCase().includes('internet')
     );
-  }
-  if (category === 'gift-card') {
+  } else if (category === 'refill') {
+    // Airtime: carrier names but NOT data bundles
     filtered = filtered.filter((p: any) =>
-      p.category?.toLowerCase().includes('gift') ||
-      p.name.toLowerCase().includes('gift card') ||
-      p.type === 'gift_card'
+      (p.name.toLowerCase().includes('airtel') ||
+       p.name.toLowerCase().includes('mtn') ||
+       p.name.toLowerCase().includes('glo') ||
+       p.name.toLowerCase().includes('9mobile')) &&
+      !p.name.toLowerCase().includes('data')
+    );
+  } else if (category === 'gift-card') {
+    // Retail vouchers / gift cards: not airtime, not data, not electricity
+    filtered = filtered.filter((p: any) => {
+      const n = p.name.toLowerCase();
+      const isUtility = n.includes('airtel') || n.includes('mtn') || n.includes('glo') ||
+                        n.includes('9mobile') || n.includes('data') || n.includes('electricity');
+      return !isUtility;
+    });
+  } else if (category === 'esim') {
+    filtered = filtered.filter((p: any) =>
+      p.name.toLowerCase().includes('esim') || p.name.toLowerCase().includes('e-sim')
     );
   }
 
