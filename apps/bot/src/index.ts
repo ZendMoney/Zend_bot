@@ -225,7 +225,7 @@ const ZEND_TREASURY_WALLET = process.env.ZEND_TREASURY_WALLET || ''; // receives
 // Dev wallet for gas sponsorship (supports ZEND_DEV_WALLET_SECRET or PV_KEY)
 const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_KEY || '';
 
-const MIN_SOL_FOR_GAS = 0.0005; // ~0.00008 base fee + buffer for bundled tx
+const MIN_SOL_FOR_GAS = 0.003; // covers ATA creation rent (~0.002039) + tx fees + buffer
 const GAS_SPONSORSHIP_FEE_BPS = 50; // 0.5% extra for gasless users
 
 /** Fund SOL from dev wallet if user has insufficient balance. Returns true if funded. */
@@ -5421,6 +5421,14 @@ function startWebhookServer(botInstance: Telegraf<any>) {
         try {
           const event = JSON.parse(body);
           console.log('📩 PAJ Webhook:', event.type, event.reference);
+
+          // Guard against malformed/health-check webhooks
+          if (!event.type) {
+            console.log('[PAJ Webhook] No event type — likely ping/health-check. Body:', body.slice(0, 200));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ received: true, note: 'No event type' }));
+            return;
+          }
 
           switch (event.type) {
             case 'onramp.deposit.confirmed': {
