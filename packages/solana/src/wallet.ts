@@ -278,6 +278,105 @@ export class WalletService {
     );
   }
 
+  /**
+   * Execute a local (OTC) swap between two SPL tokens using the dev wallet as counterparty.
+   * Both legs are bundled in a single atomic transaction:
+   *   1. userWallet sends `fromAmount` of `fromMint` to devWallet
+   *   2. devWallet sends `toAmount` of `toMint` to `outputRecipientAddress` (defaults to userWallet)
+   *
+   * Returns the transaction signature.
+   */
+  async executeLocalSwap(
+    userWallet: Keypair,
+    devWallet: Keypair,
+    fromMint: string,
+    toMint: string,
+    fromAmount: number,
+    toAmount: number,
+    fromDecimals: number,
+    toDecimals: number,
+    outputRecipientAddress?: string
+  ): Promise<string> {
+    const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+
+    const fromMintPubkey = new PublicKey(fromMint);
+    const toMintPubkey = new PublicKey(toMint);
+    const recipientPubkey = new PublicKey(outputRecipientAddress || userWallet.publicKey.toBase58());
+
+    // --- Leg 1: user → dev (fromMint) ---
+    const userFromTokenAccount = await getAssociatedTokenAddress(fromMintPubkey, userWallet.publicKey);
+    const devFromTokenAccount = await getAssociatedTokenAddress(fromMintPubkey, devWallet.publicKey);
+    const rawFromAmount = BigInt(Math.round(fromAmount * Math.pow(10, fromDecimals)));
+
+    // --- Leg 2: dev → recipient (toMint) ---
+    const devToTokenAccount = await getAssociatedTokenAddress(toMintPubkey, devWallet.publicKey);
+    const recipientToTokenAccount = await getAssociatedTokenAddress(toMintPubkey, recipientPubkey);
+    const rawToAmount = BigInt(Math.round(toAmount * Math.pow(10, toDecimals)));
+
+    const instructions: TransactionInstruction[] = [];
+
+    // Ensure dev's output ATA exists (dev pays rent)
+    instructions.push(
+      createAssociatedTokenAccountIdempotentInstruction(
+        devWallet.publicKey,
+        devToTokenAccount,
+        devWallet.publicKey,
+        toMintPubkey
+      )
+    );
+
+    // Ensure recipient's output ATA exists (dev pays rent)
+    instructions.push(
+      createAssociatedTokenAccountIdempotentInstruction(
+        devWallet.publicKey,
+        recipientToTokenAccount,
+        recipientPubkey,
+        toMintPubkey
+      )
+    );
+
+    // Transfer from user → dev
+    instructions.push(
+      createTransferInstruction(
+        userFromTokenAccount,
+        devFromTokenAccount,
+        userWallet.publicKey,
+        rawFromAmount
+      )
+    );
+
+    // Transfer from dev → recipient
+    instructions.push(
+      createTransferInstruction(
+        devToTokenAccount,
+        recipientToTokenAccount,
+        devWallet.publicKey,
+        rawToAmount
+      )
+    );
+
+    const messageV0 = new TransactionMessage({
+      payerKey: userWallet.publicKey, // user pays SOL gas
+      recentBlockhash: blockhash,
+      instructions,
+    }).compileToV0Message();
+
+    const transaction = new VersionedTransaction(messageV0);
+    transaction.sign([userWallet, devWallet]);
+
+    const signature = await this.connection.sendTransaction(transaction, {
+      maxRetries: 3,
+      skipPreflight: false,
+    });
+
+    await this.connection.confirmTransaction(
+      { signature, blockhash, lastValidBlockHeight },
+      'confirmed'
+    );
+
+    return signature;
+  }
+
   // Send raw SOL (used for gas sponsorship from dev wallet)
   async sendSol(
     senderWallet: Keypair,

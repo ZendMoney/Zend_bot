@@ -228,23 +228,35 @@ const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_K
 const MIN_SOL_FOR_GAS = 0.0005; // base tx fee buffer
 const ATA_RENT_SOL = 0.002039; // rent to create an Associated Token Account
 const GAS_SPONSORSHIP_FEE_BPS = 50; // 0.5% extra for gasless users
+const AUDD_USDT_RATE = parseFloat(process.env.AUDD_USDT_RATE || '0.65'); // 1 AUDD = X USDT (admin-set)
 
 /** Calculate exact SOL a user needs for a send (fees + optional ATA rent). */
 function calcRequiredSol(feeSol: number, needsAta: boolean): number {
   return feeSol + MIN_SOL_FOR_GAS + (needsAta ? ATA_RENT_SOL : 0);
 }
 
+/** Get dev wallet SOL balance (for gas sponsorship health checks). */
+async function getDevWalletBalance(): Promise<number> {
+  if (!DEV_WALLET_SECRET) return 0;
+  try {
+    const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+    return await walletService.getSolBalance(devKeypair.publicKey.toBase58());
+  } catch {
+    return 0;
+  }
+}
+
 /**
  * Smart gas funding — tops up the user with exactly the shortfall.
  * If recipient needs an ATA, includes ATA rent in the calculation.
- * Returns { funded: boolean; gasSponsored: boolean; shortfall?: number }
+ * Returns { funded: boolean; gasSponsored: boolean; shortfall?: number; error?: string }
  */
 async function fundSolIfNeeded(
   walletAddress: string,
   feeSol: number,
   recipientAddress?: string,
   mintAddress?: string
-): Promise<{ funded: boolean; gasSponsored: boolean; shortfall?: number }> {
+): Promise<{ funded: boolean; gasSponsored: boolean; shortfall?: number; error?: string }> {
   let needsAta = false;
   if (recipientAddress && mintAddress) {
     try {
@@ -265,21 +277,46 @@ async function fundSolIfNeeded(
 
   if (!DEV_WALLET_SECRET) {
     console.warn('[Gas] No dev wallet secret set — cannot fund SOL');
-    return { funded: false, gasSponsored: false, shortfall };
+    return { funded: false, gasSponsored: false, shortfall, error: 'Dev wallet not configured' };
   }
 
-  try {
-    const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
-    await walletService.sendSol(devKeypair, walletAddress, shortfall);
-    console.log('[Gas] Funded exact shortfall:', shortfall.toFixed(6), 'SOL (needsAta:', needsAta, ') to', walletAddress);
-    return { funded: true, gasSponsored: true, shortfall };
-  } catch (err: any) {
-    console.error('[Gas] Failed to fund SOL:', err.message);
-    return { funded: false, gasSponsored: false, shortfall };
+  const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+  const devBalance = await walletService.getSolBalance(devKeypair.publicKey.toBase58());
+  const devNeeds = shortfall + MIN_SOL_FOR_GAS; // dev needs shortfall + its own tx fee
+  if (devBalance < devNeeds) {
+    console.error(`[Gas] Dev wallet has ${devBalance.toFixed(6)} SOL but needs ${devNeeds.toFixed(6)} SOL to fund user ${walletAddress}`);
+    return { funded: false, gasSponsored: false, shortfall, error: `Dev wallet low on SOL (${devBalance.toFixed(6)}). Please top up the dev wallet.` };
   }
+
+  // Retry up to 3 times with jitter
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await walletService.sendSol(devKeypair, walletAddress, shortfall);
+      console.log('[Gas] Funded exact shortfall:', shortfall.toFixed(6), 'SOL (needsAta:', needsAta, ') to', walletAddress);
+      return { funded: true, gasSponsored: true, shortfall };
+    } catch (err: any) {
+      console.error(`[Gas] Attempt ${attempt}/3 failed to fund SOL:`, err.message);
+      if (attempt === 3) {
+        return { funded: false, gasSponsored: false, shortfall, error: err.message };
+      }
+      // Jittered backoff: 500ms, 1000ms, 1500ms
+      await new Promise(r => setTimeout(r, attempt * 500 + Math.random() * 200));
+    }
+  }
+
+  return { funded: false, gasSponsored: false, shortfall, error: 'Funding failed after 3 retries' };
 }
 
 // ─── Helpers ───
+// Escape Telegram Markdown v1 special chars in user-generated text
+function md(text: string | undefined | null): string {
+  if (!text) return '';
+  return text
+    .replace(/_/g, '＿')
+    .replace(/\*/g, '•')
+    .replace(/`/g, "'");
+}
+
 function generateTxId(): string {
   return 'ZND-' + Math.random().toString(36).substring(2, 7).toUpperCase();
 }
@@ -874,8 +911,8 @@ bot.command('admin', async (ctx) => {
   // Stats
   const userCount = await db.select({ count: sql`count(*)` }).from(users);
   const txCount = await db.select({ count: sql`count(*)` }).from(transactions);
-  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(amount_ngn), 0)` }).from(transactions).where(eq(transactions.type, 'offramp'));
-  const totalNgnIn = await db.select({ sum: sql`coalesce(sum(amount_ngn), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
+  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'offramp'));
+  const totalNgnIn = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
   const activeFeatures = await db.select().from(botFeatures).where(eq(botFeatures.isActive, true));
 
   const stats =
@@ -1152,7 +1189,7 @@ bot.action(/shop_product:(.+)/, async (ctx) => {
     buttons.push([Markup.button.callback('⬅️ Back', 'shop_back')]);
 
     await ctx.editMessageText(
-      `🛒 *${product.name}*\n\n` +
+      `🛒 *${md(product.name)}*\n\n` +
       `${product.in_stock ? '✅ In Stock' : '❌ Out of Stock'}\n` +
       `Country: ${product.country || 'Nigeria'}\n` +
       `Currency: ${product.currency}\n\n` +
@@ -2562,8 +2599,8 @@ bot.on(message('text'), async (ctx, next) => {
     const menuFromToken = Object.values(SOLANA_TOKENS).find(t => t.mint === menuFromMint) || SOLANA_TOKENS.USDT;
     confirmMsg += `\n` +
       `Amount: *${formatNgn(amountNgn!)}*\n` +
-      `To: *${verifiedName}*\n` +
-      `Bank: *${bank.name}*\n` +
+      `To: *${md(verifiedName)}*\n` +
+      `Bank: *${md(bank.name)}*\n` +
       `Account: \`${accountNumber}\`\n\n` +
       feeLine +
       `You pay: *${amountUsdt!.toFixed(2)} ${menuFromToken.symbol}*\n` +
@@ -2763,8 +2800,8 @@ bot.on(message('text'), async (ctx, next) => {
 
         const fromSymbol = fromTokenInfo.symbol;
         msg += `\n` +
-          `To: *${verifiedName || 'Recipient'}*\n` +
-          `Bank: ${parsed.bankName || 'Solana'}\n` +
+          `To: *${md(verifiedName || 'Recipient')}*\n` +
+          `Bank: ${md(parsed.bankName) || 'Solana'}\n` +
           `Account: \`${parsed.accountNumber || parsed.walletAddress}\`\n` +
           `Amount: ${formatNgn(parsed.amount)}\n` +
           `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${feeSol.toFixed(6)} SOL (~${zendFeeUsdt.toFixed(2)} USDT)\n` +
@@ -2954,8 +2991,8 @@ bot.on(message('text'), async (ctx, next) => {
       await saveScheduledTransfer(userId, sd, sd.startAt);
       await ctx.reply(
         `✅ *Scheduled Transfer Created!*\n\n` +
-        `To: ${sd.recipientName}\n` +
-        `Bank: ${sd.bankName}\n` +
+        `To: ${md(sd.recipientName)}\n` +
+        `Bank: ${md(sd.bankName)}\n` +
         `Account: \`${sd.accountNumber}\`\n` +
         `Amount: ${formatNgn(sd.amountNgn!)}\n` +
         `Frequency: ${sd.frequency}\n` +
@@ -3046,8 +3083,8 @@ bot.on(message('text'), async (ctx, next) => {
 
     await ctx.reply(
       `✅ *Recipient Saved*\n\n` +
-      `Name: ${accountName}\n` +
-      `Bank: ${bank.name}\n` +
+      `Name: ${md(accountName)}\n` +
+      `Bank: ${md(bank.name)}\n` +
       `Account: \`${accountNumber}\`\n\n` +
       `How much NGN do you want to send each time?\n` +
       `Example: 50000`,
@@ -3135,8 +3172,8 @@ bot.on(message('text'), async (ctx, next) => {
 
     await ctx.reply(
       `✅ *Scheduled Transfer Created!*\n\n` +
-      `To: ${sd.recipientName}\n` +
-      `Bank: ${sd.bankName}\n` +
+      `To: ${md(sd.recipientName)}\n` +
+      `Bank: ${md(sd.bankName)}\n` +
       `Account: \`${sd.accountNumber}\`\n` +
       `Amount: ${formatNgn(sd.amountNgn!)}\n` +
       `Frequency: ${sd.frequency}\n` +
@@ -3572,9 +3609,9 @@ async function showVirtualAccount(
     `Fee: ${formatNgn(displayFee)}\n` +
     `You receive: ~${Number(displayReceive).toFixed(2)} ${receiveLabel}\n\n` +
     `*Send bank transfer to:*\n` +
-    `🏦 *${virtualAccount.bankName}*\n` +
+    `🏦 *${md(virtualAccount.bankName)}*\n` +
     `🔢 \`${virtualAccount.accountNumber}\`\n` +
-    `👤 *${virtualAccount.accountName}*\n\n` +
+    `👤 *${md(virtualAccount.accountName)}*\n\n` +
     `⏱️ Arrives in: 2-5 minutes\n\n` +
     `⚠️ *Important:* Send from a bank account in your name.`,
     { parse_mode: 'Markdown', ...mainMenu }
@@ -3739,32 +3776,44 @@ async function executeSendCore(
 
       let tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, pajMint);
 
-      // Auto-swap AUDD → USDT if user selected AUDD (hidden from user)
+      // Auto-swap AUDD → USDT via local pool (hidden from user)
       if (userFromMint === SOLANA_TOKENS.AUDD.mint) {
         const auddBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.AUDD.mint);
         if (auddBalance <= 0) {
           throw new Error('No AUDD balance. Please deposit AUDD first.');
         }
-        const swapAmountBase = Math.round(auddBalance * Math.pow(10, SOLANA_TOKENS.AUDD.decimals));
-        const quote = await getSwapQuote(SOLANA_TOKENS.AUDD.mint, SOLANA_TOKENS.USDT.mint, swapAmountBase, 100);
-        if (!quote) {
-          throw new Error('AUDD conversion not available right now. Please try again later.');
+        const usdtNeeded = order.amount;
+        const auddNeeded = usdtNeeded / AUDD_USDT_RATE;
+        if (auddBalance < auddNeeded) {
+          throw new Error(`Not enough AUDD. You have ${auddBalance.toFixed(2)} AUDD but need ${auddNeeded.toFixed(2)} AUDD (rate: 1 AUDD = ${AUDD_USDT_RATE} USDT).`);
         }
-        const outAmountUsdt = Number(quote.outAmount) / Math.pow(10, SOLANA_TOKENS.USDT.decimals);
-        if (outAmountUsdt < order.amount) {
-          throw new Error(`Not enough AUDD. Your ${auddBalance.toFixed(2)} AUDD is worth ≈${outAmountUsdt.toFixed(2)} USDT, but you need ${order.amount.toFixed(2)} USDT.`);
+        if (!DEV_WALLET_SECRET) {
+          throw new Error('AUDD swap not available: dev wallet not configured.');
         }
-        const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
-        if (!serializedTx) throw new Error('Failed to build swap transaction.');
+        const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+        const devUsdtBalance = await walletService.getTokenBalance(devKeypair.publicKey.toBase58(), SOLANA_TOKENS.USDT.mint);
+        if (devUsdtBalance < usdtNeeded) {
+          throw new Error('AUDD swap not available: liquidity pool is low. Please try again later or contact support.');
+        }
         const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
         const keypair = Keypair.fromSecretKey(secretKey);
-        const swapTxHash = await walletService.signAndSendSerialized(keypair, serializedTx);
-        console.log('[Jupiter] Auto-swap AUDD→USDT:', swapTxHash);
+        const swapTxHash = await walletService.executeLocalSwap(
+          keypair,
+          devKeypair,
+          SOLANA_TOKENS.AUDD.mint,
+          SOLANA_TOKENS.USDT.mint,
+          auddNeeded,
+          usdtNeeded,
+          SOLANA_TOKENS.AUDD.decimals,
+          SOLANA_TOKENS.USDT.decimals,
+          user[0].walletAddress // dev sends USDT back to user wallet
+        );
+        console.log('[LocalSwap] AUDD→USDT:', swapTxHash);
         const swapTxId = generateTxId();
         await db.insert(transactions).values({
           id: swapTxId, userId, type: 'swap', status: 'completed',
-          fromMint: SOLANA_TOKENS.AUDD.mint, fromAmount: auddBalance.toString(),
-          toMint: SOLANA_TOKENS.USDT.mint, toAmount: outAmountUsdt.toString(),
+          fromMint: SOLANA_TOKENS.AUDD.mint, fromAmount: auddNeeded.toString(),
+          toMint: SOLANA_TOKENS.USDT.mint, toAmount: usdtNeeded.toString(),
           solanaTxHash: swapTxHash,
         });
         tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
@@ -3802,7 +3851,7 @@ async function executeSendCore(
       }
 
       // Gas sponsorship: top up exact shortfall (including ATA rent if needed)
-      const { funded, gasSponsored, shortfall } = await fundSolIfNeeded(
+      const { funded, gasSponsored, shortfall, error: fundError } = await fundSolIfNeeded(
         user[0].walletAddress,
         txData.feeSol || 0,
         order.address,
@@ -3810,8 +3859,9 @@ async function executeSendCore(
       );
       if (shortfall && !funded) {
         throw new Error(
-          `Insufficient SOL for network fee. You need ~${shortfall.toFixed(6)} more SOL. ` +
-          `We can cover it for you (+0.5% extra).`
+          `Your wallet needs ~${shortfall.toFixed(6)} more SOL for network fees. ` +
+          (fundError ? `Auto-funding failed: ${fundError}. ` : '') +
+          `Please deposit a small amount of SOL to your Zend wallet, or contact support.`
         );
       }
 
@@ -3990,11 +4040,12 @@ async function executeSwap(
     }
 
     // Gas sponsorship for swaps
-    const { funded, gasSponsored, shortfall } = await fundSolIfNeeded(user[0].walletAddress, 0);
+    const { funded, gasSponsored, shortfall, error: fundError } = await fundSolIfNeeded(user[0].walletAddress, 0);
     if (shortfall && !funded) {
       throw new Error(
-        `Insufficient SOL for swap fee. You need ~${shortfall.toFixed(6)} more SOL. ` +
-        `We can cover it for you (+0.5% extra).`
+        `Your wallet needs ~${shortfall.toFixed(6)} more SOL for swap fees. ` +
+        (fundError ? `Auto-funding failed: ${fundError}. ` : '') +
+        `Please deposit a small amount of SOL to your Zend wallet, or contact support.`
       );
     }
 
@@ -4245,8 +4296,8 @@ async function prepareSendConfirmation(
   }
 
   msg += `\n` +
-    `To: *${verifiedName || 'Recipient'}*\n` +
-    `Bank: ${bankName}\n` +
+    `To: *${md(verifiedName || 'Recipient')}*\n` +
+    `Bank: ${md(bankName)}\n` +
     `Account: \`${recipientAccountNumber}\`\n` +
     `Amount: ${formatNgn(amountNgn)}\n` +
     `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${feeSol.toFixed(6)} SOL (~${zendFeeUsdt.toFixed(2)} USDT)\n` +
@@ -4394,8 +4445,6 @@ async function showSwapMenu(ctx: ZendContext, userId: string) {
         [Markup.button.callback('SOL → USDT', 'swap:SOL:USDT')],
         [Markup.button.callback('USDC → USDT', 'swap:USDC:USDT')],
         [Markup.button.callback('USDT → SOL', 'swap:USDT:SOL')],
-        [Markup.button.callback('AUDD → USDT', 'swap:AUDD:USDT')],
-        [Markup.button.callback('USDT → AUDD', 'swap:USDT:AUDD')],
         [Markup.button.callback('❌ Cancel', 'cancel_swap')],
       ]),
     }
@@ -4576,8 +4625,8 @@ bot.action(/schedule_bank:([A-Z]+)/, async (ctx) => {
 
   await ctx.editMessageText(
     `✅ *Recipient Saved*\n\n` +
-    `Name: ${accountName}\n` +
-    `Bank: ${bank.name}\n` +
+    `Name: ${md(accountName)}\n` +
+    `Bank: ${md(bank.name)}\n` +
     `Account: \`${accountNumber}\`\n\n` +
     `How much NGN do you want to send each time?\n` +
     `Example: 50000`,
@@ -4613,8 +4662,8 @@ bot.action(/schedule_recipient:(\d+)/, async (ctx) => {
 
   await ctx.editMessageText(
     `📅 *Schedule Transfer*\n\n` +
-    `Recipient: ${acc.accountName}\n` +
-    `Bank: ${acc.bankName}\n` +
+    `Recipient: ${md(acc.accountName)}\n` +
+    `Bank: ${md(acc.bankName)}\n` +
     `Account: \`${acc.accountNumber}\`\n\n` +
     `How much NGN do you want to send each time?\n` +
     `Example: 50000`,
@@ -5075,7 +5124,7 @@ async function showSettings(ctx: ZendContext, userId: string) {
     const msg =
       `⚙️ *Settings*\n\n` +
       `👤 *Profile*\n` +
-      `Name: ${u.firstName} ${u.lastName || ''}\n\n` +
+      `Name: ${md(u.firstName)} ${md(u.lastName || '')}\n\n` +
       `*Your Address:*\n` +
       `\`\`\`\n${u.walletAddress}\n\`\`\`\n\n` +
       `🔐 *Security*\n` +
@@ -5502,31 +5551,42 @@ function startWebhookServer(botInstance: Telegraf<any>) {
                     if (user.length > 0 && user[0].walletEncryptedKey) {
                       const usdtAmount = Number(txRows[0].fromAmount || 0);
                       if (usdtAmount > 0) {
-                        const swapAmountBase = Math.round(usdtAmount * Math.pow(10, SOLANA_TOKENS.USDT.decimals));
-                        const quote = await getSwapQuote(SOLANA_TOKENS.USDT.mint, SOLANA_TOKENS.AUDD.mint, swapAmountBase, 100);
-                        if (quote) {
-                          const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
-                          if (serializedTx) {
+                        const auddOut = usdtAmount / AUDD_USDT_RATE;
+                        if (DEV_WALLET_SECRET) {
+                          const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+                          const devAuddBalance = await walletService.getTokenBalance(devKeypair.publicKey.toBase58(), SOLANA_TOKENS.AUDD.mint);
+                          if (devAuddBalance >= auddOut) {
                             const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
                             const keypair = Keypair.fromSecretKey(secretKey);
-                            const swapTxHash = await walletService.signAndSendSerialized(keypair, serializedTx);
-                            const outAudd = Number(quote.outAmount) / Math.pow(10, SOLANA_TOKENS.AUDD.decimals);
+                            const swapTxHash = await walletService.executeLocalSwap(
+                              keypair,
+                              devKeypair,
+                              SOLANA_TOKENS.USDT.mint,
+                              SOLANA_TOKENS.AUDD.mint,
+                              usdtAmount,
+                              auddOut,
+                              SOLANA_TOKENS.USDT.decimals,
+                              SOLANA_TOKENS.AUDD.decimals,
+                              user[0].walletAddress
+                            );
                             const swapTxId = generateTxId();
                             await db.insert(transactions).values({
                               id: swapTxId, userId, type: 'swap', status: 'completed',
                               fromMint: SOLANA_TOKENS.USDT.mint, fromAmount: usdtAmount.toString(),
-                              toMint: SOLANA_TOKENS.AUDD.mint, toAmount: outAudd.toString(),
+                              toMint: SOLANA_TOKENS.AUDD.mint, toAmount: auddOut.toString(),
                               solanaTxHash: swapTxHash,
                             });
                             await botInstance.telegram.sendMessage(
                               userId,
                               `🎉 *AUDD Deposit Complete!*\n\n` +
                               `Your Naira bank transfer has been confirmed and AUDD has been credited to your Zend account.\n\n` +
-                              `Received: ~${outAudd.toFixed(2)} AUDD\n` +
+                              `Received: ~${auddOut.toFixed(2)} AUDD\n` +
                               `Reference: \`${event.reference}\``,
                               { parse_mode: 'Markdown' }
                             );
                             notified = true;
+                          } else {
+                            console.error('[AUDD On-ramp] Dev wallet AUDD balance too low:', devAuddBalance, 'needed:', auddOut);
                           }
                         }
                       }
@@ -5938,8 +5998,8 @@ async function runScheduledTransfers() {
               s.userId,
               `✅ *Scheduled Transfer Executed*\n\n` +
               `Amount: ${formatNgn(Number(s.amountNgn))}\n` +
-              `To: ${acc.accountName}\n` +
-              `Bank: ${acc.bankName} • \`${acc.accountNumber}\`\n\n` +
+              `To: ${md(acc.accountName)}\n` +
+              `Bank: ${md(acc.bankName)} • \`${acc.accountNumber}\`\n\n` +
               `Reference: \`${result.txId}\`\n` +
               (result.solanaTxHash ? `Tx: \`https://solscan.io/tx/${result.solanaTxHash}\`\n` : '') +
               `Time: ~2 minutes`,
@@ -5952,8 +6012,8 @@ async function runScheduledTransfers() {
               s.userId,
               `❌ *Scheduled Transfer Failed*\n\n` +
               `Amount: ${formatNgn(Number(s.amountNgn))}\n` +
-              `To: ${acc.accountName}\n` +
-              `Bank: ${acc.bankName} • \`${acc.accountNumber}\`\n\n` +
+              `To: ${md(acc.accountName)}\n` +
+              `Bank: ${md(acc.bankName)} • \`${acc.accountNumber}\`\n\n` +
               `Error: ${result.error || 'Unknown error'}\n` +
               `No funds were deducted.`,
               { parse_mode: 'Markdown', ...mainMenu }
