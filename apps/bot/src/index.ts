@@ -80,6 +80,7 @@ interface ZendSession {
   pinVerifyAction?: 'send' | 'swap' | 'export' | 'schedule';
   pajContact?: string; // email/phone pending OTP
   onrampAmount?: number; // pending on-ramp amount in NGN
+  onrampTargetToken?: 'USDT' | 'AUDD'; // which token the on-ramp should credit
   voiceAnalysis?: {
     text: string;
     amount: number | null;
@@ -120,6 +121,7 @@ interface ZendSession {
     bitrefillPriceUsd?: number;
     totalUsdt?: number;
   };
+  lastBotMessageId?: number; // message ID of last bot prompt (for cleanup)
 }
 
 interface ZendContext extends Context {
@@ -337,7 +339,7 @@ async function getSolPriceInUsdt(): Promise<number> {
   try {
     const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
     const data = await res.json();
-    const price = data?.solana?.usd || 140;
+    const price = (data as any)?.solana?.usd || 140;
     _solPriceCache = { price, time: Date.now() };
     return price;
   } catch {
@@ -416,8 +418,8 @@ async function seedBotFeatures() {
       { key: 'add_naira', name: 'Add Naira', description: 'Bank transfer to a virtual account, get Dollars in your wallet', category: 'payment', sortOrder: 2 },
       { key: 'send', name: 'Send to Bank', description: 'Send money to any Nigerian bank (GTB, UBA, Access, OPay, Kuda, etc.)', category: 'payment', sortOrder: 3 },
       { key: 'receive', name: 'Receive Money', description: 'Crypto address for direct deposit + virtual bank account for Naira', category: 'payment', sortOrder: 4 },
-      { key: 'swap', name: 'Convert Currency', description: 'Exchange SOL ↔ USDT ↔ USDC', category: 'payment', sortOrder: 5 },
-      { key: 'deposit_crypto', name: 'Deposit from Other Apps', description: 'Send Dollars from Binance, MetaMask, Trust Wallet → receive in Zend', category: 'payment', sortOrder: 6 },
+      { key: 'swap', name: 'Convert Currency', description: 'Exchange SOL ↔ USDT ↔ USDC ↔ AUDD', category: 'payment', sortOrder: 5 },
+      { key: 'deposit_crypto', name: 'Deposit from Other Apps', description: 'Send Dollars or AUDD from Binance, MetaMask, Trust Wallet → receive in Zend', category: 'payment', sortOrder: 6 },
       { key: 'history', name: 'Transaction History', description: 'View all past transactions', category: 'info', sortOrder: 7 },
       { key: 'voice', name: 'Voice Commands', description: 'Send a voice note to execute commands', category: 'info', sortOrder: 8 },
       { key: 'scheduled', name: 'Scheduled Transfers', description: 'Schedule automatic recurring or one-time future payments', category: 'payment', sortOrder: 9 },
@@ -636,7 +638,7 @@ bot.use(async (ctx, next) => {
 // Track & auto-delete user messages during sensitive flows
 bot.on(message('text'), async (ctx, next) => {
   const userId = ctx.from?.id?.toString();
-  if (!userId || !ctx.chat) return next();
+  if (!userId || !ctx.chat || !ctx.message?.message_id) return next();
   const session = getSession(userId);
   const sensitiveStates = [
     ConversationState.AWAITING_PIN,
@@ -653,10 +655,33 @@ bot.on(message('text'), async (ctx, next) => {
     ConversationState.AWAITING_BANK_DETAILS,
     ConversationState.AWAITING_SHOP_PHONE,
   ];
-  if (sensitiveStates.includes(session.state)) {
-    trackMessage(ctx.chat.id, ctx.message.message_id, session.state === ConversationState.AWAITING_PIN || session.state === ConversationState.AWAITING_PIN_VERIFY);
+  const isSensitive = sensitiveStates.includes(session.state);
+  const isPin = session.state === ConversationState.AWAITING_PIN || session.state === ConversationState.AWAITING_PIN_VERIFY;
+
+  if (isSensitive) {
+    trackMessage(ctx.chat.id, ctx.message.message_id, isPin);
   }
-  return next();
+
+  await next(); // let the main handler process the message
+
+  // Immediately delete user messages for sensitive flows (more reliable than queue)
+  if (isSensitive) {
+    try {
+      await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id);
+      console.log(`[AutoDelete] Deleted user message ${ctx.message.message_id} in state ${session.state}`);
+    } catch (err: any) {
+      console.log(`[AutoDelete] Failed to delete user message ${ctx.message.message_id}:`, err.message);
+    }
+    // For PIN flows, also delete the bot's previous prompt message
+    if (isPin && session.lastBotMessageId) {
+      try {
+        await ctx.telegram.deleteMessage(ctx.chat.id, session.lastBotMessageId);
+        console.log(`[AutoDelete] Deleted bot prompt ${session.lastBotMessageId}`);
+      } catch (err: any) {
+        console.log(`[AutoDelete] Failed to delete bot prompt ${session.lastBotMessageId}:`, err.message);
+      }
+    }
+  }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -788,17 +813,30 @@ bot.command('start', async (ctx) => {
 // /ADMIN — Admin Dashboard
 // ═════════════════════════════════════════════════════════════════════════════
 
-const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID;
+// Comma-separated list of admin Telegram usernames or IDs (no @ symbols)
+// Example: ADMIN_TELEGRAM_IDS=israel_igboze,ajemark,123456789
+const ADMIN_TELEGRAM_IDS = (process.env.ADMIN_TELEGRAM_IDS || process.env.ADMIN_TELEGRAM_ID || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
 
-async function isAdmin(userId: string): Promise<boolean> {
-  if (ADMIN_TELEGRAM_ID && userId === ADMIN_TELEGRAM_ID) return true;
-  const u = await db.select({ isAdmin: users.isAdmin }).from(users).where(eq(users.id, userId)).limit(1);
-  return u.length > 0 && u[0].isAdmin;
+async function isAdmin(userId: string, username?: string): Promise<boolean> {
+  // Check env list by user ID or username
+  if (ADMIN_TELEGRAM_IDS.length > 0) {
+    if (ADMIN_TELEGRAM_IDS.includes(userId)) return true;
+    if (username && ADMIN_TELEGRAM_IDS.includes(username.toLowerCase())) return true;
+  }
+  // Check DB flag for runtime admin management
+  const u = await db.select({ isAdmin: users.isAdmin, telegramUsername: users.telegramUsername }).from(users).where(eq(users.id, userId)).limit(1);
+  if (u.length > 0 && u[0].isAdmin) return true;
+  if (u.length > 0 && u[0].telegramUsername && ADMIN_TELEGRAM_IDS.includes(u[0].telegramUsername.toLowerCase())) return true;
+  return false;
 }
 
 bot.command('admin', async (ctx) => {
   const userId = ctx.from.id.toString();
-  if (!(await isAdmin(userId))) {
+  const username = ctx.from.username;
+  if (!(await isAdmin(userId, username))) {
     await ctx.reply('❌ You do not have permission to access the admin panel.');
     return;
   }
@@ -835,7 +873,8 @@ bot.command('admin', async (ctx) => {
 
 bot.action(/admin_toggle_feature:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
-  if (!(await isAdmin(userId))) {
+  const username = ctx.from.username;
+  if (!(await isAdmin(userId, username))) {
     await ctx.answerCbQuery('❌ Not authorized');
     return;
   }
@@ -894,7 +933,7 @@ bot.command('wallet', async (ctx) => {
     `👛 *Your Account*\n\n` +
     `*Your Address:*\n\n` +
     `${u.walletAddress}\n\n` +
-    `*Currencies:* SOL, USDT, USDC\n\n` +
+    `*Currencies:* SOL, USDT, USDC, AUDD\n\n` +
     `⚠️ To view your secret code, go to *⚙️ Settings*.`;
 
   const copyBtn = Markup.inlineKeyboard([
@@ -1709,7 +1748,8 @@ bot.action('export_key', async (ctx) => {
       `Enter your 4-digit PIN to view your secret code:`,
       { parse_mode: 'Markdown' }
     );
-    await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    const waitMsg = await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    getSession(userId).lastBotMessageId = waitMsg.message_id;
     return;
   }
 
@@ -1750,7 +1790,7 @@ async function buildBalanceMessage(userId: string): Promise<string | null> {
         ngnEquiv = bal.amount * offRampRate;
       }
       totalNgn += ngnEquiv;
-      const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : '🟡';
+      const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : bal.symbol === 'AUDD' ? '🇦🇺' : '🟡';
       msg += `${emoji} *${bal.symbol}*  ${formatBalance(bal.amount, bal.symbol)}  (≈${formatNgn(ngnEquiv)})\n`;
     }
 
@@ -1815,7 +1855,7 @@ async function startAddNaira(ctx: ZendContext, userId: string) {
   }
 
   // Step 1: Ask how much NGN they want to add
-  setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT });
+  setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampTargetToken: 'USDT' });
 
   await ctx.reply(
     `💵 *Add Naira*\n\n` +
@@ -1833,6 +1873,45 @@ bot.hears('💵 Add Naira', async (ctx) => {
 bot.action('add_naira_start', async (ctx) => {
   await ctx.answerCbQuery();
   await startAddNaira(ctx, ctx.from!.id.toString());
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 🇦🇺 ADD AUDD (On-Ramp with hidden USDT→AUDD swap)
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function startAddAudd(ctx: ZendContext, userId: string) {
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+
+  if (user.length === 0) {
+    await ctx.reply('Please run /start first.', mainMenu);
+    return;
+  }
+
+  const pajClient = await getPAJClient();
+  if (!pajClient) {
+    await ctx.reply('❌ PAJ service is not configured. Please contact support.', mainMenu);
+    return;
+  }
+
+  setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampTargetToken: 'AUDD' });
+
+  await ctx.reply(
+    `🇦🇺 *Add AUDD*\n\n` +
+    `How much NGN do you want to deposit?\n\n` +
+    `You'll receive Australian Digital Dollars (AUDD) in your wallet.\n\n` +
+    `Minimum: ${formatNgn(PAJ_MIN_DEPOSIT_NGN)}\n\n` +
+    `Enter the amount (numbers only):`,
+    { parse_mode: 'Markdown', ...cancelKeyboard }
+  );
+}
+
+bot.command('addaudd', async (ctx) => {
+  await startAddAudd(ctx, ctx.from.id.toString());
+});
+
+bot.action('add_aud_start', async (ctx) => {
+  await ctx.answerCbQuery();
+  await startAddAudd(ctx, ctx.from!.id.toString());
 });
 
 // Handle PAJ email/phone input
@@ -1908,8 +1987,9 @@ bot.on(message('text'), async (ctx, next) => {
 
     if (hasPajSession && user[0]) {
       // Already authenticated — create order and show VA
-      setSession(userId, { state: ConversationState.IDLE, onrampAmount: amount });
-      await showVirtualAccount(ctx, userId, user[0].pajSessionToken!, amount, rate, feeNgn);
+      const targetToken = session.onrampTargetToken || 'USDT';
+      setSession(userId, { state: ConversationState.IDLE, onrampAmount: amount, onrampTargetToken: targetToken });
+      await showVirtualAccount(ctx, userId, user[0].pajSessionToken!, amount, rate, feeNgn, targetToken);
       return;
     }
 
@@ -2188,6 +2268,7 @@ bot.on(message('text'), async (ctx, next) => {
 
       // Now show virtual account (with pending amount if any)
       const onrampAmount = session.onrampAmount;
+      const targetToken = session.onrampTargetToken || 'USDT';
       if (onrampAmount) {
         // Get rate for the pending amount
         let rate = 1550;
@@ -2195,13 +2276,13 @@ bot.on(message('text'), async (ctx, next) => {
         try {
           const rateData = await pajClient.getRateByAmount(onrampAmount);
           rate = rateData.rate.rate;
-          fee = rateData.fee || 0;
+          fee = (rateData as any).fee || 0;
         } catch (err) {
           console.log('Using fallback rate for on-ramp after verify');
         }
-        await showVirtualAccount(ctx, userId, verified.token, onrampAmount, rate, fee);
+        await showVirtualAccount(ctx, userId, verified.token, onrampAmount, rate, fee, targetToken);
       } else {
-        await showVirtualAccount(ctx, userId, verified.token);
+        await showVirtualAccount(ctx, userId, verified.token, undefined, undefined, undefined, targetToken);
       }
     } catch (err: any) {
       console.error('[PAJ] Verify failed:', err);
@@ -2277,6 +2358,7 @@ bot.on(message('text'), async (ctx, next) => {
     const feeSol = zendFeeUsdt / solPrice;
 
     session.pendingTransaction = {
+      ...session.pendingTransaction,
       amountNgn: amount,
       amountUsdt: usdtNeeded,
       zendFeeUsdt,
@@ -2717,7 +2799,7 @@ bot.on(message('text'), async (ctx, next) => {
               ngnEquiv = bal.amount * offRampRate;
             }
             totalNgn += ngnEquiv;
-            const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : '🟡';
+            const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : bal.symbol === 'AUDD' ? '🇦🇺' : '🟡';
             msg += `${emoji} *${bal.symbol}*  ${formatBalance(bal.amount, bal.symbol)}  (≈${formatNgn(ngnEquiv)})\n`;
           }
 
@@ -3008,11 +3090,12 @@ bot.on(message('text'), async (ctx, next) => {
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     if (user.length > 0 && user[0].transactionPin) {
       setSession(userId, { ...session, state: ConversationState.AWAITING_PIN_VERIFY, pinVerifyAction: 'schedule' });
-      await ctx.reply(
+      const pinMsg = await ctx.reply(
         `🔐 *Security Check*\n\n` +
         `Enter your 4-digit PIN to confirm this scheduled transfer:`,
         cancelKeyboard
       );
+      getSession(userId).lastBotMessageId = pinMsg.message_id;
       return;
     }
 
@@ -3348,7 +3431,8 @@ async function showVirtualAccount(
   sessionToken: string,
   amount?: number,
   rate?: number,
-  fee?: number
+  fee?: number,
+  targetToken: 'USDT' | 'AUDD' = 'USDT'
 ): Promise<void> {
   const pajClient = await getPAJClient();
   if (!pajClient) {
@@ -3374,6 +3458,7 @@ async function showVirtualAccount(
     }
   }
   const usdtAmount = fiatAmount / _rate;
+  const receiveLabel = targetToken === 'AUDD' ? 'AUDD' : 'Dollars';
 
   // Check if we have a cached virtual account to reuse (max 24h old)
   let virtualAccount: any = user[0]?.virtualAccount;
@@ -3440,7 +3525,7 @@ async function showVirtualAccount(
     pajReference: order.id,
     pajPoolAddress: walletAddress,
     recipientWalletAddress: walletAddress,
-    metadata: { virtualAccount, source: 'fresh' },
+    metadata: { virtualAccount, source: 'fresh', targetToken },
   });
 
   const displayRate = order?.rate || _rate;
@@ -3448,13 +3533,14 @@ async function showVirtualAccount(
   const displayReceive = order?.amount || usdtAmount;
 
   const isExactAmount = amount && amount >= PAJ_MIN_DEPOSIT_NGN;
+  const menuTitle = targetToken === 'AUDD' ? '🇦🇺 Add AUDD' : '💵 Add Naira';
   await ctx.reply(
-    `💵 *Add Naira*\n\n` +
+    `${menuTitle}\n\n` +
     `*Deposit Details:*\n` +
     (isExactAmount ? `Amount: ${formatNgn(fiatAmount)}\n` : `Minimum: ${formatNgn(PAJ_MIN_DEPOSIT_NGN)}\n`) +
     `Rate: ₦${displayRate.toLocaleString()}/USD\n` +
     `Fee: ${formatNgn(displayFee)}\n` +
-    `You receive: ~${Number(displayReceive).toFixed(2)} Dollars\n\n` +
+    `You receive: ~${Number(displayReceive).toFixed(2)} ${receiveLabel}\n\n` +
     `*Send bank transfer to:*\n` +
     `🏦 *${virtualAccount.bankName}*\n` +
     `🔢 \`${virtualAccount.accountNumber}\`\n` +
@@ -3485,17 +3571,44 @@ bot.hears('📤 Send', async (ctx) => {
     return;
   }
 
-  setSession(userId, {
-    state: ConversationState.AWAITING_SEND_AMOUNT,
-    pendingTransaction: {},
-  });
-
+  // Ask which token to send from
   await ctx.reply(
     `📤 *Send Money*\n\n` +
+    `Send from which balance?`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('USDT', 'send_token:USDT')],
+        [Markup.button.callback('AUDD', 'send_token:AUDD')],
+        [Markup.button.callback('❌ Cancel', 'cancel_send')],
+      ]),
+    }
+  );
+});
+
+bot.action(/send_token:([A-Z]+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const tokenSymbol = ctx.match[1];
+  const token = Object.values(SOLANA_TOKENS).find(t => t.symbol === tokenSymbol);
+
+  if (!token) {
+    await ctx.editMessageText('❌ Invalid token selected.');
+    return;
+  }
+
+  setSession(userId, {
+    state: ConversationState.AWAITING_SEND_AMOUNT,
+    pendingTransaction: { fromMint: token.mint },
+  });
+
+  await ctx.editMessageText(
+    `📤 *Send Money (${tokenSymbol})*\n\n` +
     `How much do you want to send? (in Naira)\n\n` +
     `Examples:\n• 50000\n• 100000\n• 5000`,
-    { parse_mode: 'Markdown', ...cancelKeyboard }
+    { parse_mode: 'Markdown' }
   );
+  await ctx.reply('Waiting for amount...', cancelKeyboard);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -3519,9 +3632,11 @@ async function executeSendCore(
     recipientName?: string;
   }
 ): Promise<{ success: boolean; txId: string; solanaTxHash?: string; offRampRef?: string; error?: string }> {
-  const fromMint = txData.fromMint || SOLANA_TOKENS.USDT.mint;
-  const fromToken = Object.values(SOLANA_TOKENS).find(t => t.mint === fromMint) || SOLANA_TOKENS.USDT;
-  const fromSymbol = fromToken.symbol;
+  const userFromMint = txData.fromMint || SOLANA_TOKENS.USDT.mint;
+  const userFromToken = Object.values(SOLANA_TOKENS).find(t => t.mint === userFromMint) || SOLANA_TOKENS.USDT;
+  const userFromSymbol = userFromToken.symbol;
+  const pajMint = SOLANA_TOKENS.USDT.mint; // PAJ only accepts USDT
+  const pajToken = SOLANA_TOKENS.USDT;
   const finalAccountName = txData.recipientAccountName || txData.recipientName || 'Recipient';
   const finalBankName = txData.recipientBankName || 'Unknown';
   const finalBankCode = txData.recipientBankCode || 'UNKNOWN';
@@ -3537,7 +3652,7 @@ async function executeSendCore(
     ngnAmount: txData.amountNgn.toString(),
     ngnRate: (txData.ngnRate || 1550).toString(),
     fromAmount: txData.amountUsdt.toString(),
-    fromMint: fromMint,
+    fromMint: userFromMint,
     zendFeeUsdt: feeUsdt.toString(),
     recipientBankCode: finalBankCode,
     recipientBankName: finalBankName,
@@ -3584,7 +3699,7 @@ async function executeSendCore(
         accountNumber: finalAccountNumber,
         currency: Currency.NGN,
         fiatAmount: txData.amountNgn,
-        mint: fromMint,
+        mint: pajMint,
         chain: Chain.SOLANA,
         webhookURL: webhookUrl,
       } as any, user[0].pajSessionToken);
@@ -3592,10 +3707,41 @@ async function executeSendCore(
       offRampRef = order.id;
       console.log('[PAJ] Off-ramp order created:', order.id, 'deposit address:', order.address, 'amount:', order.amount);
 
-      let tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, fromMint);
+      let tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, pajMint);
+
+      // Auto-swap AUDD → USDT if user selected AUDD (hidden from user)
+      if (userFromMint === SOLANA_TOKENS.AUDD.mint) {
+        const auddBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.AUDD.mint);
+        if (auddBalance <= 0) {
+          throw new Error('No AUDD balance. Please deposit AUDD first.');
+        }
+        const swapAmountBase = Math.round(auddBalance * Math.pow(10, SOLANA_TOKENS.AUDD.decimals));
+        const quote = await getSwapQuote(SOLANA_TOKENS.AUDD.mint, SOLANA_TOKENS.USDT.mint, swapAmountBase, 100);
+        if (!quote) {
+          throw new Error('AUDD conversion not available right now. Please try again later.');
+        }
+        const outAmountUsdt = Number(quote.outAmount) / Math.pow(10, SOLANA_TOKENS.USDT.decimals);
+        if (outAmountUsdt < order.amount) {
+          throw new Error(`Not enough AUDD. Your ${auddBalance.toFixed(2)} AUDD is worth ≈${outAmountUsdt.toFixed(2)} USDT, but you need ${order.amount.toFixed(2)} USDT.`);
+        }
+        const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
+        if (!serializedTx) throw new Error('Failed to build swap transaction.');
+        const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
+        const keypair = Keypair.fromSecretKey(secretKey);
+        const swapTxHash = await walletService.signAndSendSerialized(keypair, serializedTx);
+        console.log('[Jupiter] Auto-swap AUDD→USDT:', swapTxHash);
+        const swapTxId = generateTxId();
+        await db.insert(transactions).values({
+          id: swapTxId, userId, type: 'swap', status: 'completed',
+          fromMint: SOLANA_TOKENS.AUDD.mint, fromAmount: auddBalance.toString(),
+          toMint: SOLANA_TOKENS.USDT.mint, toAmount: outAmountUsdt.toString(),
+          solanaTxHash: swapTxHash,
+        });
+        tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
+      }
 
       // Auto-swap USDC → USDT if needed
-      if (fromMint === SOLANA_TOKENS.USDT.mint && tokenBalance < order.amount) {
+      if (tokenBalance < order.amount) {
         const usdcBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDC.mint);
         if (usdcBalance >= order.amount) {
           const swapAmountUsdc = Math.min(usdcBalance, order.amount * 1.03);
@@ -3646,7 +3792,7 @@ async function executeSendCore(
 
       // Check USDT balance covers transfer only (fee is paid in SOL)
       if (tokenBalance < order.amount) {
-        throw new Error(`Insufficient ${fromSymbol} balance. You have: ${tokenBalance.toFixed(2)}, need: ${order.amount.toFixed(2)} for the transfer.`);
+        throw new Error(`Insufficient ${userFromSymbol} balance. You have: ${tokenBalance.toFixed(2)}, need: ${order.amount.toFixed(2)} for the transfer.`);
       }
 
       // Check SOL balance covers fee + gas
@@ -3673,11 +3819,11 @@ async function executeSendCore(
       const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
       const keypair = Keypair.fromSecretKey(secretKey);
       solanaTxHash = await walletService.sendSplToken(
-        keypair, order.address, fromMint, order.amount, fromToken.decimals,
+        keypair, order.address, pajMint, order.amount, pajToken.decimals,
         feeInstructions.length > 0 ? feeInstructions : undefined,
         order.amount
       );
-      console.log(`[Solana] ${fromSymbol} sent to PAJ (+ fee bundled):`, solanaTxHash);
+      console.log(`[Solana] ${userFromSymbol} sent to PAJ via USDT (+ fee bundled):`, solanaTxHash);
 
       await db.update(transactions)
         .set({ solanaTxHash, pajReference: offRampRef })
@@ -3920,7 +4066,8 @@ bot.action('confirm_send', async (ctx) => {
       `Enter your 4-digit PIN to confirm this transfer:`,
       { parse_mode: 'Markdown' }
     );
-    await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    const waitMsg = await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    getSession(userId).lastBotMessageId = waitMsg.message_id;
     return;
   }
 
@@ -3990,7 +4137,18 @@ async function prepareSendConfirmation(
     const tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, selectedMint);
     const solBalance = await walletService.getSolBalance(user[0].walletAddress);
     const transferUsdt = amountNgn / rate;
-    if (tokenBalance < transferUsdt) {
+    if (selectedMint === SOLANA_TOKENS.AUDD.mint) {
+      // For AUDD, just check they have some — actual swap check happens in executeSendCore
+      if (tokenBalance <= 0) {
+        await ctx.reply(
+          `❌ *No AUDD Balance*\n\n` +
+          `You don't have any AUDD to send.\n\n` +
+          `Add AUDD to your wallet first.`,
+          { parse_mode: 'Markdown', ...mainMenu }
+        );
+        return;
+      }
+    } else if (tokenBalance < transferUsdt) {
       const shortfall = transferUsdt - tokenBalance;
       await ctx.reply(
         `❌ *Insufficient Balance*\n\n` +
@@ -4145,7 +4303,7 @@ async function showReceive(ctx: ZendContext, userId: string) {
   msg += `Choose how you want to get paid:\n\n`;
 
   msg += `*🪙 Crypto*\n`;
-  msg += `Send Dollars (USDT/USDC) or SOL to:\n`;
+  msg += `Send Dollars (USDT/USDC), AUDD or SOL to:\n`;
   msg += `${walletAddress}\n\n`;
 
   if (hasVA) {
@@ -4173,6 +4331,7 @@ async function showReceive(ctx: ZendContext, userId: string) {
   } else {
     kbRows.push([Markup.button.callback('💵 Add Naira', 'add_naira_start')]);
   }
+  kbRows.push([Markup.button.callback('🇦🇺 Add AUDD', 'add_aud_start')]);
   kbRows.push([Markup.button.callback('🌉 Receive from Other Apps', 'bridge_start')]);
 
   await ctx.reply(msg, {
@@ -4208,6 +4367,8 @@ async function showSwapMenu(ctx: ZendContext, userId: string) {
         [Markup.button.callback('SOL → USDT', 'swap:SOL:USDT')],
         [Markup.button.callback('USDC → USDT', 'swap:USDC:USDT')],
         [Markup.button.callback('USDT → SOL', 'swap:USDT:SOL')],
+        [Markup.button.callback('AUDD → USDT', 'swap:AUDD:USDT')],
+        [Markup.button.callback('USDT → AUDD', 'swap:USDT:AUDD')],
         [Markup.button.callback('❌ Cancel', 'cancel_swap')],
       ]),
     }
@@ -4637,7 +4798,8 @@ bot.action('confirm_swap', async (ctx) => {
       `Enter your 4-digit PIN to confirm this swap:`,
       { parse_mode: 'Markdown' }
     );
-    await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    const waitMsg = await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    getSession(userId).lastBotMessageId = waitMsg.message_id;
     return;
   }
 
@@ -4975,7 +5137,8 @@ bot.action('settings_pin', async (ctx) => {
     `Example: 1234`
   );
 
-  await ctx.reply('Waiting for your input...', cancelKeyboard);
+  const waitMsg = await ctx.reply('Waiting for your input...', cancelKeyboard);
+  getSession(userId).lastBotMessageId = waitMsg.message_id;
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -5151,7 +5314,7 @@ bot.catch((err, ctx) => {
 // BALANCE CHANGE DETECTOR — notifies users of direct Solana deposits
 // ═════════════════════════════════════════════════════════════════════════════
 
-const balanceSnapshots = new Map<string, { sol: number; usdt: number; usdc: number }>();
+const balanceSnapshots = new Map<string, { sol: number; usdt: number; usdc: number; audd: number }>();
 
 async function checkBalanceChanges(botInstance: Telegraf<any>) {
   try {
@@ -5163,6 +5326,7 @@ async function checkBalanceChanges(botInstance: Telegraf<any>) {
           sol: balances.find((b: any) => b.symbol === 'SOL')?.amount || 0,
           usdt: balances.find((b: any) => b.symbol === 'USDT')?.amount || 0,
           usdc: balances.find((b: any) => b.symbol === 'USDC')?.amount || 0,
+          audd: balances.find((b: any) => b.symbol === 'AUDD')?.amount || 0,
         };
 
         const prev = balanceSnapshots.get(user.id);
@@ -5195,6 +5359,16 @@ async function checkBalanceChanges(botInstance: Telegraf<any>) {
               `🎉 *Funds Received!*\n\n` +
               `*+${usdcDiff.toFixed(2)} USDC* has arrived in your Zend wallet.\n\n` +
               `New balance: *${current.usdc.toFixed(2)} USDC*`,
+              { parse_mode: 'Markdown' }
+            );
+          }
+          if (current.audd - (prev?.audd || 0) > 0.000001) {
+            const auddDiff = current.audd - (prev?.audd || 0);
+            await botInstance.telegram.sendMessage(
+              user.id,
+              `🎉 *Funds Received!*\n\n` +
+              `*+${auddDiff.toFixed(2)} AUDD* has arrived in your Zend wallet.\n\n` +
+              `New balance: *${current.audd.toFixed(2)} AUDD*`,
               { parse_mode: 'Markdown' }
             );
           }
@@ -5282,9 +5456,55 @@ function startWebhookServer(botInstance: Telegraf<any>) {
                   .where(eq(transactions.pajReference, event.reference));
               }
 
-              // Notify user
+              // Check if this on-ramp should be converted to AUDD (hidden swap)
+              let notified = false;
               try {
                 if (txRows.length > 0) {
+                  const targetToken = (txRows[0].metadata as any)?.targetToken;
+                  if (targetToken === 'AUDD') {
+                    const userId = txRows[0].userId;
+                    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+                    if (user.length > 0 && user[0].walletEncryptedKey) {
+                      const usdtAmount = Number(txRows[0].fromAmount || 0);
+                      if (usdtAmount > 0) {
+                        const swapAmountBase = Math.round(usdtAmount * Math.pow(10, SOLANA_TOKENS.USDT.decimals));
+                        const quote = await getSwapQuote(SOLANA_TOKENS.USDT.mint, SOLANA_TOKENS.AUDD.mint, swapAmountBase, 100);
+                        if (quote) {
+                          const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
+                          if (serializedTx) {
+                            const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
+                            const keypair = Keypair.fromSecretKey(secretKey);
+                            const swapTxHash = await walletService.signAndSendSerialized(keypair, serializedTx);
+                            const outAudd = Number(quote.outAmount) / Math.pow(10, SOLANA_TOKENS.AUDD.decimals);
+                            const swapTxId = generateTxId();
+                            await db.insert(transactions).values({
+                              id: swapTxId, userId, type: 'swap', status: 'completed',
+                              fromMint: SOLANA_TOKENS.USDT.mint, fromAmount: usdtAmount.toString(),
+                              toMint: SOLANA_TOKENS.AUDD.mint, toAmount: outAudd.toString(),
+                              solanaTxHash: swapTxHash,
+                            });
+                            await botInstance.telegram.sendMessage(
+                              userId,
+                              `🎉 *AUDD Deposit Complete!*\n\n` +
+                              `Your Naira bank transfer has been confirmed and AUDD has been credited to your Zend account.\n\n` +
+                              `Received: ~${outAudd.toFixed(2)} AUDD\n` +
+                              `Reference: \`${event.reference}\``,
+                              { parse_mode: 'Markdown' }
+                            );
+                            notified = true;
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              } catch (swapErr) {
+                console.error('[AUDD On-ramp] Hidden swap failed:', swapErr);
+              }
+
+              // Notify user (default USDT notification)
+              try {
+                if (!notified && txRows.length > 0) {
                   const userId = txRows[0].userId;
                   await botInstance.telegram.sendMessage(
                     userId,

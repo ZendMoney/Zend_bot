@@ -54,6 +54,12 @@ export const SOLANA_TOKENS = {
     decimals: 6,
     name: 'USD Coin',
   },
+  AUDD: {
+    mint: 'AUDDttiEpCydTm7joUMbYddm72jAWXZnCpPZtDoxqBSw',
+    symbol: 'AUDD',
+    decimals: 6,
+    name: 'Australian Digital Dollar',
+  },
 } as const;
 
 // Conversation States

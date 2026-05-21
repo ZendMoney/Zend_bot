@@ -63,16 +63,18 @@ export class WalletService {
 
   // Get all token balances for a wallet
   async getAllBalances(walletAddress: string) {
-    const [solBalance, usdtBalance, usdcBalance] = await Promise.all([
+    const [solBalance, usdtBalance, usdcBalance, auddBalance] = await Promise.all([
       this.getSolBalance(walletAddress),
       this.getTokenBalance(walletAddress, SOLANA_TOKENS.USDT.mint),
       this.getTokenBalance(walletAddress, SOLANA_TOKENS.USDC.mint),
+      this.getTokenBalance(walletAddress, SOLANA_TOKENS.AUDD.mint),
     ]);
 
     return [
       { ...SOLANA_TOKENS.SOL, amount: solBalance },
       { ...SOLANA_TOKENS.USDT, amount: usdtBalance },
       { ...SOLANA_TOKENS.USDC, amount: usdcBalance },
+      { ...SOLANA_TOKENS.AUDD, amount: auddBalance },
     ];
   }
 
@@ -258,6 +260,21 @@ export class WalletService {
       SOLANA_TOKENS.USDC.mint,
       amount,
       SOLANA_TOKENS.USDC.decimals
+    );
+  }
+
+  // Send AUDD specifically
+  async sendAudd(
+    userWallet: Keypair,
+    recipientAddress: string,
+    amount: number
+  ): Promise<string> {
+    return this.sendSplToken(
+      userWallet,
+      recipientAddress,
+      SOLANA_TOKENS.AUDD.mint,
+      amount,
+      SOLANA_TOKENS.AUDD.decimals
     );
   }
 
