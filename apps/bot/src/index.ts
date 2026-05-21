@@ -228,7 +228,6 @@ const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_K
 const MIN_SOL_FOR_GAS = 0.0005; // base tx fee buffer
 const ATA_RENT_SOL = 0.002039; // rent to create an Associated Token Account
 const GAS_SPONSORSHIP_FEE_BPS = 50; // 0.5% extra for gasless users
-const AUDD_USDT_RATE = parseFloat(process.env.AUDD_USDT_RATE || '0.65'); // 1 AUDD = X USDT (admin-set)
 
 /** Calculate exact SOL a user needs for a send (fees + optional ATA rent). */
 function calcRequiredSol(feeSol: number, needsAta: boolean): number {
@@ -411,6 +410,27 @@ async function getSolPriceInUsdt(): Promise<number> {
     return price;
   } catch {
     return _solPriceCache?.price || 140;
+  }
+}
+
+// ─── AUDD Price (CoinGecko) ───
+let _auddPriceCache: { price: number; time: number } | null = null;
+
+async function getAuddPriceInUsdt(): Promise<number> {
+  if (_auddPriceCache && Date.now() - _auddPriceCache.time < 120000) {
+    return _auddPriceCache.price;
+  }
+  try {
+    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=novatti-australian-digital-dollar&vs_currencies=usd');
+    const data = await res.json();
+    const price = (data as any)?.['novatti-australian-digital-dollar']?.usd || 0;
+    if (price > 0) {
+      _auddPriceCache = { price, time: Date.now() };
+      return price;
+    }
+    throw new Error('Invalid price');
+  } catch {
+    return _auddPriceCache?.price || parseFloat(process.env.AUDD_USDT_RATE || '0.65');
   }
 }
 
@@ -3783,9 +3803,10 @@ async function executeSendCore(
           throw new Error('No AUDD balance. Please deposit AUDD first.');
         }
         const usdtNeeded = order.amount;
-        const auddNeeded = usdtNeeded / AUDD_USDT_RATE;
+        const auddRate = await getAuddPriceInUsdt();
+        const auddNeeded = usdtNeeded / auddRate;
         if (auddBalance < auddNeeded) {
-          throw new Error(`Not enough AUDD. You have ${auddBalance.toFixed(2)} AUDD but need ${auddNeeded.toFixed(2)} AUDD (rate: 1 AUDD = ${AUDD_USDT_RATE} USDT).`);
+          throw new Error(`Not enough AUDD. You have ${auddBalance.toFixed(2)} AUDD but need ${auddNeeded.toFixed(2)} AUDD (rate: 1 AUDD = ${auddRate.toFixed(4)} USDT).`);
         }
         if (!DEV_WALLET_SECRET) {
           throw new Error('AUDD swap not available: dev wallet not configured.');
@@ -5551,7 +5572,8 @@ function startWebhookServer(botInstance: Telegraf<any>) {
                     if (user.length > 0 && user[0].walletEncryptedKey) {
                       const usdtAmount = Number(txRows[0].fromAmount || 0);
                       if (usdtAmount > 0) {
-                        const auddOut = usdtAmount / AUDD_USDT_RATE;
+                        const auddRate = await getAuddPriceInUsdt();
+                        const auddOut = usdtAmount / auddRate;
                         if (DEV_WALLET_SECRET) {
                           const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
                           const devAuddBalance = await walletService.getTokenBalance(devKeypair.publicKey.toBase58(), SOLANA_TOKENS.AUDD.mint);
