@@ -225,27 +225,57 @@ const ZEND_TREASURY_WALLET = process.env.ZEND_TREASURY_WALLET || ''; // receives
 // Dev wallet for gas sponsorship (supports ZEND_DEV_WALLET_SECRET or PV_KEY)
 const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_KEY || '';
 
-const MIN_SOL_FOR_GAS = 0.003; // covers ATA creation rent (~0.002039) + tx fees + buffer
+const MIN_SOL_FOR_GAS = 0.0005; // base tx fee buffer
+const ATA_RENT_SOL = 0.002039; // rent to create an Associated Token Account
 const GAS_SPONSORSHIP_FEE_BPS = 50; // 0.5% extra for gasless users
 
-/** Fund SOL from dev wallet if user has insufficient balance. Returns true if funded. */
-async function fundSolIfNeeded(walletAddress: string): Promise<boolean> {
-  const hasGas = await walletService.hasEnoughSolForGas(walletAddress, MIN_SOL_FOR_GAS);
-  if (hasGas) return false;
+/** Calculate exact SOL a user needs for a send (fees + optional ATA rent). */
+function calcRequiredSol(feeSol: number, needsAta: boolean): number {
+  return feeSol + MIN_SOL_FOR_GAS + (needsAta ? ATA_RENT_SOL : 0);
+}
+
+/**
+ * Smart gas funding — tops up the user with exactly the shortfall.
+ * If recipient needs an ATA, includes ATA rent in the calculation.
+ * Returns { funded: boolean; gasSponsored: boolean; shortfall?: number }
+ */
+async function fundSolIfNeeded(
+  walletAddress: string,
+  feeSol: number,
+  recipientAddress?: string,
+  mintAddress?: string
+): Promise<{ funded: boolean; gasSponsored: boolean; shortfall?: number }> {
+  let needsAta = false;
+  if (recipientAddress && mintAddress) {
+    try {
+      needsAta = !(await walletService.ataExists(recipientAddress, mintAddress));
+    } catch {
+      needsAta = true; // assume worst case
+    }
+  }
+
+  const required = calcRequiredSol(feeSol, needsAta);
+  const balance = await walletService.getSolBalance(walletAddress);
+
+  if (balance >= required) {
+    return { funded: false, gasSponsored: false };
+  }
+
+  const shortfall = required - balance;
 
   if (!DEV_WALLET_SECRET) {
-    console.warn('[Gas] No dev wallet secret set (ZEND_DEV_WALLET_SECRET or PV_KEY) — cannot fund SOL');
-    return false;
+    console.warn('[Gas] No dev wallet secret set — cannot fund SOL');
+    return { funded: false, gasSponsored: false, shortfall };
   }
 
   try {
     const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
-    await walletService.sendSol(devKeypair, walletAddress, MIN_SOL_FOR_GAS);
-    console.log('[Gas] Funded', MIN_SOL_FOR_GAS, 'SOL from dev wallet to', walletAddress);
-    return true;
+    await walletService.sendSol(devKeypair, walletAddress, shortfall);
+    console.log('[Gas] Funded exact shortfall:', shortfall.toFixed(6), 'SOL (needsAta:', needsAta, ') to', walletAddress);
+    return { funded: true, gasSponsored: true, shortfall };
   } catch (err: any) {
     console.error('[Gas] Failed to fund SOL:', err.message);
-    return false;
+    return { funded: false, gasSponsored: false, shortfall };
   }
 }
 
@@ -3771,16 +3801,21 @@ async function executeSendCore(
         }
       }
 
-      // Gas sponsorship: fund SOL if user has none
-      const gasSponsored = await fundSolIfNeeded(user[0].walletAddress);
-      if (!gasSponsored) {
-        const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, MIN_SOL_FOR_GAS);
-        if (!hasGas) {
-          throw new Error(`You need a small network fee to send. We can cover it for you (+0.5% extra).`);
-        }
+      // Gas sponsorship: top up exact shortfall (including ATA rent if needed)
+      const { funded, gasSponsored, shortfall } = await fundSolIfNeeded(
+        user[0].walletAddress,
+        txData.feeSol || 0,
+        order.address,
+        pajMint
+      );
+      if (shortfall && !funded) {
+        throw new Error(
+          `Insufficient SOL for network fee. You need ~${shortfall.toFixed(6)} more SOL. ` +
+          `We can cover it for you (+0.5% extra).`
+        );
       }
 
-      // Calculate total fee in SOL (Zend fee + gas sponsorship if applicable)
+      // Calculate total fee in SOL (Zend fee + gas sponsorship fee if dev funded)
       const feeWallet = process.env.ZEND_FEE_WALLET;
       let totalFeeSol = txData.feeSol || 0;
       if (gasSponsored) {
@@ -3790,15 +3825,9 @@ async function executeSendCore(
         console.log('[Gas] Sponsorship fee added:', sponsorshipFeeSol.toFixed(6), 'SOL. Total fee:', totalFeeSol.toFixed(6), 'SOL');
       }
 
-      // Check USDT balance covers transfer only (fee is paid in SOL)
+      // Check token balance covers transfer
       if (tokenBalance < order.amount) {
         throw new Error(`Insufficient ${userFromSymbol} balance. You have: ${tokenBalance.toFixed(2)}, need: ${order.amount.toFixed(2)} for the transfer.`);
-      }
-
-      // Check SOL balance covers fee + gas
-      const solBalance = await walletService.getSolBalance(user[0].walletAddress);
-      if (solBalance < totalFeeSol + MIN_SOL_FOR_GAS) {
-        throw new Error(`Insufficient SOL for fee. You have: ${solBalance.toFixed(6)} SOL, need: ${(totalFeeSol + MIN_SOL_FOR_GAS).toFixed(6)} SOL (includes ${totalFeeSol.toFixed(6)} fee + ${MIN_SOL_FOR_GAS} gas).`);
       }
 
       // Build SOL fee transfer instruction to bundle with main send
@@ -3961,14 +3990,12 @@ async function executeSwap(
     }
 
     // Gas sponsorship for swaps
-    const gasSponsored = await fundSolIfNeeded(user[0].walletAddress);
-    if (!gasSponsored) {
-      const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, MIN_SOL_FOR_GAS);
-      if (!hasGas) {
-        throw new Error(
-          `You need a small network fee to convert. We can cover it for you (+0.5% extra).`
-        );
-      }
+    const { funded, gasSponsored, shortfall } = await fundSolIfNeeded(user[0].walletAddress, 0);
+    if (shortfall && !funded) {
+      throw new Error(
+        `Insufficient SOL for swap fee. You need ~${shortfall.toFixed(6)} more SOL. ` +
+        `We can cover it for you (+0.5% extra).`
+      );
     }
 
     // Build swap transaction

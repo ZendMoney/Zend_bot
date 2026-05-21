@@ -325,5 +325,16 @@ export class WalletService {
     return balance >= minSol;
   }
 
-
+  // Check if an ATA already exists for a given wallet + mint
+  async ataExists(walletAddress: string, mintAddress: string): Promise<boolean> {
+    const walletPubkey = new PublicKey(walletAddress);
+    const mintPubkey = new PublicKey(mintAddress);
+    const ata = await getAssociatedTokenAddress(mintPubkey, walletPubkey);
+    try {
+      const info = await this.connection.getAccountInfo(ata);
+      return info !== null;
+    } catch {
+      return false;
+    }
+  }
 }
