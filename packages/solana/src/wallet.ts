@@ -298,65 +298,56 @@ export class WalletService {
     outputRecipientAddress?: string
   ): Promise<string> {
     const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
-
-    const fromMintPubkey = new PublicKey(fromMint);
-    const toMintPubkey = new PublicKey(toMint);
     const recipientPubkey = new PublicKey(outputRecipientAddress || userWallet.publicKey.toBase58());
 
-    // --- Leg 1: user → dev (fromMint) ---
-    const userFromTokenAccount = await getAssociatedTokenAddress(fromMintPubkey, userWallet.publicKey);
-    const devFromTokenAccount = await getAssociatedTokenAddress(fromMintPubkey, devWallet.publicKey);
-    const rawFromAmount = BigInt(Math.round(fromAmount * Math.pow(10, fromDecimals)));
-
-    // --- Leg 2: dev → recipient (toMint) ---
-    const devToTokenAccount = await getAssociatedTokenAddress(toMintPubkey, devWallet.publicKey);
-    const recipientToTokenAccount = await getAssociatedTokenAddress(toMintPubkey, recipientPubkey);
-    const rawToAmount = BigInt(Math.round(toAmount * Math.pow(10, toDecimals)));
+    const fromIsSol = fromMint === SOLANA_TOKENS.SOL.mint;
+    const toIsSol = toMint === SOLANA_TOKENS.SOL.mint;
 
     const instructions: TransactionInstruction[] = [];
 
-    // Ensure dev's output ATA exists (dev pays rent)
-    instructions.push(
-      createAssociatedTokenAccountIdempotentInstruction(
-        devWallet.publicKey,
-        devToTokenAccount,
-        devWallet.publicKey,
-        toMintPubkey
-      )
-    );
+    // --- Leg 1: user → dev (fromMint) ---
+    if (fromIsSol) {
+      const lamports = Math.round(fromAmount * LAMPORTS_PER_SOL);
+      instructions.push(
+        SystemProgram.transfer({ fromPubkey: userWallet.publicKey, toPubkey: devWallet.publicKey, lamports })
+      );
+    } else {
+      const fromMintPubkey = new PublicKey(fromMint);
+      const userFromTokenAccount = await getAssociatedTokenAddress(fromMintPubkey, userWallet.publicKey);
+      const devFromTokenAccount = await getAssociatedTokenAddress(fromMintPubkey, devWallet.publicKey);
+      const rawFromAmount = BigInt(Math.round(fromAmount * Math.pow(10, fromDecimals)));
+      instructions.push(
+        createAssociatedTokenAccountIdempotentInstruction(devWallet.publicKey, devFromTokenAccount, devWallet.publicKey, fromMintPubkey)
+      );
+      instructions.push(
+        createTransferInstruction(userFromTokenAccount, devFromTokenAccount, userWallet.publicKey, rawFromAmount)
+      );
+    }
 
-    // Ensure recipient's output ATA exists (dev pays rent)
-    instructions.push(
-      createAssociatedTokenAccountIdempotentInstruction(
-        devWallet.publicKey,
-        recipientToTokenAccount,
-        recipientPubkey,
-        toMintPubkey
-      )
-    );
-
-    // Transfer from user → dev
-    instructions.push(
-      createTransferInstruction(
-        userFromTokenAccount,
-        devFromTokenAccount,
-        userWallet.publicKey,
-        rawFromAmount
-      )
-    );
-
-    // Transfer from dev → recipient
-    instructions.push(
-      createTransferInstruction(
-        devToTokenAccount,
-        recipientToTokenAccount,
-        devWallet.publicKey,
-        rawToAmount
-      )
-    );
+    // --- Leg 2: dev → recipient (toMint) ---
+    if (toIsSol) {
+      const lamports = Math.round(toAmount * LAMPORTS_PER_SOL);
+      instructions.push(
+        SystemProgram.transfer({ fromPubkey: devWallet.publicKey, toPubkey: recipientPubkey, lamports })
+      );
+    } else {
+      const toMintPubkey = new PublicKey(toMint);
+      const devToTokenAccount = await getAssociatedTokenAddress(toMintPubkey, devWallet.publicKey);
+      const recipientToTokenAccount = await getAssociatedTokenAddress(toMintPubkey, recipientPubkey);
+      const rawToAmount = BigInt(Math.round(toAmount * Math.pow(10, toDecimals)));
+      instructions.push(
+        createAssociatedTokenAccountIdempotentInstruction(devWallet.publicKey, devToTokenAccount, devWallet.publicKey, toMintPubkey)
+      );
+      instructions.push(
+        createAssociatedTokenAccountIdempotentInstruction(devWallet.publicKey, recipientToTokenAccount, recipientPubkey, toMintPubkey)
+      );
+      instructions.push(
+        createTransferInstruction(devToTokenAccount, recipientToTokenAccount, devWallet.publicKey, rawToAmount)
+      );
+    }
 
     const messageV0 = new TransactionMessage({
-      payerKey: userWallet.publicKey, // user pays SOL gas
+      payerKey: userWallet.publicKey,
       recentBlockhash: blockhash,
       instructions,
     }).compileToV0Message();
@@ -364,16 +355,8 @@ export class WalletService {
     const transaction = new VersionedTransaction(messageV0);
     transaction.sign([userWallet, devWallet]);
 
-    const signature = await this.connection.sendTransaction(transaction, {
-      maxRetries: 3,
-      skipPreflight: false,
-    });
-
-    await this.connection.confirmTransaction(
-      { signature, blockhash, lastValidBlockHeight },
-      'confirmed'
-    );
-
+    const signature = await this.connection.sendTransaction(transaction, { maxRetries: 3, skipPreflight: false });
+    await this.connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed');
     return signature;
   }
 

@@ -76,6 +76,7 @@ interface ZendSession {
     swapOutAmount?: number;
     swapMinOut?: number;
     swapPriceImpact?: number;
+    isLocalSwap?: boolean;
   }>;
   pinVerifyAction?: 'send' | 'swap' | 'export' | 'schedule';
   pajContact?: string; // email/phone pending OTP
@@ -1054,10 +1055,11 @@ async function getCachedProducts(country: string, category?: string): Promise<an
   if (cached && Date.now() - cached.fetchedAt < BITREFILL_CACHE_TTL) {
     return cached.products;
   }
-  if (!bitrefillClient) return [];
+  const client = bitrefillClient || bitrefillBusinessClient;
+  if (!client) return [];
   try {
-    const res = await bitrefillClient.getProducts({ country, category, limit: 50 });
-    const products = res.data || [];
+    const res = await client.getProducts({ country, category, limit: 50 });
+    const products = Array.isArray(res) ? res : (res.data || []);
     bitrefillProductCache.set(key, { products, fetchedAt: Date.now() });
     return products;
   } catch (err) {
@@ -1076,7 +1078,7 @@ bot.hears('🎁 Shop', async (ctx) => {
 });
 
 async function showShop(ctx: ZendContext) {
-  if (!bitrefillClient) {
+  if (!bitrefillClient && !bitrefillBusinessClient) {
     await ctx.reply(
       '🎁 *Shop*\n\n' +
       'Shopping is temporarily unavailable. Please try again later.',
@@ -1172,10 +1174,11 @@ bot.action(/shop_product:(.+)/, async (ctx) => {
 
   await ctx.answerCbQuery('Loading...');
 
-  if (!bitrefillClient) return;
+  const client = bitrefillClient || bitrefillBusinessClient;
+  if (!client) return;
 
   try {
-    const product = await bitrefillClient.getProduct(productId);
+    const product = await client.getProduct(productId);
     const session = getSession(userId);
     session.shopData = {
       productId: product.id,
@@ -1605,7 +1608,8 @@ async function createBitRefillInvoice(ctx: ZendContext, userId: string) {
   const session = getSession(userId);
   const sd = session.shopData!;
 
-  if (!bitrefillClient) {
+  const client = bitrefillClient || bitrefillBusinessClient;
+  if (!client) {
     await ctx.reply('❌ Shop is not configured. Please try again later.', mainMenu);
     return;
   }
@@ -1638,7 +1642,7 @@ async function createBitRefillInvoice(ctx: ZendContext, userId: string) {
     const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || '';
     const webhookUrl = webhookBaseUrl ? `${webhookBaseUrl.replace(/\/$/, '')}/webhooks/bitrefill` : undefined;
 
-    const invoice = await bitrefillClient.createInvoice({
+    const invoice = await client.createInvoice({
       products,
       payment_method: 'bitcoin',
       refund_address: user[0]?.walletAddress,
@@ -4073,31 +4077,69 @@ async function executeSwap(
       );
     }
 
-    // Build swap transaction
-    const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
-    if (!serializedTx) {
-      throw new Error('Failed to build swap transaction');
-    }
-
-    // Sign and send
+    let txHash: string;
     const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
     const keypair = Keypair.fromSecretKey(secretKey);
 
-    await ctx.replyWithChatAction('typing');
-    const txHash = await walletService.signAndSendSerialized(keypair, serializedTx);
-    console.log('[Jupiter] Swap executed:', txHash);
+    // ─── Local swap (AUDD pairs via dev wallet) ───
+    if ((pt as any).isLocalSwap) {
+      if (!DEV_WALLET_SECRET) throw new Error('Dev wallet not configured for local swap.');
+      const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+      const fromDecimals = getTokenBySymbol(fromSymbol)!.decimals;
+      const toDecimals = getTokenBySymbol(toSymbol)!.decimals;
+      const fromAmount = Number(quote.inAmount) / Math.pow(10, fromDecimals);
 
-    // Collect gas sponsorship fee for swaps (0.5% of output value, paid in SOL)
-    if (gasSponsored) {
-      const feeWallet = process.env.ZEND_FEE_WALLET;
-      if (feeWallet) {
-        try {
-          const solPrice = await getSolPriceInUsdt();
-          const sponsorshipFeeSol = (outAmount * (GAS_SPONSORSHIP_FEE_BPS / 10000)) / solPrice;
-          await walletService.sendSol(keypair, feeWallet, sponsorshipFeeSol);
-          console.log('[Gas] Swap sponsorship fee collected:', sponsorshipFeeSol.toFixed(6), 'SOL');
-        } catch (feeErr: any) {
-          console.error('[Gas] Swap fee collection failed (non-critical):', feeErr.message);
+      await ctx.replyWithChatAction('typing');
+      txHash = await walletService.executeLocalSwap(
+        keypair,
+        devKeypair,
+        pt.fromMint!,
+        pt.toMint!,
+        fromAmount,
+        outAmount,
+        fromDecimals,
+        toDecimals,
+        user[0].walletAddress
+      );
+      console.log('[LocalSwap] Executed:', txHash);
+
+      // Collect gas sponsorship fee for local swaps (0.5% of output value, paid in SOL)
+      if (gasSponsored) {
+        const feeWallet = process.env.ZEND_FEE_WALLET;
+        if (feeWallet) {
+          try {
+            const solPrice = await getSolPriceInUsdt();
+            const sponsorshipFeeSol = (outAmount * (GAS_SPONSORSHIP_FEE_BPS / 10000)) / solPrice;
+            await walletService.sendSol(keypair, feeWallet, sponsorshipFeeSol);
+            console.log('[Gas] Local swap sponsorship fee collected:', sponsorshipFeeSol.toFixed(6), 'SOL');
+          } catch (feeErr: any) {
+            console.error('[Gas] Local swap fee collection failed (non-critical):', feeErr.message);
+          }
+        }
+      }
+    } else {
+      // ─── Jupiter swap (non-AUDD pairs) ───
+      const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
+      if (!serializedTx) {
+        throw new Error('Failed to build swap transaction');
+      }
+
+      await ctx.replyWithChatAction('typing');
+      txHash = await walletService.signAndSendSerialized(keypair, serializedTx);
+      console.log('[Jupiter] Swap executed:', txHash);
+
+      // Collect gas sponsorship fee for swaps (0.5% of output value, paid in SOL)
+      if (gasSponsored) {
+        const feeWallet = process.env.ZEND_FEE_WALLET;
+        if (feeWallet) {
+          try {
+            const solPrice = await getSolPriceInUsdt();
+            const sponsorshipFeeSol = (outAmount * (GAS_SPONSORSHIP_FEE_BPS / 10000)) / solPrice;
+            await walletService.sendSol(keypair, feeWallet, sponsorshipFeeSol);
+            console.log('[Gas] Swap sponsorship fee collected:', sponsorshipFeeSol.toFixed(6), 'SOL');
+          } catch (feeErr: any) {
+            console.error('[Gas] Swap fee collection failed (non-critical):', feeErr.message);
+          }
         }
       }
     }
@@ -4469,6 +4511,10 @@ async function showSwapMenu(ctx: ZendContext, userId: string) {
         [Markup.button.callback('SOL → USDT', 'swap:SOL:USDT')],
         [Markup.button.callback('USDC → USDT', 'swap:USDC:USDT')],
         [Markup.button.callback('USDT → SOL', 'swap:USDT:SOL')],
+        [Markup.button.callback('SOL → AUDD', 'swap:SOL:AUDD')],
+        [Markup.button.callback('AUDD → SOL', 'swap:AUDD:SOL')],
+        [Markup.button.callback('USDT → AUDD', 'swap:USDT:AUDD')],
+        [Markup.button.callback('AUDD → USDT', 'swap:AUDD:USDT')],
         [Markup.button.callback('❌ Cancel', 'cancel_swap')],
       ]),
     }
@@ -4821,9 +4867,106 @@ async function handleSwapAmount(ctx: ZendContext, userId: string, text: string) 
     return;
   }
 
-  // Convert to base units
+  const fromToken = getTokenBySymbol(pt.fromSymbol as string)!;
+  const toToken = getTokenBySymbol(pt.toSymbol as string)!;
   const amountBase = Math.round(amount * Math.pow(10, pt.fromDecimals as number));
 
+  // ─── Local swap via dev wallet (AUDD pairs) ───
+  const isAuddPair = pt.fromMint === SOLANA_TOKENS.AUDD.mint || pt.toMint === SOLANA_TOKENS.AUDD.mint;
+  if (isAuddPair) {
+    await ctx.replyWithChatAction('typing');
+    try {
+      const solPrice = await getSolPriceInUsdt();
+      const auddPrice = await getAuddPriceInUsdt();
+
+      let outAmount = 0;
+      if (pt.fromMint === SOLANA_TOKENS.SOL.mint && pt.toMint === SOLANA_TOKENS.AUDD.mint) {
+        outAmount = amount * solPrice / auddPrice;
+      } else if (pt.fromMint === SOLANA_TOKENS.AUDD.mint && pt.toMint === SOLANA_TOKENS.SOL.mint) {
+        outAmount = amount * auddPrice / solPrice;
+      } else if (pt.fromMint === SOLANA_TOKENS.USDT.mint && pt.toMint === SOLANA_TOKENS.AUDD.mint) {
+        outAmount = amount / auddPrice;
+      } else if (pt.fromMint === SOLANA_TOKENS.AUDD.mint && pt.toMint === SOLANA_TOKENS.USDT.mint) {
+        outAmount = amount * auddPrice;
+      } else if (pt.fromMint === SOLANA_TOKENS.USDC.mint && pt.toMint === SOLANA_TOKENS.AUDD.mint) {
+        outAmount = amount / auddPrice;
+      } else if (pt.fromMint === SOLANA_TOKENS.AUDD.mint && pt.toMint === SOLANA_TOKENS.USDC.mint) {
+        outAmount = amount * auddPrice;
+      }
+
+      if (!DEV_WALLET_SECRET) {
+        await ctx.reply('❌ AUDD swap not available: dev wallet not configured.', mainMenu);
+        setSession(userId, { state: ConversationState.IDLE });
+        return;
+      }
+      const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+
+      // Check dev wallet has enough output token
+      if (pt.toMint === SOLANA_TOKENS.AUDD.mint) {
+        const devBal = await walletService.getTokenBalance(devKeypair.publicKey.toBase58(), SOLANA_TOKENS.AUDD.mint);
+        if (devBal < outAmount) {
+          await ctx.reply(`❌ AUDD liquidity is low. Only ${devBal.toFixed(2)} AUDD available in pool.`, mainMenu);
+          setSession(userId, { state: ConversationState.IDLE });
+          return;
+        }
+      } else if (pt.toMint === SOLANA_TOKENS.USDT.mint) {
+        const devBal = await walletService.getTokenBalance(devKeypair.publicKey.toBase58(), SOLANA_TOKENS.USDT.mint);
+        if (devBal < outAmount) {
+          await ctx.reply(`❌ USDT liquidity is low. Only ${devBal.toFixed(2)} USDT available in pool.`, mainMenu);
+          setSession(userId, { state: ConversationState.IDLE });
+          return;
+        }
+      } else if (pt.toMint === SOLANA_TOKENS.USDC.mint) {
+        const devBal = await walletService.getTokenBalance(devKeypair.publicKey.toBase58(), SOLANA_TOKENS.USDC.mint);
+        if (devBal < outAmount) {
+          await ctx.reply(`❌ USDC liquidity is low. Only ${devBal.toFixed(2)} USDC available in pool.`, mainMenu);
+          setSession(userId, { state: ConversationState.IDLE });
+          return;
+        }
+      } else if (pt.toMint === SOLANA_TOKENS.SOL.mint) {
+        const devBal = await walletService.getSolBalance(devKeypair.publicKey.toBase58());
+        if (devBal < outAmount) {
+          await ctx.reply(`❌ SOL liquidity is low. Only ${devBal.toFixed(4)} SOL available in pool.`, mainMenu);
+          setSession(userId, { state: ConversationState.IDLE });
+          return;
+        }
+      }
+
+      const outAmountBase = Math.round(outAmount * Math.pow(10, toToken.decimals));
+      session.pendingTransaction = {
+        ...pt,
+        swapAmountBase: amountBase,
+        swapQuote: { outAmount: String(outAmountBase), inAmount: String(amountBase), otherAmountThreshold: String(outAmountBase), priceImpactPct: '0' },
+        swapOutAmount: outAmount,
+        swapMinOut: outAmount,
+        swapPriceImpact: 0,
+        isLocalSwap: true,
+      };
+      session.state = ConversationState.AWAITING_CONFIRMATION;
+      setSession(userId, session);
+
+      let msg = `🔄 *Exchange Rate (Local Swap)*\n\n`;
+      msg += `${amount.toFixed(fromToken.decimals === 9 ? 4 : 2)} ${fromToken.symbol} → ${outAmount.toFixed(toToken.decimals === 9 ? 4 : 2)} ${toToken.symbol}\n`;
+      msg += `Rate: 1 ${fromToken.symbol} ≈ ${(outAmount / amount).toFixed(6)} ${toToken.symbol}\n`;
+      msg += `Price impact: 0%\n\n`;
+      msg += `Confirm?`;
+
+      await ctx.reply(msg, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('✅ Confirm Swap', 'confirm_swap')],
+          [Markup.button.callback('❌ Cancel', 'cancel_swap')],
+        ]),
+      });
+      return;
+    } catch (err: any) {
+      await ctx.reply(`❌ Could not calculate local swap rate: ${err.message}`, mainMenu);
+      setSession(userId, { state: ConversationState.IDLE });
+      return;
+    }
+  }
+
+  // ─── Jupiter swap (non-AUDD pairs) ───
   await ctx.replyWithChatAction('typing');
   const quote = await getSwapQuote(pt.fromMint, pt.toMint, amountBase, 50);
 
@@ -4832,9 +4975,6 @@ async function handleSwapAmount(ctx: ZendContext, userId: string, text: string) 
     setSession(userId, { state: ConversationState.IDLE });
     return;
   }
-
-  const fromToken = getTokenBySymbol(pt.fromSymbol as string)!;
-  const toToken = getTokenBySymbol(pt.toSymbol as string)!;
 
   const outAmount = Number(quote.outAmount) / Math.pow(10, toToken.decimals);
   const minOut = Number(quote.otherAmountThreshold) / Math.pow(10, toToken.decimals);
