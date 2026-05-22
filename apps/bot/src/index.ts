@@ -1192,8 +1192,10 @@ bot.action(/shop_product:(.+)/, async (ctx) => {
     if (product.packages && product.packages.length > 0) {
       // Fixed packages
       for (const pkg of product.packages.slice(0, 8)) {
+        const pkgCurrency = pkg.currency || product.currency || '';
+        const priceSymbol = pkg.price_currency === 'USD' ? '$' : (pkg.price_currency === 'NGN' ? '₦' : (pkg.price_currency || '$') + ' ');
         buttons.push([Markup.button.callback(
-          `${pkg.value} ${pkg.currency} — ~$${pkg.price}`,
+          `${pkg.value.toLocaleString()} ${pkgCurrency} — ~${priceSymbol}${pkg.price.toLocaleString()}`,
           `shop_pkg:${pkg.package_id}`
         )]);
       }
@@ -1387,11 +1389,26 @@ async function showShopConfirm(ctx: ZendContext, userId: string) {
     // Calculate BitRefill price in USD
     let bitrefillPriceUsd = 0;
     if (pkg) {
-      bitrefillPriceUsd = pkg.price;
+      if (pkg.price_currency === 'NGN') {
+        // Convert NGN price to USD using live PAJ rate
+        let ngnRate = 1550;
+        try {
+          const rates = await getPAJRates();
+          ngnRate = rates.offRampRate;
+        } catch { /* use fallback */ }
+        bitrefillPriceUsd = pkg.price / ngnRate;
+      } else {
+        bitrefillPriceUsd = pkg.price;
+      }
     } else if (product?.range && sd.amount) {
       // Estimate: use amount as proxy for USD (NGN is ~1600:1, but BitRefill might price differently)
       // For variable products, we'll need to create an invoice to get exact price
-      bitrefillPriceUsd = sd.amount / 1600; // rough estimate for display
+      let ngnRate = 1600;
+      try {
+        const rates = await getPAJRates();
+        ngnRate = rates.offRampRate;
+      } catch { /* use fallback */ }
+      bitrefillPriceUsd = sd.amount / ngnRate;
     }
 
     // Add Zend margin
@@ -3878,10 +3895,15 @@ async function executeSendCore(
         }
       }
 
+      // Pre-calculate potential sponsorship fee so fundSolIfNeeded reserves enough SOL
+      const solPrice = await getSolPriceInUsdt();
+      const potentialSponsorshipFeeSol = (txData.amountUsdt * (GAS_SPONSORSHIP_FEE_BPS / 10000)) / solPrice;
+      const maxFeeSol = (txData.feeSol || 0) + potentialSponsorshipFeeSol;
+
       // Gas sponsorship: top up exact shortfall (including ATA rent if needed)
       const { funded, gasSponsored, shortfall, error: fundError } = await fundSolIfNeeded(
         user[0].walletAddress,
-        txData.feeSol || 0,
+        maxFeeSol,
         order.address,
         pajMint
       );
@@ -3897,10 +3919,8 @@ async function executeSendCore(
       const feeWallet = process.env.ZEND_FEE_WALLET;
       let totalFeeSol = txData.feeSol || 0;
       if (gasSponsored) {
-        const solPrice = await getSolPriceInUsdt();
-        const sponsorshipFeeSol = (txData.amountUsdt * (GAS_SPONSORSHIP_FEE_BPS / 10000)) / solPrice;
-        totalFeeSol += sponsorshipFeeSol;
-        console.log('[Gas] Sponsorship fee added:', sponsorshipFeeSol.toFixed(6), 'SOL. Total fee:', totalFeeSol.toFixed(6), 'SOL');
+        totalFeeSol += potentialSponsorshipFeeSol;
+        console.log('[Gas] Sponsorship fee added:', potentialSponsorshipFeeSol.toFixed(6), 'SOL. Total fee:', totalFeeSol.toFixed(6), 'SOL');
       }
 
       // Check token balance covers transfer
