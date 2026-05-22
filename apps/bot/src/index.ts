@@ -1193,7 +1193,8 @@ bot.action(/shop_product:(.+)/, async (ctx) => {
       // Fixed packages
       for (const pkg of product.packages.slice(0, 8)) {
         const pkgCurrency = pkg.currency || product.currency || '';
-        const priceSymbol = pkg.price_currency === 'USD' ? '$' : (pkg.price_currency === 'NGN' ? '₦' : (pkg.price_currency || '$') + ' ');
+        const isNgn = product.currency === 'NGN' || pkg.currency === 'NGN' || pkg.price_currency === 'NGN';
+        const priceSymbol = isNgn ? '₦' : (pkg.price_currency === 'USD' ? '$' : (pkg.price_currency || '$') + ' ');
         buttons.push([Markup.button.callback(
           `${pkg.value.toLocaleString()} ${pkgCurrency} — ~${priceSymbol}${pkg.price.toLocaleString()}`,
           `shop_pkg:${pkg.package_id}`
@@ -1389,7 +1390,8 @@ async function showShopConfirm(ctx: ZendContext, userId: string) {
     // Calculate BitRefill price in USD
     let bitrefillPriceUsd = 0;
     if (pkg) {
-      if (pkg.price_currency === 'NGN') {
+      const isNgnPrice = pkg.price_currency === 'NGN' || product.currency === 'NGN';
+      if (isNgnPrice) {
         // Convert NGN price to USD using live PAJ rate
         let ngnRate = 1550;
         try {
