@@ -1060,6 +1060,7 @@ async function getCachedProducts(country: string, category?: string): Promise<an
   try {
     const res = await client.getProducts({ country, category, limit: 50 });
     const products = Array.isArray(res) ? res : (res.data || []);
+    console.log('[BitRefill] Fetched', products.length, 'products for', country, '- names:', products.map((p: any) => p.name).join(', '));
     bitrefillProductCache.set(key, { products, fetchedAt: Date.now() });
     return products;
   } catch (err) {
@@ -1097,6 +1098,7 @@ async function showShop(ctx: ZendContext) {
         [Markup.button.callback('📶 Data Bundles', 'shop_cat:data')],
         [Markup.button.callback('🌍 Gift Cards', 'shop_cat:gift-card')],
         [Markup.button.callback('🌐 eSIM', 'shop_cat:esim')],
+        [Markup.button.callback('📋 All Products', 'shop_cat:all')],
         [Markup.button.callback('📦 My Orders', 'shop_orders')],
       ]),
     }
@@ -1114,34 +1116,32 @@ bot.action(/shop_cat:(.+)/, async (ctx) => {
   const products = await getCachedProducts('NG');
   let filtered = products.filter((p: any) => p.in_stock !== false);
 
-  if (category === 'data') {
-    filtered = filtered.filter((p: any) =>
-      p.name.toLowerCase().includes('data') ||
-      p.name.toLowerCase().includes('bundle') ||
-      p.name.toLowerCase().includes('internet')
-    );
+  const DATA_KEYWORDS = ['data', 'bundle', 'internet', 'sme', 'social', 'night', 'weekly', 'monthly', 'daily', 'subscription', 'pack'];
+  const CARRIER_NAMES = ['airtel', 'mtn', 'glo', '9mobile'];
+  const isDataProduct = (p: any) =>
+    p.type === 'bundle' ||
+    p.type === 'data_bundle' ||
+    DATA_KEYWORDS.some(k => p.name.toLowerCase().includes(k));
+  const isCarrierProduct = (p: any) =>
+    CARRIER_NAMES.some(c => p.name.toLowerCase().includes(c));
+
+  if (category === 'all') {
+    // Show everything, no extra filtering
+  } else if (category === 'data') {
+    filtered = filtered.filter((p: any) => isCarrierProduct(p) && isDataProduct(p));
   } else if (category === 'refill') {
-    // Airtime: carrier names but NOT data bundles
-    filtered = filtered.filter((p: any) =>
-      (p.name.toLowerCase().includes('airtel') ||
-       p.name.toLowerCase().includes('mtn') ||
-       p.name.toLowerCase().includes('glo') ||
-       p.name.toLowerCase().includes('9mobile')) &&
-      !p.name.toLowerCase().includes('data')
-    );
+    // Airtime: carrier products that are NOT data bundles
+    filtered = filtered.filter((p: any) => isCarrierProduct(p) && !isDataProduct(p));
   } else if (category === 'gift-card') {
-    // Retail vouchers / gift cards: not airtime, not data, not electricity
-    filtered = filtered.filter((p: any) => {
-      const n = p.name.toLowerCase();
-      const isUtility = n.includes('airtel') || n.includes('mtn') || n.includes('glo') ||
-                        n.includes('9mobile') || n.includes('data') || n.includes('electricity');
-      return !isUtility;
-    });
+    // Retail vouchers / gift cards: not carrier products
+    filtered = filtered.filter((p: any) => !isCarrierProduct(p));
   } else if (category === 'esim') {
     filtered = filtered.filter((p: any) =>
       p.name.toLowerCase().includes('esim') || p.name.toLowerCase().includes('e-sim')
     );
   }
+
+  console.log('[BitRefill] Category:', category, '-', filtered.length, 'products:', filtered.map((p: any) => p.name).join(', '));
 
   if (!filtered.length) {
     await ctx.editMessageText(
@@ -1161,7 +1161,7 @@ bot.action(/shop_cat:(.+)/, async (ctx) => {
   buttons.push([Markup.button.callback('⬅️ Back', 'shop_back')]);
 
   await ctx.editMessageText(
-    `🛒 *Shop — ${category === 'refill' ? 'Airtime' : category === 'gift-card' ? 'Gift Cards' : category === 'esim' ? 'eSIM' : 'Data Bundles'}*\n\n` +
+    `🛒 *Shop — ${category === 'refill' ? 'Airtime' : category === 'gift-card' ? 'Gift Cards' : category === 'esim' ? 'eSIM' : category === 'all' ? 'All Products' : 'Data Bundles'}*\n\n` +
     `Choose a product:`,
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
   );
