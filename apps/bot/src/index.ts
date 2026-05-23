@@ -1911,8 +1911,12 @@ async function buildBalanceMessage(userId: string): Promise<string | null> {
     msg += `💵 Total: ≈${formatNgn(totalNgn)}\n`;
     msg += `📈 Rate: ${formatNgn(offRampRate)} per Dollar`;
     return msg;
-  } catch (err) {
+  } catch (err: any) {
     console.error('Balance error:', err);
+    const isRateLimit = err?.message?.includes('429') || err?.message?.includes('Too many requests');
+    if (isRateLimit) {
+      return `⏳ *Rate Limited*\n\nThe Solana network is busy right now. Please wait a few seconds and tap *Balance* again.`;
+    }
     return null;
   }
 }

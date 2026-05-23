@@ -22,9 +22,14 @@ import { SOLANA_TOKENS } from '../../shared/src/constants.js';
 
 export class WalletService {
   private connection: Connection;
+  private balanceCache = new Map<string, { data: any[]; ts: number }>();
+  private readonly CACHE_TTL_MS = 15_000;
 
   constructor(rpcUrl: string) {
-    this.connection = new Connection(rpcUrl, 'confirmed');
+    this.connection = new Connection(rpcUrl, {
+      commitment: 'confirmed',
+      confirmTransactionInitialTimeout: 60_000,
+    });
   }
 
   // Generate a new Solana wallet for a user
@@ -61,8 +66,13 @@ export class WalletService {
     }
   }
 
-  // Get all token balances for a wallet
+  // Get all token balances for a wallet (cached for 15s to reduce RPC rate limits)
   async getAllBalances(walletAddress: string) {
+    const cached = this.balanceCache.get(walletAddress);
+    if (cached && Date.now() - cached.ts < this.CACHE_TTL_MS) {
+      return cached.data;
+    }
+
     const [solBalance, usdtBalance, usdcBalance, auddBalance] = await Promise.all([
       this.getSolBalance(walletAddress),
       this.getTokenBalance(walletAddress, SOLANA_TOKENS.USDT.mint),
@@ -70,12 +80,15 @@ export class WalletService {
       this.getTokenBalance(walletAddress, SOLANA_TOKENS.AUDD.mint),
     ]);
 
-    return [
+    const result = [
       { ...SOLANA_TOKENS.SOL, amount: solBalance },
       { ...SOLANA_TOKENS.USDT, amount: usdtBalance },
       { ...SOLANA_TOKENS.USDC, amount: usdcBalance },
       { ...SOLANA_TOKENS.AUDD, amount: auddBalance },
     ];
+
+    this.balanceCache.set(walletAddress, { data: result, ts: Date.now() });
+    return result;
   }
 
   // Build and sign a transaction (user pays gas with their own SOL)
