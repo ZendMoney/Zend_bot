@@ -863,6 +863,25 @@ bot.command('start', async (ctx) => {
     return;
   }
 
+  // Parse deep link referral param: /start <code>
+  const startPayload = ctx.message?.text?.split(' ')[1]?.trim() || '';
+  let ambassadorRefCode: string | undefined;
+  let referredByUserId: string | undefined;
+
+  if (startPayload) {
+    // Check if it's an ambassador custom code
+    const ambassadorMatch = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.customReferralCode, startPayload.toLowerCase())).limit(1);
+    if (ambassadorMatch.length > 0) {
+      ambassadorRefCode = startPayload.toLowerCase();
+    } else {
+      // Check if it's a regular user referral code
+      const refUser = await db.select({ id: users.id }).from(users).where(eq(users.referralCode, startPayload.toUpperCase())).limit(1);
+      if (refUser.length > 0) {
+        referredByUserId = refUser[0].id;
+      }
+    }
+  }
+
   // Generate wallet
   const wallet = walletService.generateWallet();
   const encryptedKey = await encryptPrivateKey(wallet.secretKey);
@@ -876,6 +895,8 @@ bot.command('start', async (ctx) => {
     walletAddress: wallet.publicKey,
     walletEncryptedKey: encryptedKey,
     referralCode,
+    referredBy: referredByUserId,
+    ambassadorReferralCode: ambassadorRefCode,
   });
 
   await ctx.reply(
@@ -925,7 +946,8 @@ const adminMainKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback('📊 Overview', 'admin_page:overview')],
   [Markup.button.callback('👤 Users', 'admin_page:users'), Markup.button.callback('🧑‍🎓 Ambassadors', 'admin_page:ambassadors')],
   [Markup.button.callback('🚨 Suspensions', 'admin_page:suspensions'), Markup.button.callback('💰 Fees & Revenue', 'admin_page:fees')],
-  [Markup.button.callback('🔍 Search', 'admin_page:search'), Markup.button.callback('⚙️ Features', 'admin_page:features')],
+  [Markup.button.callback('🎯 Ref Links', 'admin_page:ambassador_refs'), Markup.button.callback('🔍 Search', 'admin_page:search')],
+  [Markup.button.callback('⚙️ Features', 'admin_page:features')],
 ]);
 
 bot.command('admin', async (ctx) => {
@@ -1224,6 +1246,138 @@ bot.action(/admin_toggle_feature:(\d+)/, async (ctx) => {
   const text = `⚙️ *Features* — ${activeCount} / ${features.length} active\n\nTap to toggle:`;
 
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+});
+
+// ─── Ambassador Referrals ───
+
+bot.action('admin_page:ambassador_refs', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const ambassadors = await db.select().from(ambassadorApplications).orderBy(desc(ambassadorApplications.createdAt));
+
+  // Get signup counts per ambassador code
+  const signupCounts: Record<string, number> = {};
+  for (const a of ambassadors) {
+    if (a.customReferralCode) {
+      const count = await db.select({ count: sql`count(*)` }).from(users).where(eq(users.ambassadorReferralCode, a.customReferralCode));
+      signupCounts[a.customReferralCode] = Number(count[0]?.count || 0);
+    }
+  }
+
+  let list = ambassadors.map((a, i) => {
+    const code = a.customReferralCode ? `\`${a.customReferralCode}\`` : '_(not set)_';
+    const signups = a.customReferralCode ? (signupCounts[a.customReferralCode] || 0) : 0;
+    const link = a.customReferralCode ? `t.me/ZendBot?start=${a.customReferralCode}` : '';
+    return `${i + 1}. *${escapeTelegramMarkdown(a.name)}* — ${code}\n   Signups: ${signups}${link ? ` | [Link](${link})` : ''}`;
+  }).join('\n\n');
+
+  const text = `🎯 *Ambassador Referral Links* — ${ambassadors.length} ambassadors\n\n${list || 'No ambassadors yet.'}\n\nTap an ambassador to manage their code:`;
+
+  const buttons = ambassadors.map(a => [
+    Markup.button.callback(`${escapeTelegramMarkdown(a.name)}`, `admin_ambassador_detail:${a.id}`)
+  ]);
+  buttons.push([Markup.button.callback('◀️ Back', 'admin_back')]);
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_ambassador_detail:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const ambId = parseInt(ctx.match[1], 10);
+  const ambRows = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.id, ambId)).limit(1);
+  if (ambRows.length === 0) { await ctx.answerCbQuery('Ambassador not found'); return; }
+  const amb = ambRows[0];
+
+  const signupCount = amb.customReferralCode
+    ? await db.select({ count: sql`count(*)` }).from(users).where(eq(users.ambassadorReferralCode, amb.customReferralCode))
+    : [{ count: 0 }];
+
+  const text =
+    `🧑‍🎓 *Ambassador Detail*\n\n` +
+    `*Name:* ${escapeTelegramMarkdown(amb.name)}\n` +
+    `*Handle:* @${escapeTelegramMarkdown(amb.tgHandle.replace(/^@/, ''))}\n` +
+    `*Focus:* ${escapeTelegramMarkdown(amb.focus)}\n` +
+    `*Student:* ${escapeTelegramMarkdown(amb.isStudent)}\n\n` +
+    `*Referral Code:* ${amb.customReferralCode ? `\`${amb.customReferralCode}\`` : '_(not set)_'}\n` +
+    `*Signups:* ${Number(signupCount[0]?.count || 0)}\n` +
+    `${amb.customReferralCode ? `*Link:* \`t.me/ZendBot?start=${amb.customReferralCode}\`` : ''}`;
+
+  const buttons = [
+    [Markup.button.callback('✏️ Set Code', `admin_set_ambassador_code:${amb.id}`)],
+    [Markup.button.callback('👥 View Signups', `admin_ambassador_signups:${amb.id}`)],
+    [Markup.button.callback('◀️ Back', 'admin_page:ambassador_refs')],
+  ];
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_set_ambassador_code:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const ambId = parseInt(ctx.match[1], 10);
+  const ambRows = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.id, ambId)).limit(1);
+  if (ambRows.length === 0) { await ctx.answerCbQuery('Ambassador not found'); return; }
+
+  setSession(userId, { state: ConversationState.AWAITING_ADMIN_SET_AMBASSADOR_CODE, pendingTransaction: { recipientName: String(ambId) } as any });
+
+  await ctx.editMessageText(
+    `✏️ *Set Referral Code*\n\n` +
+    `Ambassador: *${escapeTelegramMarkdown(ambRows[0].name)}*\n\n` +
+    `Enter a unique code (lowercase, no spaces, e.g., \`ajemark\`, \`ghali\`):\n\n` +
+    `Current: ${ambRows[0].customReferralCode ? `\`${ambRows[0].customReferralCode}\`` : '_(none)_'}`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', `admin_ambassador_detail:${ambId}`)]]) }
+  );
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_ambassador_signups:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const ambId = parseInt(ctx.match[1], 10);
+  const ambRows = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.id, ambId)).limit(1);
+  if (ambRows.length === 0) { await ctx.answerCbQuery('Ambassador not found'); return; }
+  const amb = ambRows[0];
+
+  if (!amb.customReferralCode) {
+    await ctx.editMessageText('❌ This ambassador has no referral code set.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', `admin_ambassador_detail:${ambId}`)]]));
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  const signups = await db.select({
+    id: users.id,
+    name: users.firstName,
+    username: users.telegramUsername,
+    createdAt: users.createdAt,
+  }).from(users).where(eq(users.ambassadorReferralCode, amb.customReferralCode)).orderBy(desc(users.createdAt)).limit(20);
+
+  const total = await db.select({ count: sql`count(*)` }).from(users).where(eq(users.ambassadorReferralCode, amb.customReferralCode));
+
+  let list = signups.map((u, i) =>
+    `${i + 1}. ${escapeTelegramMarkdown(u.name || 'Unknown')}${u.username ? ` (@${escapeTelegramMarkdown(u.username.replace(/^@/, ''))})` : ''} — ${new Date(u.createdAt).toLocaleDateString('en-NG')}`
+  ).join('\n');
+
+  const text =
+    `👥 *Signups via ${escapeTelegramMarkdown(amb.name)}*\n` +
+    `Code: \`${amb.customReferralCode}\` | Total: ${Number(total[0]?.count || 0)}\n\n` +
+    (list || 'No signups yet.');
+
+  const buttons = signups.map(u => [Markup.button.callback(`View ${escapeTelegramMarkdown(u.name || 'User')}`, `admin_user:${u.id}`)]);
+  buttons.push([Markup.button.callback('◀️ Back', `admin_ambassador_detail:${ambId}`)]);
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
 });
 
 // ─── Admin Search ───
@@ -2525,6 +2679,38 @@ bot.on(message('text'), async (ctx, next) => {
       [Markup.button.callback('🔍 New Search', 'admin_page:search')],
     ];
     await ctx.reply(detailText, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+    return;
+  }
+
+  // ─── ADMIN: SET AMBASSADOR REFERRAL CODE ───
+  if (session.state === ConversationState.AWAITING_ADMIN_SET_AMBASSADOR_CODE) {
+    setSession(userId, { state: ConversationState.IDLE });
+    const ambId = parseInt((session as any).pendingTransaction?.recipientName || '0', 10);
+    if (!ambId) {
+      await ctx.reply('❌ Something went wrong. Please try again.', adminMainKeyboard);
+      return;
+    }
+
+    const code = text.trim().toLowerCase().replace(/\s+/g, '');
+    if (!code || code.length < 3 || code.length > 50) {
+      await ctx.reply('❌ Code must be 3–50 characters. Try again.', Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', `admin_ambassador_detail:${ambId}`)]]));
+      return;
+    }
+
+    // Check uniqueness
+    const existing = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.customReferralCode, code)).limit(1);
+    if (existing.length > 0 && existing[0].id !== ambId) {
+      await ctx.reply('❌ That code is already taken. Try another.', Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', `admin_ambassador_detail:${ambId}`)]]));
+      return;
+    }
+
+    await db.update(ambassadorApplications).set({ customReferralCode: code }).where(eq(ambassadorApplications.id, ambId));
+    await ctx.reply(
+      `✅ Referral code updated!\n\n` +
+      `Ambassador link:\n` +
+      `\`t.me/ZendBot?start=${code}\``,
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', `admin_ambassador_detail:${ambId}`)]]) }
+    );
     return;
   }
 

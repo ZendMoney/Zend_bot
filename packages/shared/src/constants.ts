@@ -90,6 +90,7 @@ export enum ConversationState {
   AWAITING_SHOP_PHONE = 'awaiting_shop_phone',
   AWAITING_ADMIN_TXN_SEARCH = 'awaiting_admin_txn_search',
   AWAITING_ADMIN_USER_SEARCH = 'awaiting_admin_user_search',
+  AWAITING_ADMIN_SET_AMBASSADOR_CODE = 'awaiting_admin_set_ambassador_code',
 }
 
 // Transaction Types

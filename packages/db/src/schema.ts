@@ -32,6 +32,7 @@ export const users = pgTable('users', {
   // Referral
   referralCode: varchar('referral_code', { length: 20 }).unique(),
   referredBy: varchar('referred_by', { length: 50 }).references((): any => users.id),
+  ambassadorReferralCode: varchar('ambassador_referral_code', { length: 50 }),
 
   // Admin
   isAdmin: boolean('is_admin').default(false).notNull(),
@@ -197,6 +198,7 @@ export const ambassadorApplications = pgTable('ambassador_applications', {
   tgHandle: varchar('tg_handle', { length: 40 }).notNull(),
   isStudent: varchar('is_student', { length: 10 }).notNull(),
   focus: varchar('focus', { length: 120 }).notNull(),
+  customReferralCode: varchar('custom_referral_code', { length: 50 }).unique(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
