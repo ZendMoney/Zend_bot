@@ -904,106 +904,230 @@ bot.command('start', async (ctx) => {
 // /ADMIN — Admin Dashboard
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Comma-separated list of admin Telegram usernames or IDs (no @ symbols)
-// Example: ADMIN_TELEGRAM_IDS=israel_igboze,ajemark,123456789
 const ADMIN_TELEGRAM_IDS = (process.env.ADMIN_TELEGRAM_IDS || process.env.ADMIN_TELEGRAM_ID || '')
   .split(',')
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
 
-async function isAdmin(userId: string, username?: string): Promise<boolean> {
-  // Check env list by user ID or username
+async function checkAdmin(userId: string, username?: string): Promise<boolean> {
   if (ADMIN_TELEGRAM_IDS.length > 0) {
     if (ADMIN_TELEGRAM_IDS.includes(userId)) return true;
     if (username && ADMIN_TELEGRAM_IDS.includes(username.toLowerCase())) return true;
   }
-  // Check DB flag for runtime admin management
   const u = await db.select({ isAdmin: users.isAdmin, telegramUsername: users.telegramUsername }).from(users).where(eq(users.id, userId)).limit(1);
   if (u.length > 0 && u[0].isAdmin) return true;
   if (u.length > 0 && u[0].telegramUsername && ADMIN_TELEGRAM_IDS.includes(u[0].telegramUsername.toLowerCase())) return true;
   return false;
 }
 
+// ─── Admin Navigation ───
+const adminMainKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback('📊 Overview', 'admin_page:overview')],
+  [Markup.button.callback('👤 Users', 'admin_page:users'), Markup.button.callback('🧑‍🎓 Ambassadors', 'admin_page:ambassadors')],
+  [Markup.button.callback('🚨 Suspensions', 'admin_page:suspensions'), Markup.button.callback('💰 Fees & Revenue', 'admin_page:fees')],
+  [Markup.button.callback('⚙️ Features', 'admin_page:features')],
+]);
+
 bot.command('admin', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await isAdmin(userId, username))) {
+  if (!(await checkAdmin(userId, username))) {
     await ctx.reply('❌ You do not have permission to access the admin panel.');
     return;
   }
+  await ctx.reply('🛠 *Zend Admin Panel*\n\nChoose a section:', { parse_mode: 'Markdown', ...adminMainKeyboard });
+});
 
-  // Stats
+bot.action('admin_back', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  await ctx.editMessageText('🛠 *Zend Admin Panel*\n\nChoose a section:', { parse_mode: 'Markdown', ...adminMainKeyboard });
+  await ctx.answerCbQuery();
+});
+
+// ─── Overview ───
+bot.action('admin_page:overview', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
   const userCount = await db.select({ count: sql`count(*)` }).from(users);
   const txCount = await db.select({ count: sql`count(*)` }).from(transactions);
   const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'offramp'));
   const totalNgnIn = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
+  const totalZendFee = await db.select({ sum: sql`coalesce(sum(zend_fee_usdt), 0)` }).from(transactions).where(eq(transactions.status, 'completed'));
   const activeFeatures = await db.select().from(botFeatures).where(eq(botFeatures.isActive, true));
 
-  const stats =
-    `📊 *Zend Admin Dashboard*\n\n` +
-    `👤 Total Users: ${userCount[0]?.count || 0}\n` +
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const newToday = await db.select({ count: sql`count(*)` }).from(users).where(sql`${users.createdAt} >= ${todayStart}`);
+
+  const text =
+    `📊 *Overview*\n\n` +
+    `👤 Total Users: ${userCount[0]?.count || 0} (+${newToday[0]?.count || 0} today)\n` +
     `📋 Total Transactions: ${txCount[0]?.count || 0}\n` +
     `💰 Total NGN In: ₦${Number(totalNgnIn[0]?.sum || 0).toLocaleString()}\n` +
     `💸 Total NGN Out: ₦${Number(totalNgnOut[0]?.sum || 0).toLocaleString()}\n` +
-    `✅ Active Features: ${activeFeatures.length}\n\n` +
-    `Tap a feature below to toggle it:`;
+    `🪙 Zend Fees (USDT): $${Number(totalZendFee[0]?.sum || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}\n` +
+    `✅ Active Features: ${activeFeatures.length}\n`;
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+// ─── Users ───
+bot.action('admin_page:users', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const total = await db.select({ count: sql`count(*)` }).from(users);
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const newToday = await db.select({ count: sql`count(*)` }).from(users).where(sql`${users.createdAt} >= ${todayStart}`);
+  const weekStart = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const newWeek = await db.select({ count: sql`count(*)` }).from(users).where(sql`${users.createdAt} >= ${weekStart}`);
+
+  const recentUsers = await db.select({
+    id: users.id,
+    name: users.firstName,
+    username: users.telegramUsername,
+    createdAt: users.createdAt,
+    wallet: users.walletAddress,
+  }).from(users).orderBy(sql`${users.createdAt} desc`).limit(10);
+
+  let userList = recentUsers.map(u =>
+    `- ${u.name}${u.username ? ` (@${u.username})` : ''} | \`${u.wallet?.slice(0, 6)}...${u.wallet?.slice(-4)}\``
+  ).join('\n');
+
+  const text =
+    `👤 *Users*\n\n` +
+    `Total: ${total[0]?.count || 0}\n` +
+    `New today: ${newToday[0]?.count || 0}\n` +
+    `New this week: ${newWeek[0]?.count || 0}\n\n` +
+    `*Recent users:*\n${userList || 'No users yet.'}`;
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+// ─── Ambassadors ───
+bot.action('admin_page:ambassadors', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const total = await db.select({ count: sql`count(*)` }).from(ambassadorApplications);
+  const apps = await db.select().from(ambassadorApplications).orderBy(sql`${ambassadorApplications.createdAt} desc`).limit(20);
+
+  let list = apps.map((a, i) =>
+    `${i + 1}. *${a.name}* (@${a.tgHandle})\n` +
+    `   Student: ${a.isStudent} | Focus: ${a.focus}`
+  ).join('\n\n');
+
+  const text =
+    `🧑‍🎓 *Ambassador Applications* — ${total[0]?.count || 0} total\n\n` +
+    (list || 'No applications yet.');
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+// ─── Suspensions ───
+bot.action('admin_page:suspensions', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const total = await db.select({ count: sql`count(*)` }).from(deviceSuspensionRequests);
+  const reqs = await db.select().from(deviceSuspensionRequests).orderBy(sql`${deviceSuspensionRequests.createdAt} desc`).limit(20);
+
+  let list = reqs.map((r, i) =>
+    `${i + 1}. *${r.fullName}* (@${r.handle})\n` +
+    `   📧 ${r.email} | 📱 ${r.phone}\n` +
+    `   Device: ${r.deviceLost}${r.details ? `\n   Details: ${r.details.slice(0, 100)}` : ''}`
+  ).join('\n\n');
+
+  const text =
+    `🚨 *Device Suspension Requests* — ${total[0]?.count || 0} total\n\n` +
+    (list || 'No requests yet.');
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+// ─── Fees & Revenue ───
+bot.action('admin_page:fees', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const totalZendFee = await db.select({ sum: sql`coalesce(sum(zend_fee_usdt), 0)` }).from(transactions).where(eq(transactions.status, 'completed'));
+  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'offramp'));
+  const totalNgnIn = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
+
+  const offrampCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'offramp'));
+  const onrampCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
+  const swapCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'swap'));
+  const shopCount = await db.select({ count: sql`count(*)` }).from(bitrefillOrders);
+  const shopVolume = await db.select({ sum: sql`coalesce(sum(amount_fiat), 0)` }).from(bitrefillOrders).where(eq(bitrefillOrders.status, 'completed'));
+
+  const text =
+    `💰 *Fees & Revenue*\n\n` +
+    `🪙 Total Zend Fees: $${Number(totalZendFee[0]?.sum || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}\n\n` +
+    `📊 *Volume by Type:*\n` +
+    `📤 Off-Ramp: ${offrampCount[0]?.count || 0} tx | ₦${Number(totalNgnOut[0]?.sum || 0).toLocaleString()}\n` +
+    `📥 On-Ramp: ${onrampCount[0]?.count || 0} tx | ₦${Number(totalNgnIn[0]?.sum || 0).toLocaleString()}\n` +
+    `🔄 Swaps: ${swapCount[0]?.count || 0} tx\n` +
+    `🎁 Shop Orders: ${shopCount[0]?.count || 0} | $${Number(shopVolume[0]?.sum || 0).toLocaleString()}\n`;
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+// ─── Features ───
+bot.action('admin_page:features', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const features = await db.select().from(botFeatures).orderBy(botFeatures.sortOrder);
   const buttons = features.map(f => [
-    Markup.button.callback(
-      `${f.isActive ? '🟢' : '🔴'} ${f.name}`,
-      `admin_toggle_feature:${f.id}`
-    )
+    Markup.button.callback(`${f.isActive ? '🟢' : '🔴'} ${f.name}`, `admin_toggle_feature:${f.id}`)
   ]);
+  buttons.push([Markup.button.callback('◀️ Back', 'admin_back')]);
 
-  await ctx.reply(stats, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard(buttons),
-  });
+  const activeCount = features.filter(f => f.isActive).length;
+  const text = `⚙️ *Features* — ${activeCount} / ${features.length} active\n\nTap to toggle:`;
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
 });
 
 bot.action(/admin_toggle_feature:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await isAdmin(userId, username))) {
-    await ctx.answerCbQuery('❌ Not authorized');
-    return;
-  }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const featureId = parseInt(ctx.match[1], 10);
   const feature = await db.select().from(botFeatures).where(eq(botFeatures.id, featureId)).limit(1);
-  if (feature.length === 0) {
-    await ctx.answerCbQuery('Feature not found');
-    return;
-  }
+  if (feature.length === 0) { await ctx.answerCbQuery('Feature not found'); return; }
 
   const newState = !feature[0].isActive;
   await db.update(botFeatures).set({ isActive: newState }).where(eq(botFeatures.id, featureId));
-
-  // Invalidate cache
   _botFeaturesCache = null;
 
   await ctx.answerCbQuery(`${feature[0].name} is now ${newState ? 'ON' : 'OFF'}`);
 
-  // Refresh the admin panel
+  // Refresh features page
   const features = await db.select().from(botFeatures).orderBy(botFeatures.sortOrder);
   const buttons = features.map(f => [
-    Markup.button.callback(
-      `${f.isActive ? '🟢' : '🔴'} ${f.name}`,
-      `admin_toggle_feature:${f.id}`
-    )
+    Markup.button.callback(`${f.isActive ? '🟢' : '🔴'} ${f.name}`, `admin_toggle_feature:${f.id}`)
   ]);
-
+  buttons.push([Markup.button.callback('◀️ Back', 'admin_back')]);
   const activeCount = features.filter(f => f.isActive).length;
-  const updatedText =
-    `📊 *Zend Admin Dashboard*\n\n` +
-    `✅ Active Features: ${activeCount} / ${features.length}\n\n` +
-    `Tap a feature below to toggle it:`;
+  const text = `⚙️ *Features* — ${activeCount} / ${features.length} active\n\nTap to toggle:`;
 
-  await ctx.editMessageText(updatedText, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard(buttons),
-  });
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
