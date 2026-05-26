@@ -454,6 +454,83 @@ async function finishLoading(ctx: ZendContext, messageId: number, text: string, 
   await ctx.telegram.editMessageText(ctx.chat!.id, messageId, undefined, text, parseMode ? { parse_mode: parseMode as any } : undefined);
 }
 
+// ─── Ambassador Program Helpers ───
+
+async function getAmbassadorActiveUserCount(code: string): Promise<number> {
+  const result = await db.select({ count: sql`count(distinct ${users.id})` })
+    .from(users)
+    .where(
+      and(
+        eq(users.ambassadorReferralCode, code),
+        sql`exists (select 1 from ${transactions} where ${transactions.userId} = ${users.id} and ${transactions.status} = 'completed')`
+      )
+    );
+  return Number(result[0]?.count || 0);
+}
+
+async function getAmbassadorMonthlyVolume(code: string, year: number, month: number): Promise<number> {
+  const start = new Date(year, month - 1, 1).toISOString();
+  const end = new Date(year, month, 1).toISOString();
+  const result = await db.select({ sum: sql`coalesce(sum(${transactions.ngnAmount}), 0)` })
+    .from(transactions)
+    .innerJoin(users, eq(transactions.userId, users.id))
+    .where(
+      and(
+        eq(users.ambassadorReferralCode, code),
+        eq(transactions.status, 'completed'),
+        sql`${transactions.createdAt} >= ${start}`,
+        sql`${transactions.createdAt} < ${end}`
+      )
+    );
+  return Number(result[0]?.sum || 0);
+}
+
+async function getAmbassadorTotalVolume(code: string): Promise<number> {
+  const result = await db.select({ sum: sql`coalesce(sum(${transactions.ngnAmount}), 0)` })
+    .from(transactions)
+    .innerJoin(users, eq(transactions.userId, users.id))
+    .where(
+      and(
+        eq(users.ambassadorReferralCode, code),
+        eq(transactions.status, 'completed')
+      )
+    );
+  return Number(result[0]?.sum || 0);
+}
+
+function getAmbassadorTierFromCount(activeCount: number): 'entry' | 'pro' | 'elite' {
+  if (activeCount >= 300) return 'elite';
+  if (activeCount >= 75) return 'pro';
+  return 'entry';
+}
+
+function getCommissionRateBps(tier: string): number {
+  const map: Record<string, number> = { entry: 25, pro: 30, elite: 35 };
+  return map[tier] || 25;
+}
+
+function calculateCommissionNgn(volumeNgn: number, tier: string): number {
+  return volumeNgn * (getCommissionRateBps(tier) / 10000);
+}
+
+function formatAmbassadorTier(tier: string): string {
+  const map: Record<string, string> = {
+    entry: '🥉 ZendER (Entry)',
+    pro: '🥈 ZendER Pro',
+    elite: '🥇 ZendER Elite',
+  };
+  return map[tier] || tier;
+}
+
+function formatAmbassadorStatus(status: string): string {
+  const map: Record<string, string> = {
+    pending: '⏳ Pending',
+    confirmed: '✅ Confirmed',
+    removed: '❌ Removed',
+  };
+  return map[status] || status;
+}
+
 // ─── Rate Cache ───
 let _pajRates: { onRampRate: number; offRampRate: number } | null = null;
 let _pajRatesTime = 0;
@@ -847,6 +924,97 @@ async function promptPrivateChat(ctx: ZendContext, action: string) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// /MYREF — Ambassador Self-Service Stats
+// ═════════════════════════════════════════════════════════════════════════════
+
+bot.command('myref', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  const handle = username ? username.toLowerCase().replace(/^@/, '') : '';
+
+  if (!handle) {
+    await ctx.reply('❌ You need a Telegram username to be an ambassador. Set one in Telegram Settings.');
+    return;
+  }
+
+  const ambRows = await db.select().from(ambassadorApplications)
+    .where(sql`LOWER(${ambassadorApplications.tgHandle}) = LOWER(${handle})`)
+    .limit(1);
+
+  if (ambRows.length === 0) {
+    await ctx.reply(
+      `🧑‍🎓 *ZendER Programme*\n\n` +
+      `You are not registered as a Zend ambassador.\n\n` +
+      `Apply at: https://zend-simple-payments-production.up.railway.app/ambassador`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  const amb = ambRows[0];
+
+  if (amb.status === 'pending') {
+    await ctx.reply(
+      `⏳ *ZendER Application Pending*\n\n` +
+      `Hi ${escapeTelegramMarkdown(amb.name)}, your application is being reviewed.\n\n` +
+      `Complete your starter tasks and the team will confirm you soon.`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  if (amb.status === 'removed') {
+    await ctx.reply(
+      `❌ *ZendER Status Removed*\n\n` +
+      `Your ambassador access has been revoked. Contact the programme manager for more info.`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  // Confirmed ambassador — show stats
+  let activeCount = 0;
+  let totalVolume = 0;
+  let currentMonthVolume = 0;
+  if (amb.customReferralCode) {
+    activeCount = await getAmbassadorActiveUserCount(amb.customReferralCode);
+    totalVolume = await getAmbassadorTotalVolume(amb.customReferralCode);
+    const now = new Date();
+    currentMonthVolume = await getAmbassadorMonthlyVolume(amb.customReferralCode, now.getFullYear(), now.getMonth() + 1);
+  }
+
+  const computedTier = getAmbassadorTierFromCount(activeCount);
+  const rate = getCommissionRateBps(computedTier);
+  const monthCommission = calculateCommissionNgn(currentMonthVolume, computedTier);
+  const totalCommission = calculateCommissionNgn(totalVolume, computedTier);
+  const nextTier = computedTier === 'entry' ? 'Pro (75)' : computedTier === 'pro' ? 'Elite (300)' : 'Maxed';
+  const toNext = computedTier === 'entry' ? Math.max(0, 75 - activeCount) : computedTier === 'pro' ? Math.max(0, 300 - activeCount) : 0;
+
+  let text =
+    `🎯 *Your ZendER Dashboard*\n\n` +
+    `*Name:* ${escapeTelegramMarkdown(amb.name)}\n` +
+    `*Tier:* ${formatAmbassadorTier(computedTier)}\n` +
+    `*Commission Rate:* ${(rate / 100).toFixed(2)}%\n\n`;
+
+  if (amb.customReferralCode) {
+    text +=
+      `🔗 *Your Referral Link*\n` +
+      `\`t.me/ZendBot?start=${amb.customReferralCode}\`\n\n`;
+  }
+
+  text +=
+    `📊 *Stats*\n` +
+    `• Active Users: ${activeCount}${toNext > 0 ? ` (${toNext} to ${nextTier})` : ''}\n` +
+    `• Total Volume: ₦${totalVolume.toLocaleString()}\n` +
+    `• This Month Volume: ₦${currentMonthVolume.toLocaleString()}\n` +
+    `• Est. Monthly Commission: ₦${Math.round(monthCommission).toLocaleString()}\n` +
+    `• Est. Total Commission: ₦${Math.round(totalCommission).toLocaleString()}\n\n` +
+    `💡 Only users who sign up *and complete a transaction* count as active.`;
+
+  await ctx.reply(text, { parse_mode: 'Markdown' });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // /START — Onboarding
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -869,8 +1037,12 @@ bot.command('start', async (ctx) => {
   let referredByUserId: string | undefined;
 
   if (startPayload) {
-    // Check if it's an ambassador custom code
-    const ambassadorMatch = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.customReferralCode, startPayload.toLowerCase())).limit(1);
+    // Check if it's a confirmed ambassador's custom code
+    const ambassadorMatch = await db.select().from(ambassadorApplications)
+      .where(and(
+        eq(ambassadorApplications.customReferralCode, startPayload.toLowerCase()),
+        eq(ambassadorApplications.status, 'confirmed')
+      )).limit(1);
     if (ambassadorMatch.length > 0) {
       ambassadorRefCode = startPayload.toLowerCase();
     } else {
@@ -1257,30 +1429,61 @@ bot.action('admin_page:ambassador_refs', async (ctx) => {
 
   const ambassadors = await db.select().from(ambassadorApplications).orderBy(desc(ambassadorApplications.createdAt));
 
-  // Get signup counts per ambassador code
-  const signupCounts: Record<string, number> = {};
+  // Compute stats per ambassador
+  const stats: Record<number, { signups: number; active: number; volume: number }> = {};
   for (const a of ambassadors) {
     if (a.customReferralCode) {
-      const count = await db.select({ count: sql`count(*)` }).from(users).where(eq(users.ambassadorReferralCode, a.customReferralCode));
-      signupCounts[a.customReferralCode] = Number(count[0]?.count || 0);
+      const signups = await db.select({ count: sql`count(*)` }).from(users).where(eq(users.ambassadorReferralCode, a.customReferralCode));
+      const active = await getAmbassadorActiveUserCount(a.customReferralCode);
+      const volume = await getAmbassadorTotalVolume(a.customReferralCode);
+      stats[a.id] = { signups: Number(signups[0]?.count || 0), active, volume };
+    } else {
+      stats[a.id] = { signups: 0, active: 0, volume: 0 };
     }
   }
 
   let list = ambassadors.map((a, i) => {
-    const code = a.customReferralCode ? `\`${a.customReferralCode}\`` : '_(not set)_';
-    const signups = a.customReferralCode ? (signupCounts[a.customReferralCode] || 0) : 0;
-    const link = a.customReferralCode ? `t.me/ZendBot?start=${a.customReferralCode}` : '';
-    return `${i + 1}. *${escapeTelegramMarkdown(a.name)}* — ${code}\n   Signups: ${signups}${link ? ` | [Link](${link})` : ''}`;
+    const s = stats[a.id];
+    const tierBadge = a.tier === 'elite' ? '🥇' : a.tier === 'pro' ? '🥈' : '🥉';
+    const statusIcon = a.status === 'confirmed' ? '✅' : a.status === 'removed' ? '❌' : '⏳';
+    return `${i + 1}. ${tierBadge} ${statusIcon} *${escapeTelegramMarkdown(a.name)}*\n   Active: ${s.active} | Vol: ₦${s.volume.toLocaleString()} | Code: ${a.customReferralCode ? `\`${a.customReferralCode}\`` : '—'}`;
   }).join('\n\n');
 
-  const text = `🎯 *Ambassador Referral Links* — ${ambassadors.length} ambassadors\n\n${list || 'No ambassadors yet.'}\n\nTap an ambassador to manage their code:`;
+  const text = `🎯 *Ambassador Programme* — ${ambassadors.length} total\n\n${list || 'No ambassadors yet.'}\n\nTap an ambassador for details:`;
 
   const buttons = ambassadors.map(a => [
     Markup.button.callback(`${escapeTelegramMarkdown(a.name)}`, `admin_ambassador_detail:${a.id}`)
   ]);
+  buttons.push([Markup.button.callback('🏆 Leaderboard', 'admin_ambassador_leaderboard')]);
   buttons.push([Markup.button.callback('◀️ Back', 'admin_back')]);
 
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
+});
+
+bot.action('admin_ambassador_leaderboard', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const ambassadors = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.status, 'confirmed'));
+
+  const board = [];
+  for (const a of ambassadors) {
+    if (!a.customReferralCode) continue;
+    const active = await getAmbassadorActiveUserCount(a.customReferralCode);
+    const volume = await getAmbassadorTotalVolume(a.customReferralCode);
+    board.push({ ...a, active, volume });
+  }
+  board.sort((a, b) => b.active - a.active);
+
+  let list = board.slice(0, 10).map((a, i) => {
+    const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
+    return `${medal} *${escapeTelegramMarkdown(a.name)}* — ${a.active} active | ₦${a.volume.toLocaleString()}`;
+  }).join('\n\n');
+
+  const text = `🏆 *ZendER Leaderboard* — Top ${board.length}\n\n${list || 'No confirmed ambassadors yet.'}`;
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_page:ambassador_refs')]]) });
   await ctx.answerCbQuery();
 });
 
@@ -1294,28 +1497,74 @@ bot.action(/admin_ambassador_detail:(\d+)/, async (ctx) => {
   if (ambRows.length === 0) { await ctx.answerCbQuery('Ambassador not found'); return; }
   const amb = ambRows[0];
 
-  const signupCount = amb.customReferralCode
-    ? await db.select({ count: sql`count(*)` }).from(users).where(eq(users.ambassadorReferralCode, amb.customReferralCode))
-    : [{ count: 0 }];
+  let activeCount = 0;
+  let totalVolume = 0;
+  if (amb.customReferralCode) {
+    activeCount = await getAmbassadorActiveUserCount(amb.customReferralCode);
+    totalVolume = await getAmbassadorTotalVolume(amb.customReferralCode);
+  }
+
+  const computedTier = getAmbassadorTierFromCount(activeCount);
+  const rate = getCommissionRateBps(computedTier);
+  const commission = calculateCommissionNgn(totalVolume, computedTier);
 
   const text =
     `🧑‍🎓 *Ambassador Detail*\n\n` +
     `*Name:* ${escapeTelegramMarkdown(amb.name)}\n` +
     `*Handle:* @${escapeTelegramMarkdown(amb.tgHandle.replace(/^@/, ''))}\n` +
     `*Focus:* ${escapeTelegramMarkdown(amb.focus)}\n` +
-    `*Student:* ${escapeTelegramMarkdown(amb.isStudent)}\n\n` +
+    `*Student:* ${escapeTelegramMarkdown(amb.isStudent)}\n` +
+    `*Status:* ${formatAmbassadorStatus(amb.status)}\n` +
+    `*Tier:* ${formatAmbassadorTier(amb.tier)} (computed: ${formatAmbassadorTier(computedTier)})\n\n` +
     `*Referral Code:* ${amb.customReferralCode ? `\`${amb.customReferralCode}\`` : '_(not set)_'}\n` +
-    `*Signups:* ${Number(signupCount[0]?.count || 0)}\n` +
+    `*Active Users:* ${activeCount}\n` +
+    `*Total Volume:* ₦${totalVolume.toLocaleString()}\n` +
+    `*Commission Rate:* ${(rate / 100).toFixed(2)}%\n` +
+    `*Est. Commission:* ₦${Math.round(commission).toLocaleString()}\n` +
     `${amb.customReferralCode ? `*Link:* \`t.me/ZendBot?start=${amb.customReferralCode}\`` : ''}`;
 
   const buttons = [
     [Markup.button.callback('✏️ Set Code', `admin_set_ambassador_code:${amb.id}`)],
-    [Markup.button.callback('👥 View Signups', `admin_ambassador_signups:${amb.id}`)],
-    [Markup.button.callback('◀️ Back', 'admin_page:ambassador_refs')],
+    [Markup.button.callback('👥 View Active Users', `admin_ambassador_signups:${amb.id}`)],
   ];
+  if (amb.status === 'pending') {
+    buttons.push([Markup.button.callback('✅ Confirm', `admin_confirm_ambassador:${amb.id}`)]);
+  }
+  if (amb.status !== 'removed') {
+    buttons.push([Markup.button.callback('❌ Remove', `admin_remove_ambassador:${amb.id}`)]);
+  }
+  buttons.push([Markup.button.callback('◀️ Back', 'admin_page:ambassador_refs')]);
 
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
   await ctx.answerCbQuery();
+});
+
+bot.action(/admin_confirm_ambassador:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const ambId = parseInt(ctx.match[1], 10);
+  await db.update(ambassadorApplications)
+    .set({ status: 'confirmed', confirmedAt: new Date() })
+    .where(eq(ambassadorApplications.id, ambId));
+
+  await ctx.answerCbQuery('✅ Ambassador confirmed');
+  await ctx.editMessageText('✅ Ambassador confirmed successfully.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', `admin_ambassador_detail:${ambId}`)]]));
+});
+
+bot.action(/admin_remove_ambassador:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const ambId = parseInt(ctx.match[1], 10);
+  await db.update(ambassadorApplications)
+    .set({ status: 'removed' })
+    .where(eq(ambassadorApplications.id, ambId));
+
+  await ctx.answerCbQuery('❌ Ambassador removed');
+  await ctx.editMessageText('❌ Ambassador removed. Their referral link is now deactivated.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', `admin_ambassador_detail:${ambId}`)]]));
 });
 
 bot.action(/admin_set_ambassador_code:(\d+)/, async (ctx) => {
@@ -1355,25 +1604,34 @@ bot.action(/admin_ambassador_signups:(\d+)/, async (ctx) => {
     return;
   }
 
-  const signups = await db.select({
+  // Show ACTIVE users only (users with ≥1 completed transaction)
+  const activeUsers = await db.select({
     id: users.id,
     name: users.firstName,
     username: users.telegramUsername,
     createdAt: users.createdAt,
-  }).from(users).where(eq(users.ambassadorReferralCode, amb.customReferralCode)).orderBy(desc(users.createdAt)).limit(20);
+  }).from(users)
+    .where(
+      and(
+        eq(users.ambassadorReferralCode, amb.customReferralCode),
+        sql`exists (select 1 from ${transactions} where ${transactions.userId} = ${users.id} and ${transactions.status} = 'completed')`
+      )
+    )
+    .orderBy(desc(users.createdAt))
+    .limit(20);
 
-  const total = await db.select({ count: sql`count(*)` }).from(users).where(eq(users.ambassadorReferralCode, amb.customReferralCode));
+  const totalActive = await getAmbassadorActiveUserCount(amb.customReferralCode);
 
-  let list = signups.map((u, i) =>
+  let list = activeUsers.map((u, i) =>
     `${i + 1}. ${escapeTelegramMarkdown(u.name || 'Unknown')}${u.username ? ` (@${escapeTelegramMarkdown(u.username.replace(/^@/, ''))})` : ''} — ${new Date(u.createdAt).toLocaleDateString('en-NG')}`
   ).join('\n');
 
   const text =
-    `👥 *Signups via ${escapeTelegramMarkdown(amb.name)}*\n` +
-    `Code: \`${amb.customReferralCode}\` | Total: ${Number(total[0]?.count || 0)}\n\n` +
-    (list || 'No signups yet.');
+    `👥 *Active Users via ${escapeTelegramMarkdown(amb.name)}*\n` +
+    `Code: \`${amb.customReferralCode}\` | Active: ${totalActive}\n\n` +
+    (list || 'No active users yet.');
 
-  const buttons = signups.map(u => [Markup.button.callback(`View ${escapeTelegramMarkdown(u.name || 'User')}`, `admin_user:${u.id}`)]);
+  const buttons = activeUsers.map(u => [Markup.button.callback(`View ${escapeTelegramMarkdown(u.name || 'User')}`, `admin_user:${u.id}`)]);
   buttons.push([Markup.button.callback('◀️ Back', `admin_ambassador_detail:${ambId}`)]);
 
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });

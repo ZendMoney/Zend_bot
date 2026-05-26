@@ -199,6 +199,9 @@ export const ambassadorApplications = pgTable('ambassador_applications', {
   isStudent: varchar('is_student', { length: 10 }).notNull(),
   focus: varchar('focus', { length: 120 }).notNull(),
   customReferralCode: varchar('custom_referral_code', { length: 50 }).unique(),
+  status: varchar('status', { length: 20 }).default('pending').notNull(), // pending | confirmed | removed
+  tier: varchar('tier', { length: 20 }).default('entry').notNull(), // entry | pro | elite
+  confirmedAt: timestamp('confirmed_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
