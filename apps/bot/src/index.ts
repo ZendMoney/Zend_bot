@@ -17,7 +17,7 @@ import bs58 from 'bs58';
 import { message } from 'telegraf/filters';
 import { db, checkConnection } from '@zend/db';
 import { users, transactions, savedBankAccounts, scheduledTransfers, bitrefillOrders, ambassadorApplications, deviceSuspensionRequests, botFeatures } from '@zend/db';
-import { eq, sql, and } from 'drizzle-orm';
+import { eq, sql, and, desc } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
 import { BitRefillClient } from '@zend/bitrefill-client';
 import { parseCommand, transcribeVoice, chatWithKimi, analyzeVoiceWithKimi, parseMenuInputWithAI, type ParsedCommand } from './services/nlp.js';
@@ -925,7 +925,7 @@ const adminMainKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback('📊 Overview', 'admin_page:overview')],
   [Markup.button.callback('👤 Users', 'admin_page:users'), Markup.button.callback('🧑‍🎓 Ambassadors', 'admin_page:ambassadors')],
   [Markup.button.callback('🚨 Suspensions', 'admin_page:suspensions'), Markup.button.callback('💰 Fees & Revenue', 'admin_page:fees')],
-  [Markup.button.callback('⚙️ Features', 'admin_page:features')],
+  [Markup.button.callback('🔍 Search', 'admin_page:search'), Markup.button.callback('⚙️ Features', 'admin_page:features')],
 ]);
 
 bot.command('admin', async (ctx) => {
@@ -1224,6 +1224,215 @@ bot.action(/admin_toggle_feature:(\d+)/, async (ctx) => {
   const text = `⚙️ *Features* — ${activeCount} / ${features.length} active\n\nTap to toggle:`;
 
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+});
+
+// ─── Admin Search ───
+
+const adminSearchKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback('🔎 Search Transaction', 'admin_search:txn')],
+  [Markup.button.callback('👤 Search User', 'admin_search:user')],
+  [Markup.button.callback('◀️ Back', 'admin_back')],
+]);
+
+bot.action('admin_page:search', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  await ctx.editMessageText('🔍 *Search*\n\nWhat do you want to look up?', { parse_mode: 'Markdown', ...adminSearchKeyboard });
+  await ctx.answerCbQuery();
+});
+
+bot.action('admin_search:txn', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  setSession(userId, { state: ConversationState.AWAITING_ADMIN_TXN_SEARCH });
+  await ctx.editMessageText('🔎 *Search Transaction*\n\nEnter the transaction ID (e.g., `ZND-12345`):', { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'admin_cancel_search')]]) });
+  await ctx.answerCbQuery();
+});
+
+bot.action('admin_search:user', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  setSession(userId, { state: ConversationState.AWAITING_ADMIN_USER_SEARCH });
+  await ctx.editMessageText('👤 *Search User*\n\nEnter a Telegram user ID or @username:', { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'admin_cancel_search')]]) });
+  await ctx.answerCbQuery();
+});
+
+bot.action('admin_cancel_search', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  setSession(userId, { state: ConversationState.IDLE });
+  await ctx.editMessageText('🔍 *Search*\n\nWhat do you want to look up?', { parse_mode: 'Markdown', ...adminSearchKeyboard });
+  await ctx.answerCbQuery('Cancelled');
+});
+
+function formatTxnStatus(status: string): string {
+  const map: Record<string, string> = {
+    pending: '⏳ Pending',
+    processing: '⏳ Processing',
+    completed: '✅ Completed',
+    failed: '❌ Failed',
+    cancelled: '🚫 Cancelled',
+  };
+  return map[status] || status;
+}
+
+function formatTxnType(type: string): string {
+  const map: Record<string, string> = {
+    offramp: '📤 Off-Ramp',
+    ngn_receive: '📥 On-Ramp',
+    swap: '🔄 Swap',
+    deposit: '⬇️ Deposit',
+    withdraw: '⬆️ Withdraw',
+  };
+  return map[type] || type;
+}
+
+async function buildTxnDetailText(txn: any): Promise<string> {
+  const userRows = await db.select({ firstName: users.firstName, telegramUsername: users.telegramUsername }).from(users).where(eq(users.id, txn.userId)).limit(1);
+  const u = userRows[0];
+
+  let text = `📋 *Transaction Detail*\n\n`;
+  text += `*ID:* \`${txn.id}\`\n`;
+  text += `*Type:* ${formatTxnType(txn.type)}\n`;
+  text += `*Status:* ${formatTxnStatus(txn.status)}\n`;
+  text += `*User:* ${escapeTelegramMarkdown(u?.firstName || 'Unknown')}${u?.telegramUsername ? ` (@${escapeTelegramMarkdown(u.telegramUsername.replace(/^@/, ''))})` : ''}\n`;
+  text += `*User ID:* \`${txn.userId}\`\n`;
+
+  if (txn.ngnAmount) {
+    text += `\n💰 *Fiat:*\n`;
+    text += `   NGN Amount: ₦${Number(txn.ngnAmount).toLocaleString()}\n`;
+    if (txn.ngnRate) text += `   Rate: ₦${Number(txn.ngnRate).toLocaleString()}\n`;
+  }
+
+  if (txn.fromAmount || txn.toAmount) {
+    text += `\n🪙 *Crypto:*\n`;
+    if (txn.fromAmount && txn.fromMint) text += `   From: ${Number(txn.fromAmount).toLocaleString(undefined, { maximumFractionDigits: 6 })} ${txn.fromMint.slice(0, 4)}...\n`;
+    if (txn.toAmount && txn.toMint) text += `   To: ${Number(txn.toAmount).toLocaleString(undefined, { maximumFractionDigits: 6 })} ${txn.toMint.slice(0, 4)}...\n`;
+  }
+
+  text += `\n📊 *Fees:*\n`;
+  if (txn.pajFeeBps) text += `   PAJ Fee: ${(txn.pajFeeBps / 100).toFixed(2)}%\n`;
+  if (txn.zendSpreadBps) text += `   Zend Spread: ${(txn.zendSpreadBps / 100).toFixed(2)}%\n`;
+  if (txn.zendFeeUsdt) text += `   Zend Fee: $${Number(txn.zendFeeUsdt).toLocaleString(undefined, { maximumFractionDigits: 6 })}\n`;
+
+  if (txn.recipientBankName || txn.recipientAccountNumber) {
+    text += `\n🏦 *Recipient:*\n`;
+    if (txn.recipientBankName) text += `   Bank: ${escapeTelegramMarkdown(txn.recipientBankName)}\n`;
+    if (txn.recipientAccountNumber) text += `   Account: \`${txn.recipientAccountNumber}\`\n`;
+    if (txn.recipientAccountName) text += `   Name: ${escapeTelegramMarkdown(txn.recipientAccountName)}\n`;
+  }
+
+  if (txn.recipientWalletAddress) {
+    text += `\n📬 *Wallet Recipient:*\n   \`${txn.recipientWalletAddress}\`\n`;
+  }
+
+  if (txn.solanaTxHash) {
+    text += `\n🔗 *Solana Tx:*\n   [View on Solscan](https://solscan.io/tx/${txn.solanaTxHash})\n`;
+  }
+
+  if (txn.pajReference) text += `\n📌 *PAJ Ref:* \`${txn.pajReference}\`\n`;
+  if (txn.chainrailsIntentAddress) text += `📌 *ChainRails:* \`${txn.chainrailsIntentAddress}\`\n`;
+
+  if (txn.createdAt) text += `\n🕐 *Created:* ${new Date(txn.createdAt).toLocaleString('en-NG')}\n`;
+  if (txn.completedAt) text += `🕐 *Completed:* ${new Date(txn.completedAt).toLocaleString('en-NG')}\n`;
+
+  if (txn.metadata) {
+    try {
+      const meta = typeof txn.metadata === 'string' ? JSON.parse(txn.metadata) : txn.metadata;
+      const metaStr = JSON.stringify(meta, null, 2).slice(0, 300);
+      if (metaStr.length > 10) text += `\n📝 *Metadata:*\n\`\`\`\n${escapeTelegramMarkdown(metaStr)}\n\`\`\``;
+    } catch { /* ignore */ }
+  }
+
+  return text;
+}
+
+async function buildUserDetailText(userRow: any): Promise<string> {
+  const txCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.userId, userRow.id));
+  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(and(eq(transactions.userId, userRow.id), eq(transactions.type, 'offramp')));
+  const totalNgnIn = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(and(eq(transactions.userId, userRow.id), eq(transactions.type, 'ngn_receive')));
+
+  const recentTxns = await db.select().from(transactions)
+    .where(eq(transactions.userId, userRow.id))
+    .orderBy(desc(transactions.createdAt))
+    .limit(5);
+
+  let text = `👤 *User Detail*\n\n`;
+  text += `*Name:* ${escapeTelegramMarkdown(userRow.firstName || 'Unknown')} ${escapeTelegramMarkdown(userRow.lastName || '')}\n`;
+  text += `*Username:* ${userRow.telegramUsername ? `@${escapeTelegramMarkdown(userRow.telegramUsername.replace(/^@/, ''))}` : 'N/A'}\n`;
+  text += `*ID:* \`${userRow.id}\`\n`;
+  text += `*Wallet:* \`${userRow.walletAddress}\`\n`;
+  text += `*Tier:* ${userRow.tier || 1} | *Lang:* ${userRow.language || 'en'}\n`;
+  if (userRow.autoSaveRateBps) text += `*Auto-save:* ${(userRow.autoSaveRateBps / 100).toFixed(1)}%\n`;
+  if (userRow.pajContact) text += `*PAJ Contact:* ${escapeTelegramMarkdown(userRow.pajContact)}\n`;
+
+  if (userRow.virtualAccount) {
+    try {
+      const va = typeof userRow.virtualAccount === 'string' ? JSON.parse(userRow.virtualAccount) : userRow.virtualAccount;
+      if (va?.accountNumber) text += `\n🏦 *Virtual Account:*\n   Bank: ${escapeTelegramMarkdown(va.bankName || 'N/A')}\n   Number: \`${va.accountNumber}\`\n`;
+    } catch { /* ignore */ }
+  }
+
+  text += `\n📊 *Stats:*\n`;
+  text += `   Total Txns: ${txCount[0]?.count || 0}\n`;
+  text += `   NGN In: ₦${Number(totalNgnIn[0]?.sum || 0).toLocaleString()}\n`;
+  text += `   NGN Out: ₦${Number(totalNgnOut[0]?.sum || 0).toLocaleString()}\n`;
+
+  if (recentTxns.length > 0) {
+    text += `\n📋 *Recent Transactions:*\n`;
+    text += recentTxns.map((t: any) =>
+      `   • ${formatTxnType(t.type)} ${formatTxnStatus(t.status)} | ₦${Number(t.ngnAmount || 0).toLocaleString()} | \`${t.id}\``
+    ).join('\n');
+  }
+
+  text += `\n\n🕐 *Joined:* ${new Date(userRow.createdAt).toLocaleString('en-NG')}`;
+  return text;
+}
+
+bot.action(/admin_txn:(.+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const txnId = ctx.match[1];
+  const txnRows = await db.select().from(transactions).where(eq(transactions.id, txnId)).limit(1);
+  if (txnRows.length === 0) {
+    await ctx.editMessageText('❌ Transaction not found.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_page:search')]]));
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  const text = await buildTxnDetailText(txnRows[0]);
+  const buttons = [
+    [Markup.button.callback('👤 View User', `admin_user:${txnRows[0].userId}`)],
+    [Markup.button.callback('🔍 New Search', 'admin_page:search')],
+  ];
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_user:(.+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const targetId = ctx.match[1];
+  const userRows = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
+  if (userRows.length === 0) {
+    await ctx.editMessageText('❌ User not found.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_page:search')]]));
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  const text = await buildUserDetailText(userRows[0]);
+  const buttons = [
+    [Markup.button.url('💬 Open Chat', `tg://user?id=${targetId}`)],
+    [Markup.button.callback('🔍 New Search', 'admin_page:search')],
+  ];
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2272,6 +2481,50 @@ bot.on(message('text'), async (ctx, next) => {
   if (text === '❌ Cancel') {
     setSession(userId, { state: ConversationState.IDLE });
     await ctx.reply('Cancelled.', mainMenu);
+    return;
+  }
+
+  // ─── ADMIN: SEARCH TRANSACTION ───
+  if (session.state === ConversationState.AWAITING_ADMIN_TXN_SEARCH) {
+    setSession(userId, { state: ConversationState.IDLE });
+    const txnId = text.trim().toUpperCase();
+    const txnRows = await db.select().from(transactions).where(eq(transactions.id, txnId)).limit(1);
+    if (txnRows.length === 0) {
+      await ctx.reply('❌ Transaction not found. Try again or tap 🔍 Search to go back.', adminSearchKeyboard);
+      return;
+    }
+    const detailText = await buildTxnDetailText(txnRows[0]);
+    const buttons = [
+      [Markup.button.callback('👤 View User', `admin_user:${txnRows[0].userId}`)],
+      [Markup.button.callback('🔍 New Search', 'admin_page:search')],
+    ];
+    await ctx.reply(detailText, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+    return;
+  }
+
+  // ─── ADMIN: SEARCH USER ───
+  if (session.state === ConversationState.AWAITING_ADMIN_USER_SEARCH) {
+    setSession(userId, { state: ConversationState.IDLE });
+    const query = text.trim();
+    let targetId = query;
+    if (query.startsWith('@')) targetId = query.slice(1);
+
+    // Try exact ID match first
+    let userRows = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
+    // Fallback to username match (case-insensitive via sql)
+    if (userRows.length === 0) {
+      userRows = await db.select().from(users).where(sql`LOWER(${users.telegramUsername}) = LOWER(${targetId})`).limit(1);
+    }
+    if (userRows.length === 0) {
+      await ctx.reply('❌ User not found. Try again or tap 🔍 Search to go back.', adminSearchKeyboard);
+      return;
+    }
+    const detailText = await buildUserDetailText(userRows[0]);
+    const buttons = [
+      [Markup.button.url('💬 Open Chat', `tg://user?id=${userRows[0].id}`)],
+      [Markup.button.callback('🔍 New Search', 'admin_page:search')],
+    ];
+    await ctx.reply(detailText, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
     return;
   }
 

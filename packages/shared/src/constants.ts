@@ -88,6 +88,8 @@ export enum ConversationState {
   AWAITING_BRIDGE_AMOUNT = 'awaiting_bridge_amount',
   AWAITING_SHOP_AMOUNT = 'awaiting_shop_amount',
   AWAITING_SHOP_PHONE = 'awaiting_shop_phone',
+  AWAITING_ADMIN_TXN_SEARCH = 'awaiting_admin_txn_search',
+  AWAITING_ADMIN_USER_SEARCH = 'awaiting_admin_user_search',
 }
 
 // Transaction Types
