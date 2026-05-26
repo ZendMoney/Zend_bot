@@ -975,7 +975,9 @@ bot.action('admin_page:overview', async (ctx) => {
   await ctx.answerCbQuery();
 });
 
-// ─── Users ───
+// ─── Users (paginated) ───
+const USERS_PER_PAGE = 20;
+
 bot.action('admin_page:users', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
@@ -983,9 +985,9 @@ bot.action('admin_page:users', async (ctx) => {
 
   const total = await db.select({ count: sql`count(*)` }).from(users);
   const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
-  const newToday = await db.select({ count: sql`count(*)` }).from(users).where(sql`${users.createdAt} >= ${todayStart}`);
+  const newToday = await db.select({ count: sql`count(*)` }).from(users).where(sql`${users.createdAt} >= ${todayStart.toISOString()}`);
   const weekStart = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-  const newWeek = await db.select({ count: sql`count(*)` }).from(users).where(sql`${users.createdAt} >= ${weekStart}`);
+  const newWeek = await db.select({ count: sql`count(*)` }).from(users).where(sql`${users.createdAt} >= ${weekStart.toISOString()}`);
 
   const recentUsers = await db.select({
     id: users.id,
@@ -993,53 +995,119 @@ bot.action('admin_page:users', async (ctx) => {
     username: users.telegramUsername,
     createdAt: users.createdAt,
     wallet: users.walletAddress,
-  }).from(users).orderBy(sql`${users.createdAt} desc`).limit(10);
+  }).from(users).orderBy(sql`${users.createdAt} desc`).limit(USERS_PER_PAGE);
 
   let userList = recentUsers.map(u =>
     `- ${escapeTelegramMarkdown(u.name || 'Unknown')}${u.username ? ` (@${escapeTelegramMarkdown(u.username.replace(/^@/, ''))})` : ''} | \`${u.wallet?.slice(0, 6)}...${u.wallet?.slice(-4)}\``
   ).join('\n');
 
   const text =
-    `👤 *Users*\n\n` +
-    `Total: ${total[0]?.count || 0}\n` +
-    `New today: ${newToday[0]?.count || 0}\n` +
-    `New this week: ${newWeek[0]?.count || 0}\n\n` +
-    `*Recent users:*\n${userList || 'No users yet.'}`;
+    `👤 *Users* (page 1)\n\n` +
+    `Total: ${total[0]?.count || 0} | New today: ${newToday[0]?.count || 0} | This week: ${newWeek[0]?.count || 0}\n\n` +
+    `${userList || 'No users yet.'}`;
 
-  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  const navButtons = [];
+  if (Number(total[0]?.count || 0) > USERS_PER_PAGE) {
+    navButtons.push(Markup.button.callback('➡️ Next', 'admin_users_page:1'));
+  }
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([navButtons, [Markup.button.callback('◀️ Back', 'admin_back')]]) });
   await ctx.answerCbQuery();
 });
 
-// ─── Ambassadors ───
+bot.action(/admin_users_page:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const page = parseInt(ctx.match[1], 10);
+  const offset = page * USERS_PER_PAGE;
+
+  const total = await db.select({ count: sql`count(*)` }).from(users);
+  const pageUsers = await db.select({
+    id: users.id,
+    name: users.firstName,
+    username: users.telegramUsername,
+    wallet: users.walletAddress,
+  }).from(users).orderBy(sql`${users.createdAt} desc`).limit(USERS_PER_PAGE).offset(offset);
+
+  let userList = pageUsers.map(u =>
+    `- ${escapeTelegramMarkdown(u.name || 'Unknown')}${u.username ? ` (@${escapeTelegramMarkdown(u.username.replace(/^@/, ''))})` : ''} | \`${u.wallet?.slice(0, 6)}...${u.wallet?.slice(-4)}\``
+  ).join('\n');
+
+  const totalCount = Number(total[0]?.count || 0);
+  const text = `👤 *Users* (page ${page + 1})\n\n${userList || 'No more users.'}`;
+
+  const navButtons = [];
+  if (page > 0) navButtons.push(Markup.button.callback('⬅️ Prev', `admin_users_page:${page - 1}`));
+  if (totalCount > offset + USERS_PER_PAGE) navButtons.push(Markup.button.callback('➡️ Next', `admin_users_page:${page + 1}`));
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([navButtons, [Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+// ─── Ambassadors (paginated) ───
+const AMBS_PER_PAGE = 20;
+
 bot.action('admin_page:ambassadors', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
   if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const total = await db.select({ count: sql`count(*)` }).from(ambassadorApplications);
-  const apps = await db.select().from(ambassadorApplications).orderBy(sql`${ambassadorApplications.createdAt} desc`).limit(20);
+  const apps = await db.select().from(ambassadorApplications).orderBy(sql`${ambassadorApplications.createdAt} desc`).limit(AMBS_PER_PAGE);
 
   let list = apps.map((a, i) =>
     `${i + 1}. *${escapeTelegramMarkdown(a.name)}* (@${escapeTelegramMarkdown(a.tgHandle.replace(/^@/, ''))})\n` +
     `   Student: ${escapeTelegramMarkdown(a.isStudent)} | Focus: ${escapeTelegramMarkdown(a.focus)}`
   ).join('\n\n');
 
-  const text =
-    `🧑‍🎓 *Ambassador Applications* — ${total[0]?.count || 0} total\n\n` +
-    (list || 'No applications yet.');
+  const text = `🧑‍🎓 *Ambassadors* (page 1) — ${total[0]?.count || 0} total\n\n${list || 'No applications yet.'}`;
 
-  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  const navButtons = [];
+  if (Number(total[0]?.count || 0) > AMBS_PER_PAGE) {
+    navButtons.push(Markup.button.callback('➡️ Next', 'admin_ambassadors_page:1'));
+  }
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([navButtons, [Markup.button.callback('◀️ Back', 'admin_back')]]) });
   await ctx.answerCbQuery();
 });
 
-// ─── Suspensions ───
+bot.action(/admin_ambassadors_page:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const page = parseInt(ctx.match[1], 10);
+  const offset = page * AMBS_PER_PAGE;
+
+  const total = await db.select({ count: sql`count(*)` }).from(ambassadorApplications);
+  const apps = await db.select().from(ambassadorApplications).orderBy(sql`${ambassadorApplications.createdAt} desc`).limit(AMBS_PER_PAGE).offset(offset);
+
+  let list = apps.map((a, i) =>
+    `${offset + i + 1}. *${escapeTelegramMarkdown(a.name)}* (@${escapeTelegramMarkdown(a.tgHandle.replace(/^@/, ''))})\n` +
+    `   Student: ${escapeTelegramMarkdown(a.isStudent)} | Focus: ${escapeTelegramMarkdown(a.focus)}`
+  ).join('\n\n');
+
+  const totalCount = Number(total[0]?.count || 0);
+  const text = `🧑‍🎓 *Ambassadors* (page ${page + 1}) — ${totalCount} total\n\n${list || 'No more applications.'}`;
+
+  const navButtons = [];
+  if (page > 0) navButtons.push(Markup.button.callback('⬅️ Prev', `admin_ambassadors_page:${page - 1}`));
+  if (totalCount > offset + AMBS_PER_PAGE) navButtons.push(Markup.button.callback('➡️ Next', `admin_ambassadors_page:${page + 1}`));
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([navButtons, [Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+// ─── Suspensions (paginated) ───
+const SUSP_PER_PAGE = 20;
+
 bot.action('admin_page:suspensions', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
   if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const total = await db.select({ count: sql`count(*)` }).from(deviceSuspensionRequests);
-  const reqs = await db.select().from(deviceSuspensionRequests).orderBy(sql`${deviceSuspensionRequests.createdAt} desc`).limit(20);
+  const reqs = await db.select().from(deviceSuspensionRequests).orderBy(sql`${deviceSuspensionRequests.createdAt} desc`).limit(SUSP_PER_PAGE);
 
   let list = reqs.map((r, i) =>
     `${i + 1}. *${escapeTelegramMarkdown(r.fullName)}* (@${escapeTelegramMarkdown(r.handle.replace(/^@/, ''))})\n` +
@@ -1047,11 +1115,39 @@ bot.action('admin_page:suspensions', async (ctx) => {
     `   Device: ${escapeTelegramMarkdown(r.deviceLost)}${r.details ? `\n   Details: ${escapeTelegramMarkdown(r.details.slice(0, 100))}` : ''}`
   ).join('\n\n');
 
-  const text =
-    `🚨 *Device Suspension Requests* — ${total[0]?.count || 0} total\n\n` +
-    (list || 'No requests yet.');
+  const text = `🚨 *Suspensions* (page 1) — ${total[0]?.count || 0} total\n\n${list || 'No requests yet.'}`;
 
-  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  const navButtons = [];
+  if (Number(total[0]?.count || 0) > SUSP_PER_PAGE) navButtons.push(Markup.button.callback('➡️ Next', 'admin_suspensions_page:1'));
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([navButtons, [Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_suspensions_page:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const page = parseInt(ctx.match[1], 10);
+  const offset = page * SUSP_PER_PAGE;
+
+  const total = await db.select({ count: sql`count(*)` }).from(deviceSuspensionRequests);
+  const reqs = await db.select().from(deviceSuspensionRequests).orderBy(sql`${deviceSuspensionRequests.createdAt} desc`).limit(SUSP_PER_PAGE).offset(offset);
+
+  let list = reqs.map((r, i) =>
+    `${offset + i + 1}. *${escapeTelegramMarkdown(r.fullName)}* (@${escapeTelegramMarkdown(r.handle.replace(/^@/, ''))})\n` +
+    `   📧 ${escapeTelegramMarkdown(r.email)} | 📱 ${escapeTelegramMarkdown(r.phone)}\n` +
+    `   Device: ${escapeTelegramMarkdown(r.deviceLost)}${r.details ? `\n   Details: ${escapeTelegramMarkdown(r.details.slice(0, 100))}` : ''}`
+  ).join('\n\n');
+
+  const totalCount = Number(total[0]?.count || 0);
+  const text = `🚨 *Suspensions* (page ${page + 1}) — ${totalCount} total\n\n${list || 'No more requests.'}`;
+
+  const navButtons = [];
+  if (page > 0) navButtons.push(Markup.button.callback('⬅️ Prev', `admin_suspensions_page:${page - 1}`));
+  if (totalCount > offset + SUSP_PER_PAGE) navButtons.push(Markup.button.callback('➡️ Next', `admin_suspensions_page:${page + 1}`));
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([navButtons, [Markup.button.callback('◀️ Back', 'admin_back')]]) });
   await ctx.answerCbQuery();
 });
 
