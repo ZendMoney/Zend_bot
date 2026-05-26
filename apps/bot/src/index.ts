@@ -960,7 +960,7 @@ bot.action('admin_page:overview', async (ctx) => {
   const activeFeatures = await db.select().from(botFeatures).where(eq(botFeatures.isActive, true));
 
   const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
-  const newToday = await db.select({ count: sql`count(*)` }).from(users).where(sql`${users.createdAt} >= ${todayStart}`);
+  const newToday = await db.select({ count: sql`count(*)` }).from(users).where(sql`${users.createdAt} >= ${todayStart.toISOString()}`);
 
   const text =
     `📊 *Overview*\n\n` +
