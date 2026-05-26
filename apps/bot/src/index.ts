@@ -996,7 +996,7 @@ bot.action('admin_page:users', async (ctx) => {
   }).from(users).orderBy(sql`${users.createdAt} desc`).limit(10);
 
   let userList = recentUsers.map(u =>
-    `- ${u.name}${u.username ? ` (@${u.username})` : ''} | \`${u.wallet?.slice(0, 6)}...${u.wallet?.slice(-4)}\``
+    `- ${escapeTelegramMarkdown(u.name || 'Unknown')}${u.username ? ` (@${escapeTelegramMarkdown(u.username.replace(/^@/, ''))})` : ''} | \`${u.wallet?.slice(0, 6)}...${u.wallet?.slice(-4)}\``
   ).join('\n');
 
   const text =
@@ -1020,8 +1020,8 @@ bot.action('admin_page:ambassadors', async (ctx) => {
   const apps = await db.select().from(ambassadorApplications).orderBy(sql`${ambassadorApplications.createdAt} desc`).limit(20);
 
   let list = apps.map((a, i) =>
-    `${i + 1}. *${a.name}* (@${a.tgHandle})\n` +
-    `   Student: ${a.isStudent} | Focus: ${a.focus}`
+    `${i + 1}. *${escapeTelegramMarkdown(a.name)}* (@${escapeTelegramMarkdown(a.tgHandle.replace(/^@/, ''))})\n` +
+    `   Student: ${escapeTelegramMarkdown(a.isStudent)} | Focus: ${escapeTelegramMarkdown(a.focus)}`
   ).join('\n\n');
 
   const text =
@@ -1042,9 +1042,9 @@ bot.action('admin_page:suspensions', async (ctx) => {
   const reqs = await db.select().from(deviceSuspensionRequests).orderBy(sql`${deviceSuspensionRequests.createdAt} desc`).limit(20);
 
   let list = reqs.map((r, i) =>
-    `${i + 1}. *${r.fullName}* (@${r.handle})\n` +
-    `   📧 ${r.email} | 📱 ${r.phone}\n` +
-    `   Device: ${r.deviceLost}${r.details ? `\n   Details: ${r.details.slice(0, 100)}` : ''}`
+    `${i + 1}. *${escapeTelegramMarkdown(r.fullName)}* (@${escapeTelegramMarkdown(r.handle.replace(/^@/, ''))})\n` +
+    `   📧 ${escapeTelegramMarkdown(r.email)} | 📱 ${escapeTelegramMarkdown(r.phone)}\n` +
+    `   Device: ${escapeTelegramMarkdown(r.deviceLost)}${r.details ? `\n   Details: ${escapeTelegramMarkdown(r.details.slice(0, 100))}` : ''}`
   ).join('\n\n');
 
   const text =
