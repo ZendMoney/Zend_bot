@@ -228,11 +228,60 @@ const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_K
 
 const MIN_SOL_FOR_GAS = 0.0005; // base tx fee buffer
 const ATA_RENT_SOL = 0.002039; // rent to create an Associated Token Account
-const GAS_SPONSORSHIP_FEE_BPS = 50; // 0.5% extra for gasless users
+// Fee structure:
+// - Normal (user has SOL): 1% fee, capped at $2
+// - Funded (user has no SOL, we cover gas): 1.5% fee, capped at $3
+const ZEND_FEE_NORMAL_BPS = 100;
+const ZEND_FEE_FUNDED_BPS = 150;
+const ZEND_FEE_NORMAL_CAP_USDT = 2;
+const ZEND_FEE_FUNDED_CAP_USDT = 3;
 
 /** Calculate exact SOL a user needs for a send (fees + optional ATA rent). */
 function calcRequiredSol(feeSol: number, needsAta: boolean): number {
   return feeSol + MIN_SOL_FOR_GAS + (needsAta ? ATA_RENT_SOL : 0);
+}
+
+/**
+ * Calculate the appropriate Zend fee based on user's SOL balance.
+ * Normal (has SOL): 1% capped at $2
+ * Funded (no SOL): 1.5% capped at $3 (includes gas sponsorship cost)
+ */
+async function calculateSendFee(
+  transferUsdt: number,
+  userWalletAddress: string
+): Promise<{
+  zendFeeUsdt: number;
+  feeSol: number;
+  feeBps: number;
+  willFundSol: boolean;
+}> {
+  const solPrice = await getSolPriceInUsdt();
+  
+  // Normal fee: 1%, cap $2
+  const normalFeeUsdt = Math.min(transferUsdt * (ZEND_FEE_NORMAL_BPS / 10000), ZEND_FEE_NORMAL_CAP_USDT);
+  const normalFeeSol = normalFeeUsdt / solPrice;
+  const normalRequired = normalFeeSol + MIN_SOL_FOR_GAS;
+  const solBalance = await walletService.getSolBalance(userWalletAddress);
+  
+  if (solBalance >= normalRequired) {
+    return {
+      zendFeeUsdt: normalFeeUsdt,
+      feeSol: normalFeeSol,
+      feeBps: ZEND_FEE_NORMAL_BPS,
+      willFundSol: false,
+    };
+  }
+  
+  // Funded fee: 1.5%, cap $3
+  const fundedFeeUsdt = Math.min(transferUsdt * (ZEND_FEE_FUNDED_BPS / 10000), ZEND_FEE_FUNDED_CAP_USDT);
+  const fundedFeeSol = fundedFeeUsdt / solPrice;
+  
+  return {
+    zendFeeUsdt: fundedFeeUsdt,
+    feeSol: fundedFeeSol,
+    feeBps: ZEND_FEE_FUNDED_BPS,
+    willFundSol: true,
+  };
 }
 
 /** Get dev wallet SOL balance (for gas sponsorship health checks). */
@@ -1075,6 +1124,9 @@ async function executeBulkSend(
 ): Promise<void> {
   const loading = await showLoading(ctx, `Executing ${recipients.length} transfers...`);
 
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  const walletAddress = user[0]?.walletAddress;
+
   const pajClient = await getPAJClient();
   let rate = 1550;
   try {
@@ -1084,14 +1136,17 @@ async function executeBulkSend(
     }
   } catch { /* fallback */ }
 
-  const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
   const results: Array<{ success: boolean; recipient: string; amountNgn: number; error?: string; txId?: string }> = [];
 
   for (let i = 0; i < recipients.length; i++) {
     const r = recipients[i];
     const transferUsdt = r.amountNgn / rate;
-    const zendFeeUsdt = transferUsdt * (zendFeeBps / 10000);
-    const amountUsdt = transferUsdt + zendFeeUsdt;
+
+    // Calculate per-recipient fee based on current SOL balance
+    const feeInfo = walletAddress
+      ? await calculateSendFee(transferUsdt, walletAddress)
+      : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
+    const amountUsdt = transferUsdt + feeInfo.zendFeeUsdt;
 
     await updateLoading(ctx, loading.message_id, `Transfer ${i + 1}/${recipients.length}: ${r.accountName}...`);
 
@@ -1100,7 +1155,8 @@ async function executeBulkSend(
         amountNgn: r.amountNgn,
         amountUsdt,
         ngnRate: rate,
-        zendFeeUsdt,
+        zendFeeUsdt: feeInfo.zendFeeUsdt,
+        feeSol: feeInfo.feeSol,
         recipientBankCode: r.bankCode,
         recipientBankName: r.bankName,
         recipientAccountNumber: r.accountNumber,
@@ -3200,24 +3256,30 @@ bot.on(message('text'), async (ctx, next) => {
       }
     } catch { /* fallback */ }
 
-    const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
+    // Calculate per-recipient fees based on user's SOL balance
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    const walletAddress = user[0]?.walletAddress;
+
     let totalUsdt = 0;
     let totalFeeUsdt = 0;
+    let anyFunded = false;
     for (const r of recipients) {
       const transferUsdt = r.amountNgn / rate;
-      const feeUsdt = transferUsdt * (zendFeeBps / 10000);
+      const feeInfo = walletAddress
+        ? await calculateSendFee(transferUsdt, walletAddress)
+        : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
       totalUsdt += transferUsdt;
-      totalFeeUsdt += feeUsdt;
+      totalFeeUsdt += feeInfo.zendFeeUsdt;
+      if (feeInfo.willFundSol) anyFunded = true;
     }
     const grandTotalUsdt = totalUsdt + totalFeeUsdt;
 
     // Check total balance
-    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     let balanceOk = true;
     let balanceMsg = '';
-    if (user[0]?.walletAddress) {
-      const tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
-      const solBalance = await walletService.getSolBalance(user[0].walletAddress);
+    if (walletAddress) {
+      const tokenBalance = await walletService.getTokenBalance(walletAddress, SOLANA_TOKENS.USDT.mint);
+      const solBalance = await walletService.getSolBalance(walletAddress);
       const solPrice = await getSolPriceInUsdt();
       const feeSol = totalFeeUsdt / solPrice;
 
@@ -3230,13 +3292,17 @@ bot.on(message('text'), async (ctx, next) => {
       }
     }
 
+    const feeRateText = anyFunded
+      ? `1.5% (includes gas) capped at $3`
+      : `1% capped at $2`;
+
     let summary =
       `📦 *Bulk Send Summary*\n\n` +
       `Recipients: ${recipients.length}\n` +
       `Total NGN: ₦${totalNgn.toLocaleString()}\n` +
       `Rate: ₦${rate.toLocaleString()} / USDT\n` +
       `Transfer: ${totalUsdt.toFixed(2)} USDT\n` +
-      `Zend Fee: ${totalFeeUsdt.toFixed(2)} USDT\n` +
+      `Zend Fee: ${totalFeeUsdt.toFixed(2)} USDT (${feeRateText})\n` +
       `Grand Total: ${grandTotalUsdt.toFixed(2)} USDT\n\n` +
       `*Recipients:*\n`;
 
@@ -3682,25 +3748,26 @@ bot.on(message('text'), async (ctx, next) => {
       console.log('Using fallback rate');
     }
 
-    const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
-    const zendFeeUsdt = (amount / rate) * (zendFeeBps / 10000);
-    const usdtNeeded = (amount / rate) + zendFeeUsdt;
-    const solPrice = await getSolPriceInUsdt();
-    const feeSol = zendFeeUsdt / solPrice;
+    const transferUsdt = amount / rate;
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    const feeInfo = user[0]?.walletAddress
+      ? await calculateSendFee(transferUsdt, user[0].walletAddress)
+      : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
+    const usdtNeeded = transferUsdt + feeInfo.zendFeeUsdt;
 
     session.pendingTransaction = {
       ...session.pendingTransaction,
       amountNgn: amount,
       amountUsdt: usdtNeeded,
-      zendFeeUsdt,
-      feeSol,
+      zendFeeUsdt: feeInfo.zendFeeUsdt,
+      feeSol: feeInfo.feeSol,
     };
     session.state = ConversationState.AWAITING_SEND_RECIPIENT;
     setSession(userId, session);
 
     let msg = `📤 Send ${formatNgn(amount)}\n` +
       `Rate: ${formatNgn(rate)} per Dollar\n` +
-      `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${feeSol.toFixed(6)} SOL (~${zendFeeUsdt.toFixed(2)} USDT)\n` +
+      `Zend fee (${(feeInfo.feeBps / 100).toFixed(2)}%${feeInfo.willFundSol ? ' includes gas' : ''}): ${feeInfo.feeSol.toFixed(6)} SOL (~${feeInfo.zendFeeUsdt.toFixed(2)} USDT)\n` +
       `You pay: *${usdtNeeded.toFixed(2)} USDT*\n\n` +
       `Who should receive it?\n\n` +
       `Just tell me naturally — e.g. "Mark OPay 7082406410" or "send to Amaka at GTB 0123456789"`;
@@ -3854,9 +3921,8 @@ bot.on(message('text'), async (ctx, next) => {
       confirmMsg += `⚠️ *Could not verify account* — please double-check details\n`;
     }
 
-    const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
     const feeLine = session.pendingTransaction?.feeSol
-      ? `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${session.pendingTransaction.feeSol.toFixed(6)} SOL (~${session.pendingTransaction.zendFeeUsdt?.toFixed(2)} USDT)\n`
+      ? `Zend fee: ${session.pendingTransaction.feeSol.toFixed(6)} SOL (~${session.pendingTransaction.zendFeeUsdt?.toFixed(2)} USDT)\n`
       : '';
 
     const menuFromMint = session.pendingTransaction?.fromMint || SOLANA_TOKENS.USDT.mint;
@@ -3983,17 +4049,16 @@ bot.on(message('text'), async (ctx, next) => {
                            SOLANA_TOKENS.USDT.mint;
         const fromTokenInfo = Object.values(SOLANA_TOKENS).find(t => t.mint === fromMint) || SOLANA_TOKENS.USDT;
 
-        const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
-        const zendFeeUsdt = (parsed.amount / rate) * (zendFeeBps / 10000);
-        const usdtNeeded = (parsed.amount / rate) + zendFeeUsdt;
-        const solPrice = await getSolPriceInUsdt();
-        const feeSol = zendFeeUsdt / solPrice;
+        const transferUsdt = parsed.amount / rate;
+        const feeInfo = user[0]?.walletAddress
+          ? await calculateSendFee(transferUsdt, user[0].walletAddress)
+          : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
+        const usdtNeeded = transferUsdt + feeInfo.zendFeeUsdt;
 
         // ─── Check wallet balance before showing confirmation ───
         if (user[0]?.walletAddress) {
           const tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, fromMint);
           const solBalance = await walletService.getSolBalance(user[0].walletAddress);
-          const transferUsdt = parsed.amount / rate;
           if (tokenBalance < transferUsdt) {
             const shortfall = transferUsdt - tokenBalance;
             await ctx.reply(
@@ -4007,10 +4072,10 @@ bot.on(message('text'), async (ctx, next) => {
             );
             return;
           }
-          if (solBalance < feeSol + MIN_SOL_FOR_GAS) {
+          if (!feeInfo.willFundSol && solBalance < feeInfo.feeSol + MIN_SOL_FOR_GAS) {
             await ctx.reply(
               `❌ *Insufficient SOL for fee*\n\n` +
-              `Fee: ${feeSol.toFixed(6)} SOL\n` +
+              `Fee: ${feeInfo.feeSol.toFixed(6)} SOL\n` +
               `Gas: ~${MIN_SOL_FOR_GAS} SOL\n` +
               `You have: ${solBalance.toFixed(6)} SOL\n\n` +
               `Top up your SOL balance first.`,
@@ -4039,8 +4104,8 @@ bot.on(message('text'), async (ctx, next) => {
         session.pendingTransaction = {
           amountNgn: parsed.amount,
           amountUsdt: usdtNeeded,
-          zendFeeUsdt,
-          feeSol,
+          zendFeeUsdt: feeInfo.zendFeeUsdt,
+          feeSol: feeInfo.feeSol,
           fromMint,
           recipientName: verifiedName,
           recipientAccountName: verifiedName,
@@ -4068,7 +4133,7 @@ bot.on(message('text'), async (ctx, next) => {
           `Bank: ${md(parsed.bankName) || 'Solana'}\n` +
           `Account: \`${parsed.accountNumber || parsed.walletAddress}\`\n` +
           `Amount: ${formatNgn(parsed.amount)}\n` +
-          `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${feeSol.toFixed(6)} SOL (~${zendFeeUsdt.toFixed(2)} USDT)\n` +
+          `Zend fee (${(feeInfo.feeBps / 100).toFixed(2)}%${feeInfo.willFundSol ? ' includes gas' : ''}): ${feeInfo.feeSol.toFixed(6)} SOL (~${feeInfo.zendFeeUsdt.toFixed(2)} USDT)\n` +
           `You pay: *${usdtNeeded.toFixed(2)} ${fromSymbol}*\n` +
           `Rate: ${formatNgn(rate)} per Dollar\n\n` +
           `Confirm?`;
@@ -5123,15 +5188,10 @@ async function executeSendCore(
         }
       }
 
-      // Pre-calculate potential sponsorship fee so fundSolIfNeeded reserves enough SOL
-      const solPrice = await getSolPriceInUsdt();
-      const potentialSponsorshipFeeSol = (txData.amountUsdt * (GAS_SPONSORSHIP_FEE_BPS / 10000)) / solPrice;
-      const maxFeeSol = (txData.feeSol || 0) + potentialSponsorshipFeeSol;
-
       // Gas sponsorship: top up exact shortfall (including ATA rent if needed)
       const { funded, gasSponsored, shortfall, error: fundError } = await fundSolIfNeeded(
         user[0].walletAddress,
-        maxFeeSol,
+        txData.feeSol || 0,
         order.address,
         pajMint
       );
@@ -5143,13 +5203,9 @@ async function executeSendCore(
         );
       }
 
-      // Calculate total fee in SOL (Zend fee + gas sponsorship fee if dev funded)
+      // Calculate total fee in SOL
       const feeWallet = process.env.ZEND_FEE_WALLET;
-      let totalFeeSol = txData.feeSol || 0;
-      if (gasSponsored) {
-        totalFeeSol += potentialSponsorshipFeeSol;
-        console.log('[Gas] Sponsorship fee added:', potentialSponsorshipFeeSol.toFixed(6), 'SOL. Total fee:', totalFeeSol.toFixed(6), 'SOL');
-      }
+      const totalFeeSol = txData.feeSol || 0;
 
       // Check token balance covers transfer
       if (tokenBalance < order.amount) {
@@ -5357,7 +5413,7 @@ async function executeSwap(
         if (feeWallet) {
           try {
             const solPrice = await getSolPriceInUsdt();
-            const sponsorshipFeeSol = (outAmount * (GAS_SPONSORSHIP_FEE_BPS / 10000)) / solPrice;
+            const sponsorshipFeeSol = (outAmount * 0.0005) / solPrice;
             await walletService.sendSol(keypair, feeWallet, sponsorshipFeeSol);
             console.log('[Gas] Local swap sponsorship fee collected:', sponsorshipFeeSol.toFixed(6), 'SOL');
           } catch (feeErr: any) {
@@ -5382,7 +5438,7 @@ async function executeSwap(
         if (feeWallet) {
           try {
             const solPrice = await getSolPriceInUsdt();
-            const sponsorshipFeeSol = (outAmount * (GAS_SPONSORSHIP_FEE_BPS / 10000)) / solPrice;
+            const sponsorshipFeeSol = (outAmount * 0.0005) / solPrice;
             await walletService.sendSol(keypair, feeWallet, sponsorshipFeeSol);
             console.log('[Gas] Swap sponsorship fee collected:', sponsorshipFeeSol.toFixed(6), 'SOL');
           } catch (feeErr: any) {
@@ -5517,18 +5573,21 @@ async function prepareSendConfirmation(
     console.log('Using fallback rate for send confirmation');
   }
 
-  const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
-  const zendFeeUsdt = (amountNgn / rate) * (zendFeeBps / 10000);
-  const usdtNeeded = (amountNgn / rate) + zendFeeUsdt;
-  const solPrice = await getSolPriceInUsdt();
-  const feeSol = zendFeeUsdt / solPrice;
+  const transferUsdt = amountNgn / rate;
+
+  // ─── Calculate fee based on SOL balance ───
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  let feeInfo = { zendFeeUsdt: 0, feeSol: 0, feeBps: 100, willFundSol: false };
+  if (user[0]?.walletAddress) {
+    feeInfo = await calculateSendFee(transferUsdt, user[0].walletAddress);
+  }
+  const { zendFeeUsdt, feeSol, feeBps, willFundSol } = feeInfo;
+  const usdtNeeded = transferUsdt + zendFeeUsdt;
 
   // ─── Check wallet balance before showing confirmation ───
-  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
   if (user[0]?.walletAddress) {
     const tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, selectedMint);
     const solBalance = await walletService.getSolBalance(user[0].walletAddress);
-    const transferUsdt = amountNgn / rate;
     if (selectedMint === SOLANA_TOKENS.AUDD.mint) {
       // For AUDD, just check they have some — actual swap check happens in executeSendCore
       if (tokenBalance <= 0) {
@@ -5553,7 +5612,8 @@ async function prepareSendConfirmation(
       );
       return;
     }
-    if (solBalance < feeSol + MIN_SOL_FOR_GAS) {
+    if (!willFundSol && solBalance < feeSol + MIN_SOL_FOR_GAS) {
+      // This shouldn't happen if calculateSendFee is correct, but guard anyway
       await ctx.reply(
         `❌ *Insufficient SOL for fee*\n\n` +
         `Fee: ${feeSol.toFixed(6)} SOL\n` +
@@ -5614,7 +5674,7 @@ async function prepareSendConfirmation(
     `Bank: ${md(bankName)}\n` +
     `Account: \`${recipientAccountNumber}\`\n` +
     `Amount: ${formatNgn(amountNgn)}\n` +
-    `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${feeSol.toFixed(6)} SOL (~${zendFeeUsdt.toFixed(2)} USDT)\n` +
+    `Zend fee (${(feeBps / 100).toFixed(2)}%${willFundSol ? ' includes gas' : ''}): ${feeSol.toFixed(6)} SOL (~${zendFeeUsdt.toFixed(2)} USDT)\n` +
     `You pay: *${usdtNeeded.toFixed(2)} ${selectedSymbol}*\n` +
     `Rate: ${formatNgn(rate)} per Dollar\n\n` +
     `Confirm?`;
@@ -7391,13 +7451,22 @@ async function runScheduledTransfers() {
           rate = rates.offRampRate;
         } catch (e) { /* use fallback */ }
 
-        const amountUsdt = Number(s.amountNgn) / rate;
+        const transferUsdt = Number(s.amountNgn) / rate;
+
+        // Calculate fee for scheduled transfer
+        const userRow = await db.select().from(users).where(eq(users.id, s.userId)).limit(1);
+        const feeInfo = userRow[0]?.walletAddress
+          ? await calculateSendFee(transferUsdt, userRow[0].walletAddress)
+          : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
+        const amountUsdt = transferUsdt + feeInfo.zendFeeUsdt;
 
         // Auto-execute the transfer
         const result = await executeSendCore(s.userId, {
           amountNgn: Number(s.amountNgn),
           amountUsdt,
           ngnRate: rate,
+          zendFeeUsdt: feeInfo.zendFeeUsdt,
+          feeSol: feeInfo.feeSol,
           recipientBankCode: acc.bankCode,
           recipientBankName: acc.bankName,
           recipientAccountNumber: acc.accountNumber,
