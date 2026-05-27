@@ -641,3 +641,94 @@ export async function analyzeVoiceWithKimi(text: string): Promise<VoiceAnalysis 
     return null;
   }
 }
+
+// ─── Bulk Send Parser ───
+
+const BULK_SEND_BANK_CODES = [
+  'GTB','UBA','ACC','ZEN','FBN','ECO','WEM','FID','SKY','STA','UNI',
+  'KEC','JAB','TIT','GLO','PRO','SUN','PAR','COR','FSD','RAN','NOV',
+  'OPY','MON','KUD','PAL','PAG','VFD','CAR','BRA','FAI','FCMB','HER','STE','UNI'
+];
+
+const BULK_PARSE_PROMPT = `You are a Nigerian payment parser. Extract recipients from the user's bulk transfer text.
+
+For each recipient, extract:
+- amount_ngn: number (parse '50k' as 50000, '1.5k' as 1500, '₦2000' as 2000)
+- bank_code: 3-letter code from this list: ${BULK_SEND_BANK_CODES.join(', ')}
+- account_number: exactly 10 digits
+- account_name: full name of recipient
+
+Bank name mapping:
+GTBank/Guaranty Trust → GTB
+UBA/United Bank → UBA
+Access Bank → ACC
+Zenith Bank → ZEN
+First Bank → FBN
+Ecobank → ECO
+Wema Bank → WEM
+Fidelity Bank → FID
+Polaris Bank/Skye → SKY
+Stanbic IBTC → STA
+Union Bank → UNI
+Keystone Bank → KEC
+Jaiz Bank → JAB
+Titan Trust → TIT
+Globus Bank → GLO
+Providus Bank → PRO
+SunTrust → SUN
+Parallex Bank → PAR
+Coronation Merchant → COR
+FSDH Merchant → FSD
+Rand Merchant → RAN
+Nova Merchant → NOV
+OPay → OPY
+Moniepoint → MON
+Kuda → KUD
+PalmPay → PAL
+Paga → PAG
+VFD Microfinance → VFD
+Carbon → CAR
+Branch → BRA
+Fairmoney → FAI
+FCMB → FCMB
+Heritage → HER
+Sterling → STE
+
+Return ONLY a JSON array. No explanation, no markdown.
+[
+  {"amount_ngn":50000,"bank_code":"GTB","account_number":"0123456789","account_name":"John Doe"}
+]
+
+If you cannot parse a line, return null for that entry or omit it.`;
+
+export interface BulkRecipient {
+  amount_ngn: number;
+  bank_code: string;
+  account_number: string;
+  account_name: string;
+}
+
+export async function parseBulkSendWithAI(text: string): Promise<BulkRecipient[] | null> {
+  const content = await callKimi(BULK_PARSE_PROMPT, text, 0.1, 800);
+  if (!content) return null;
+  try {
+    const clean = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const parsed = JSON.parse(clean);
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter((r: any) =>
+      r &&
+      typeof r.amount_ngn === 'number' && r.amount_ngn >= 100 &&
+      typeof r.bank_code === 'string' && BULK_SEND_BANK_CODES.includes(r.bank_code.toUpperCase()) &&
+      typeof r.account_number === 'string' && /^\d{10}$/.test(r.account_number) &&
+      typeof r.account_name === 'string' && r.account_name.length >= 2
+    ).map((r: any) => ({
+      amount_ngn: Math.round(r.amount_ngn),
+      bank_code: r.bank_code.toUpperCase(),
+      account_number: r.account_number,
+      account_name: r.account_name.trim(),
+    }));
+  } catch (err) {
+    console.error('[BulkSend] AI parse failed:', err);
+    return null;
+  }
+}

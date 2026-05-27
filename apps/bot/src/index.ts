@@ -20,7 +20,7 @@ import { users, transactions, savedBankAccounts, scheduledTransfers, bitrefillOr
 import { eq, sql, and, desc } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
 import { BitRefillClient } from '@zend/bitrefill-client';
-import { parseCommand, transcribeVoice, chatWithKimi, analyzeVoiceWithKimi, parseMenuInputWithAI, type ParsedCommand } from './services/nlp.js';
+import { parseCommand, transcribeVoice, chatWithKimi, analyzeVoiceWithKimi, parseMenuInputWithAI, parseBulkSendWithAI, type ParsedCommand } from './services/nlp.js';
 import type { PAJClient } from '@zend/paj-client';
 import {
   ConversationState,
@@ -3136,37 +3136,53 @@ bot.on(message('text'), async (ctx, next) => {
 
   // ─── BULK SEND: AWAITING_BULK_SEND_INPUT ───
   if (session.state === ConversationState.AWAITING_BULK_SEND_INPUT) {
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-    if (lines.length === 0) {
+    const rawText = text.trim();
+    if (!rawText) {
       await ctx.reply('❌ No recipients found. Please paste at least one recipient.', cancelKeyboard);
       return;
     }
 
-    const recipients: Array<{ amountNgn: number; bankCode: string; bankName: string; accountNumber: string; accountName: string }> = [];
-    const errors: string[] = [];
+    // Try AI parsing first
+    const aiRecipients = await parseBulkSendWithAI(rawText);
 
-    for (let i = 0; i < lines.length; i++) {
-      const parsed = parseBulkRecipient(lines[i]);
-      if (parsed) {
-        recipients.push(parsed);
-      } else {
-        errors.push(`Line ${i + 1}: "${lines[i].slice(0, 40)}" — invalid format`);
+    let recipients: Array<{ amountNgn: number; bankCode: string; bankName: string; accountNumber: string; accountName: string }> = [];
+    let usedAI = false;
+
+    if (aiRecipients && aiRecipients.length > 0) {
+      usedAI = true;
+      for (const r of aiRecipients) {
+        const bank = NIGERIAN_BANKS.find(b => b.code === r.bank_code);
+        if (bank) {
+          recipients.push({
+            amountNgn: r.amount_ngn,
+            bankCode: r.bank_code,
+            bankName: bank.name,
+            accountNumber: r.account_number,
+            accountName: r.account_name,
+          });
+        }
       }
     }
 
-    if (errors.length > 0) {
-      await ctx.reply(
-        `❌ *Parse Errors*\n\n` +
-        errors.join('\n') +
-        `\n\n` +
-        `\`AMOUNT BANK_CODE ACCOUNT_NUMBER ACCOUNT_NAME\``,
-        { parse_mode: 'Markdown', ...cancelKeyboard }
-      );
-      return;
+    // Fallback to strict parser if AI returned nothing
+    if (recipients.length === 0) {
+      const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
+      for (const line of lines) {
+        const parsed = parseBulkRecipient(line);
+        if (parsed) recipients.push(parsed);
+      }
     }
 
     if (recipients.length === 0) {
-      await ctx.reply('❌ Could not parse any valid recipients. Please check your format.', cancelKeyboard);
+      await ctx.reply(
+        `❌ Could not parse any valid recipients.\n\n` +
+        `Try describing each recipient naturally, e.g.:\n` +
+        `\`Send 50k to John Doe at GTBank 0123456789\`\n` +
+        `\`₦30,000 to Jane Smith UBA 9876543210\`\n\n` +
+        `Or use the strict format:\n` +
+        `\`AMOUNT BANK_CODE ACCOUNT_NUMBER ACCOUNT_NAME\``,
+        { parse_mode: 'Markdown', ...cancelKeyboard }
+      );
       return;
     }
 
