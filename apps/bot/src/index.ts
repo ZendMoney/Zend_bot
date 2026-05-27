@@ -78,7 +78,7 @@ interface ZendSession {
     swapPriceImpact?: number;
     isLocalSwap?: boolean;
   }>;
-  pinVerifyAction?: 'send' | 'swap' | 'export' | 'schedule';
+  pinVerifyAction?: 'send' | 'swap' | 'export' | 'schedule' | 'bulk_send';
   pajContact?: string; // email/phone pending OTP
   onrampAmount?: number; // pending on-ramp amount in NGN
   onrampTargetToken?: 'USDT' | 'AUDD'; // which token the on-ramp should credit
@@ -755,7 +755,7 @@ async function verifyBankAccount(
 const mainMenu = Markup.keyboard([
   ['💰 Balance', '📤 Send', '🔄 Swap'],
   ['📥 Receive', '🎁 Shop', '📋 History'],
-  ['⚙️ Settings', '🌐 Community'],
+  ['📦 Bulk Send', '⚙️ Settings', '🌐 Community'],
 ]).resize();
 
 const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
@@ -908,7 +908,7 @@ function isGroupChat(ctx: ZendContext): boolean {
 }
 
 function getBotUsername(ctx: ZendContext): string {
-  return ctx.botInfo?.username || 'ZendBot';
+  return ctx.botInfo?.username || 'zend_money_bot';
 }
 
 async function promptPrivateChat(ctx: ZendContext, action: string) {
@@ -999,7 +999,7 @@ bot.command('myref', async (ctx) => {
   if (amb.customReferralCode) {
     text +=
       `🔗 *Your Referral Link*\n` +
-      `\`t.me/ZendBot?start=${amb.customReferralCode}\`\n\n`;
+      `\`t.me/zend_money_bot?start=${amb.customReferralCode}\`\n\n`;
   }
 
   text +=
@@ -1012,6 +1012,168 @@ bot.command('myref', async (ctx) => {
     `💡 Only users who sign up *and complete a transaction* count as active.`;
 
   await ctx.reply(text, { parse_mode: 'Markdown' });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// /BULKSEND — Batch Send to Multiple Recipients
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function startBulkSend(ctx: ZendContext, userId: string) {
+  setSession(userId, { state: ConversationState.AWAITING_BULK_SEND_INPUT, pendingTransaction: { bulkRecipients: [] } as any });
+  await ctx.reply(
+    `📦 *Bulk Send*\n\n` +
+    `Send money to multiple people at once.\n\n` +
+    `Paste your recipient list. One per line, format:\n` +
+    `\`AMOUNT BANK_CODE ACCOUNT_NUMBER ACCOUNT_NAME\`\n\n` +
+    `*Example:*\n` +
+    `\`\`\`\n` +
+    `50000 GTB 0123456789 John Doe\n` +
+    `30000 UBA 9876543210 Jane Smith\n` +
+    `25000 OPY 1234567890 Mike Johnson\n` +
+    `\`\`\`\n\n` +
+    `Supported banks: GTB, UBA, ACC, ZEN, FBN, ECO, OPY, KUD, MON, etc.`,
+    { parse_mode: 'Markdown', ...cancelKeyboard }
+  );
+}
+
+bot.command('bulksend', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  await startBulkSend(ctx, userId);
+});
+
+bot.hears('📦 Bulk Send', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  await startBulkSend(ctx, userId);
+});
+
+// ─── Parse bulk recipient line ───
+function parseBulkRecipient(line: string): { amountNgn: number; bankCode: string; bankName: string; accountNumber: string; accountName: string } | null {
+  const tokens = line.trim().split(/\s+/);
+  if (tokens.length < 4) return null;
+
+  const amount = parseInt(tokens[0].replace(/[^0-9]/g, ''), 10);
+  if (!amount || amount < 100) return null;
+
+  const bankCodeInput = tokens[1].toUpperCase();
+  const bank = NIGERIAN_BANKS.find(b => b.code === bankCodeInput);
+  if (!bank) return null;
+
+  const accountNumber = tokens[2];
+  if (!/^\d{10}$/.test(accountNumber)) return null;
+
+  const accountName = tokens.slice(3).join(' ');
+  if (accountName.length < 2) return null;
+
+  return { amountNgn: amount, bankCode: bank.code, bankName: bank.name, accountNumber, accountName };
+}
+
+// ─── Execute bulk send ───
+async function executeBulkSend(
+  ctx: ZendContext,
+  userId: string,
+  recipients: Array<{ amountNgn: number; bankCode: string; bankName: string; accountNumber: string; accountName: string }>
+): Promise<void> {
+  const loading = await showLoading(ctx, `Executing ${recipients.length} transfers...`);
+
+  const pajClient = await getPAJClient();
+  let rate = 1550;
+  try {
+    if (pajClient) {
+      const rates = await getPAJRates();
+      rate = rates.offRampRate;
+    }
+  } catch { /* fallback */ }
+
+  const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
+  const results: Array<{ success: boolean; recipient: string; amountNgn: number; error?: string; txId?: string }> = [];
+
+  for (let i = 0; i < recipients.length; i++) {
+    const r = recipients[i];
+    const transferUsdt = r.amountNgn / rate;
+    const zendFeeUsdt = transferUsdt * (zendFeeBps / 10000);
+    const amountUsdt = transferUsdt + zendFeeUsdt;
+
+    await updateLoading(ctx, loading.message_id, `Transfer ${i + 1}/${recipients.length}: ${r.accountName}...`);
+
+    try {
+      const result = await executeSendCore(userId, {
+        amountNgn: r.amountNgn,
+        amountUsdt,
+        ngnRate: rate,
+        zendFeeUsdt,
+        recipientBankCode: r.bankCode,
+        recipientBankName: r.bankName,
+        recipientAccountNumber: r.accountNumber,
+        recipientAccountName: r.accountName,
+        recipientName: r.accountName,
+      });
+
+      results.push({
+        success: result.success,
+        recipient: r.accountName,
+        amountNgn: r.amountNgn,
+        txId: result.txId,
+        error: result.error,
+      });
+    } catch (err: any) {
+      results.push({
+        success: false,
+        recipient: r.accountName,
+        amountNgn: r.amountNgn,
+        error: err.message || 'Transfer failed',
+      });
+    }
+  }
+
+  const successCount = results.filter(r => r.success).length;
+  const failCount = results.filter(r => !r.success).length;
+  const totalSent = results.filter(r => r.success).reduce((sum, r) => sum + r.amountNgn, 0);
+
+  let report = `📦 *Bulk Send Complete*\n\n`;
+  report += `✅ Successful: ${successCount}\n`;
+  report += `❌ Failed: ${failCount}\n`;
+  report += `💰 Total Sent: ₦${totalSent.toLocaleString()}\n\n`;
+
+  if (failCount > 0) {
+    report += `*Failed transfers:*\n`;
+    report += results.filter(r => !r.success).map(r =>
+      `• ${escapeTelegramMarkdown(r.recipient)} — ₦${r.amountNgn.toLocaleString()}: ${escapeTelegramMarkdown(r.error || 'Unknown error')}`
+    ).join('\n');
+    report += '\n\n';
+  }
+
+  if (successCount > 0) {
+    report += `*Successful transfers:*\n`;
+    report += results.filter(r => r.success).map(r =>
+      `• ${escapeTelegramMarkdown(r.recipient)} — ₦${r.amountNgn.toLocaleString()}${r.txId ? ` (\`${r.txId}\`)` : ''}`
+    ).join('\n');
+  }
+
+  await finishLoading(ctx, loading.message_id, report, 'Markdown');
+  await ctx.reply('Menu:', mainMenu);
+}
+
+bot.action('bulk_send_confirm', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const session = getSession(userId);
+  const recipients = (session.pendingTransaction as any)?.bulkRecipients as Array<{ amountNgn: number; bankCode: string; bankName: string; accountNumber: string; accountName: string }> | undefined;
+
+  if (!recipients || recipients.length === 0) {
+    await ctx.answerCbQuery('Session expired');
+    await ctx.editMessageText('❌ Session expired. Please start over.', mainMenu);
+    return;
+  }
+
+  setSession(userId, { state: ConversationState.IDLE });
+  await ctx.answerCbQuery('Executing...');
+  await executeBulkSend(ctx, userId, recipients);
+});
+
+bot.action('bulk_send_cancel', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  setSession(userId, { state: ConversationState.IDLE });
+  await ctx.answerCbQuery('Cancelled');
+  await ctx.editMessageText('❌ Bulk send cancelled.', mainMenu);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1521,7 +1683,7 @@ bot.action(/admin_ambassador_detail:(\d+)/, async (ctx) => {
     `*Total Volume:* ₦${totalVolume.toLocaleString()}\n` +
     `*Commission Rate:* ${(rate / 100).toFixed(2)}%\n` +
     `*Est. Commission:* ₦${Math.round(commission).toLocaleString()}\n` +
-    `${amb.customReferralCode ? `*Link:* \`t.me/ZendBot?start=${amb.customReferralCode}\`` : ''}`;
+    `${amb.customReferralCode ? `*Link:* \`t.me/zend_money_bot?start=${amb.customReferralCode}\`` : ''}`;
 
   const buttons = [
     [Markup.button.callback('✏️ Set Code', `admin_set_ambassador_code:${amb.id}`)],
@@ -2966,9 +3128,128 @@ bot.on(message('text'), async (ctx, next) => {
     await ctx.reply(
       `✅ Referral code updated!\n\n` +
       `Ambassador link:\n` +
-      `\`t.me/ZendBot?start=${code}\``,
+      `\`t.me/zend_money_bot?start=${code}\``,
       { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', `admin_ambassador_detail:${ambId}`)]]) }
     );
+    return;
+  }
+
+  // ─── BULK SEND: AWAITING_BULK_SEND_INPUT ───
+  if (session.state === ConversationState.AWAITING_BULK_SEND_INPUT) {
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    if (lines.length === 0) {
+      await ctx.reply('❌ No recipients found. Please paste at least one recipient.', cancelKeyboard);
+      return;
+    }
+
+    const recipients: Array<{ amountNgn: number; bankCode: string; bankName: string; accountNumber: string; accountName: string }> = [];
+    const errors: string[] = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const parsed = parseBulkRecipient(lines[i]);
+      if (parsed) {
+        recipients.push(parsed);
+      } else {
+        errors.push(`Line ${i + 1}: "${lines[i].slice(0, 40)}" — invalid format`);
+      }
+    }
+
+    if (errors.length > 0) {
+      await ctx.reply(
+        `❌ *Parse Errors*\n\n` +
+        errors.join('\n') +\n\n` +
+        `Please fix and try again. Format:\n` +
+        `\`AMOUNT BANK_CODE ACCOUNT_NUMBER ACCOUNT_NAME\``,
+        { parse_mode: 'Markdown', ...cancelKeyboard }
+      );
+      return;
+    }
+
+    if (recipients.length === 0) {
+      await ctx.reply('❌ Could not parse any valid recipients. Please check your format.', cancelKeyboard);
+      return;
+    }
+
+    // Store recipients in session
+    setSession(userId, { state: ConversationState.IDLE, pendingTransaction: { bulkRecipients: recipients } as any });
+
+    // Calculate totals
+    const totalNgn = recipients.reduce((sum, r) => sum + r.amountNgn, 0);
+    const pajClient = await getPAJClient();
+    let rate = 1550;
+    try {
+      if (pajClient) {
+        const rates = await getPAJRates();
+        rate = rates.offRampRate;
+      }
+    } catch { /* fallback */ }
+
+    const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
+    let totalUsdt = 0;
+    let totalFeeUsdt = 0;
+    for (const r of recipients) {
+      const transferUsdt = r.amountNgn / rate;
+      const feeUsdt = transferUsdt * (zendFeeBps / 10000);
+      totalUsdt += transferUsdt;
+      totalFeeUsdt += feeUsdt;
+    }
+    const grandTotalUsdt = totalUsdt + totalFeeUsdt;
+
+    // Check total balance
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    let balanceOk = true;
+    let balanceMsg = '';
+    if (user[0]?.walletAddress) {
+      const tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
+      const solBalance = await walletService.getSolBalance(user[0].walletAddress);
+      const solPrice = await getSolPriceInUsdt();
+      const feeSol = totalFeeUsdt / solPrice;
+
+      if (tokenBalance < totalUsdt) {
+        balanceOk = false;
+        balanceMsg = `❌ Insufficient USDT. Need ${totalUsdt.toFixed(2)} USDT, have ${tokenBalance.toFixed(2)} USDT.`;
+      } else if (solBalance < feeSol + MIN_SOL_FOR_GAS) {
+        balanceOk = false;
+        balanceMsg = `❌ Insufficient SOL for fees. Need ~${(feeSol + MIN_SOL_FOR_GAS).toFixed(4)} SOL.`;
+      }
+    }
+
+    let summary =
+      `📦 *Bulk Send Summary*\n\n` +
+      `Recipients: ${recipients.length}\n` +
+      `Total NGN: ₦${totalNgn.toLocaleString()}\n` +
+      `Rate: ₦${rate.toLocaleString()} / USDT\n` +
+      `Transfer: ${totalUsdt.toFixed(2)} USDT\n` +
+      `Zend Fee: ${totalFeeUsdt.toFixed(2)} USDT\n` +
+      `Grand Total: ${grandTotalUsdt.toFixed(2)} USDT\n\n` +
+      `*Recipients:*\n`;
+
+    summary += recipients.map((r, i) =>
+      `${i + 1}. ${escapeTelegramMarkdown(r.accountName)} — ₦${r.amountNgn.toLocaleString()} → ${escapeTelegramMarkdown(r.bankName)} (\`${r.accountNumber}\`)`
+    ).join('\n');
+
+    if (!balanceOk) {
+      summary += `\n\n${balanceMsg}`;
+      await ctx.reply(summary, { parse_mode: 'Markdown', ...cancelKeyboard });
+      return;
+    }
+
+    // Require PIN if set
+    if (user[0]?.transactionPin) {
+      setSession(userId, { state: ConversationState.AWAITING_PIN_VERIFY, pinVerifyAction: 'bulk_send', pendingTransaction: { bulkRecipients: recipients } as any });
+      await ctx.reply(
+        `${summary}\n\n🔐 Enter your 4-digit PIN to confirm this bulk send:`,
+        { parse_mode: 'Markdown', ...cancelKeyboard }
+      );
+      return;
+    }
+
+    // No PIN — confirm directly
+    const confirmButtons = Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Confirm Bulk Send', 'bulk_send_confirm')],
+      [Markup.button.callback('❌ Cancel', 'bulk_send_cancel')],
+    ]);
+    await ctx.reply(summary, { parse_mode: 'Markdown', ...confirmButtons });
     return;
   }
 
@@ -3967,6 +4248,14 @@ bot.on(message('text'), async (ctx, next) => {
         `Use *📅 Schedule* to view or cancel.`,
         { parse_mode: 'Markdown', ...mainMenu }
       );
+    } else if (action === 'bulk_send') {
+      const pt = session.pendingTransaction;
+      const recipients = (pt as any)?.bulkRecipients as Array<{ amountNgn: number; bankCode: string; bankName: string; accountNumber: string; accountName: string }> | undefined;
+      if (!recipients || recipients.length === 0) {
+        await ctx.reply('❌ Session expired. Please start over.', mainMenu);
+        return;
+      }
+      await executeBulkSend(ctx, userId, recipients);
     } else {
       await ctx.reply('✅ PIN verified.', mainMenu);
     }
