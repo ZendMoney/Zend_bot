@@ -3157,8 +3157,8 @@ bot.on(message('text'), async (ctx, next) => {
     if (errors.length > 0) {
       await ctx.reply(
         `❌ *Parse Errors*\n\n` +
-        errors.join('\n') +\n\n` +
-        `Please fix and try again. Format:\n` +
+        errors.join('\n') +
+        `\n\n` +
         `\`AMOUNT BANK_CODE ACCOUNT_NUMBER ACCOUNT_NAME\``,
         { parse_mode: 'Markdown', ...cancelKeyboard }
       );
