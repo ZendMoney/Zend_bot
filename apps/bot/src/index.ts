@@ -112,6 +112,7 @@ interface ZendSession {
     productName?: string;
     category?: string;
     amount?: number;
+    packageId?: string;
     currency?: string;
     phoneNumber?: string;
     invoiceId?: string;
@@ -1366,7 +1367,7 @@ bot.action('admin_page:overview', async (ctx) => {
 
   const userCount = await db.select({ count: sql`count(*)` }).from(users);
   const txCount = await db.select({ count: sql`count(*)` }).from(transactions);
-  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'offramp'));
+  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_send'));
   const totalNgnIn = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
   const totalZendFee = await db.select({ sum: sql`coalesce(sum(zend_fee_usdt), 0)` }).from(transactions).where(eq(transactions.status, 'completed'));
   const activeFeatures = await db.select().from(botFeatures).where(eq(botFeatures.isActive, true));
@@ -1570,10 +1571,10 @@ bot.action('admin_page:fees', async (ctx) => {
   if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const totalZendFee = await db.select({ sum: sql`coalesce(sum(zend_fee_usdt), 0)` }).from(transactions).where(eq(transactions.status, 'completed'));
-  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'offramp'));
+  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_send'));
   const totalNgnIn = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
 
-  const offrampCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'offramp'));
+  const offrampCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'ngn_send'));
   const onrampCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
   const swapCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'swap'));
   const shopCount = await db.select({ count: sql`count(*)` }).from(bitrefillOrders);
@@ -1981,7 +1982,7 @@ async function buildTxnDetailText(txn: any): Promise<string> {
 
 async function buildUserDetailText(userRow: any): Promise<string> {
   const txCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.userId, userRow.id));
-  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(and(eq(transactions.userId, userRow.id), eq(transactions.type, 'offramp')));
+  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(and(eq(transactions.userId, userRow.id), eq(transactions.type, 'ngn_send')));
   const totalNgnIn = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(and(eq(transactions.userId, userRow.id), eq(transactions.type, 'ngn_receive')));
 
   const recentTxns = await db.select().from(transactions)
@@ -2306,7 +2307,8 @@ bot.action(/shop_pkg:(.+)/, async (ctx) => {
   const product = products.find((p: any) => p.id === session.shopData!.productId);
   const pkg = product?.packages?.find((p: any) => p.package_id === packageId);
 
-  session.shopData.amount = pkg?.value || 0;
+  session.shopData.packageId = packageId;
+  session.shopData.amount = typeof pkg?.value === 'string' ? parseFloat(pkg.value) || 0 : (pkg?.value || 0);
   session.shopData.currency = pkg?.currency || product?.currency || 'NGN';
 
   await askForPhoneNumber(ctx, userId);
@@ -2570,14 +2572,24 @@ bot.action('shop_pay_balance', async (ctx) => {
       quantity: 1,
     }];
 
-    const cachedProducts = await getCachedProducts('NG');
-    const product = cachedProducts.find((p: any) => p.id === sd.productId);
-    const pkg = product?.packages?.find((p: any) => p.value === sd.amount);
-
-    if (pkg) {
-      products[0].package_id = pkg.package_id;
-    } else {
+    // Use package_id if user selected a package (data bundles)
+    if (sd.packageId) {
+      products[0].package_id = sd.packageId;
+    } else if (sd.amount && sd.amount > 0) {
+      // For value-based products (airtime) or custom amounts
       products[0].value = sd.amount;
+    }
+
+    // Fallback: try to match package by value for legacy sessions
+    if (!products[0].package_id && !products[0].value) {
+      const cachedProducts = await getCachedProducts('NG');
+      const product = cachedProducts.find((p: any) => p.id === sd.productId);
+      const pkg = product?.packages?.find((p: any) => String(p.value) === String(sd.amount));
+      if (pkg) {
+        products[0].package_id = pkg.package_id;
+      } else if (sd.amount && sd.amount > 0) {
+        products[0].value = sd.amount;
+      }
     }
 
     if (sd.phoneNumber && sd.phoneNumber !== 'skip') {
