@@ -2556,16 +2556,8 @@ bot.action('shop_pay_balance', async (ctx) => {
       console.log('[Gas] Funded SOL for shop purchase');
     }
 
-    // Deduct USDT from user wallet → treasury
-    const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
-    const keypair = Keypair.fromSecretKey(secretKey);
-
-    await ctx.reply('⏳ Sending USDT payment...');
-    const txHash = await walletService.sendUsdt(keypair, ZEND_TREASURY_WALLET, sd.totalUsdt || 0);
-    console.log('[Shop] USDT payment sent:', txHash);
-
-    // Create BitRefill invoice with auto_pay
-    await ctx.reply('⏳ Fulfilling your order via BitRefill...');
+    // ─── Step 1: Create BitRefill invoice FIRST (don't charge user yet)
+    await ctx.reply('⏳ Creating order with BitRefill...');
 
     const products: any[] = [{
       product_id: sd.productId,
@@ -2602,12 +2594,14 @@ bot.action('shop_pay_balance', async (ctx) => {
     const invoice = await bitrefillBusinessClient.createInvoice({
       products,
       payment_method: 'balance',
-      auto_pay: true,
+      auto_pay: false,
       webhook_url: webhookUrl,
       email: user[0]?.email || undefined,
     });
 
-    // Save order
+    console.log('[Shop] Invoice created:', invoice.id, 'status:', invoice.status);
+
+    // Save order immediately (pending)
     await db.insert(bitrefillOrders).values({
       userId,
       bitrefillInvoiceId: invoice.id,
@@ -2618,15 +2612,82 @@ bot.action('shop_pay_balance', async (ctx) => {
       currencyFiat: sd.currency,
       amountCrypto: String(sd.totalUsdt || 0),
       cryptoCurrency: 'USDT',
-      status: invoice.status === 'complete' ? 'complete' : 'pending',
+      status: 'pending',
       recipientPhone: sd.phoneNumber,
       recipientEmail: user[0]?.email,
       metadata: invoice,
     });
 
-    // If invoice is already complete, deliver immediately
-    if (invoice.status === 'complete' && invoice.orders?.length) {
-      const orderId = invoice.orders[0].id;
+    // ─── Step 2: Ping BitRefill until invoice needs payment or fails ───
+    let checkedInvoice = invoice;
+    let attempts = 0;
+    const maxAttempts = 15;
+
+    while (attempts < maxAttempts) {
+      attempts++;
+      checkedInvoice = await bitrefillBusinessClient.getInvoice(invoice.id);
+      console.log(`[Shop] Poll ${attempts}: invoice ${invoice.id} status = ${checkedInvoice.status}`);
+
+      if (checkedInvoice.status === 'complete') {
+        // Already complete (rare but possible)
+        break;
+      }
+      if (checkedInvoice.status === 'failed') {
+        await db.update(bitrefillOrders)
+          .set({ status: 'failed', metadata: checkedInvoice })
+          .where(eq(bitrefillOrders.bitrefillInvoiceId, invoice.id));
+        throw new Error('BitRefill order failed');
+      }
+      if (checkedInvoice.status === 'unpaid') {
+        // Invoice is valid and awaiting payment — proceed
+        break;
+      }
+      // Wait 1.5s before next poll
+      await new Promise(r => setTimeout(r, 1500));
+    }
+
+    if (attempts >= maxAttempts && checkedInvoice.status !== 'complete' && checkedInvoice.status !== 'unpaid') {
+      await db.update(bitrefillOrders)
+        .set({ status: 'failed', metadata: checkedInvoice })
+        .where(eq(bitrefillOrders.bitrefillInvoiceId, invoice.id));
+      throw new Error('BitRefill invoice did not reach payable state');
+    }
+
+    // ─── Step 3: Charge user only after invoice is valid ───
+    const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
+    const keypair = Keypair.fromSecretKey(secretKey);
+
+    await ctx.reply('⏳ Sending USDT payment...');
+    const txHash = await walletService.sendUsdt(keypair, ZEND_TREASURY_WALLET, sd.totalUsdt || 0);
+    console.log('[Shop] USDT payment sent:', txHash);
+
+    // ─── Step 4: Pay the invoice with business balance ───
+    await ctx.reply('⏳ Fulfilling your order...');
+    await bitrefillBusinessClient.payInvoice(invoice.id);
+    console.log('[Shop] Invoice paid:', invoice.id);
+
+    // ─── Step 5: Poll until complete or failed ───
+    let finalInvoice = checkedInvoice;
+    let pollAttempts = 0;
+    const maxPollAttempts = 30;
+
+    while (pollAttempts < maxPollAttempts) {
+      pollAttempts++;
+      await new Promise(r => setTimeout(r, 2000));
+      finalInvoice = await bitrefillBusinessClient.getInvoice(invoice.id);
+      console.log(`[Shop] Post-pay poll ${pollAttempts}: status = ${finalInvoice.status}`);
+
+      if (finalInvoice.status === 'complete') {
+        break;
+      }
+      if (finalInvoice.status === 'failed') {
+        break;
+      }
+    }
+
+    // ─── Step 6: Deliver result ───
+    if (finalInvoice.status === 'complete' && finalInvoice.orders?.length) {
+      const orderId = finalInvoice.orders[0].id;
       const order = await bitrefillBusinessClient.getOrder(orderId);
 
       await db.update(bitrefillOrders)
@@ -2652,7 +2713,22 @@ bot.action('shop_pay_balance', async (ctx) => {
         `Ref: \`${invoice.id}\``,
         { parse_mode: 'Markdown', ...mainMenu }
       );
+    } else if (finalInvoice.status === 'failed') {
+      await db.update(bitrefillOrders)
+        .set({ status: 'failed', metadata: finalInvoice })
+        .where(eq(bitrefillOrders.bitrefillInvoiceId, invoice.id));
+
+      await ctx.reply(
+        `❌ *Order Failed*\n\n` +
+        `${sd.productName}\n` +
+        `Amount: ${sd.currency} ${sd.amount?.toLocaleString()}\n\n` +
+        `The payment was sent but BitRefill could not fulfil the order.\n` +
+        `Our team has been notified and will refund your USDT.\n` +
+        `Ref: \`${invoice.id}\``,
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
     } else {
+      // Still processing — webhook will handle completion
       await ctx.reply(
         `⏳ *Order Processing*\n\n` +
         `${sd.productName}\n` +
