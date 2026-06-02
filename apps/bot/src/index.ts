@@ -5642,6 +5642,15 @@ async function executeSendCore(
       await clearPajSession(userId);
       return { success: false, txId, error: 'Your PAJ session expired. Please re-link in Settings.' };
     }
+    // PAJ infrastructure error — no available deposit wallets
+    const errMsg = (err?.message || '').toLowerCase();
+    if (errMsg.includes('no available wallet') || errMsg.includes('no available deposit')) {
+      return {
+        success: false,
+        txId,
+        error: 'Our payment partner is temporarily at capacity. Please try again in 1–2 minutes. No funds were deducted.',
+      };
+    }
     await db.update(transactions)
       .set({ status: 'failed' })
       .where(eq(transactions.id, txId));
