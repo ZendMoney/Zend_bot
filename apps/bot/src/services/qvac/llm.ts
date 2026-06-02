@@ -84,7 +84,7 @@ export async function* streamQVACLLM(options: LLMOptions): AsyncGenerator<string
     });
 
     for await (const event of run.events) {
-      if (event.type === 'contentDelta') {
+      if (event.type === 'contentDelta' && event.text) {
         yield event.text;
       }
     }

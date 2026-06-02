@@ -269,6 +269,63 @@ function extractFromToken(text: string): ParsedCommand['fromToken'] {
   return undefined;
 }
 
+// ─── Kimi Coding API ───
+
+const KIMI_API_KEY = process.env.KIMI_API_KEY || process.env.OPENAI_API_KEY;
+const KIMI_BASE_URL = process.env.KIMI_BASE_URL || 'https://api.kimi.com/coding';
+const KIMI_MODEL = process.env.KIMI_MODEL || 'kimi-for-coding';
+
+function getKimiBaseUrl(): string {
+  let url = KIMI_BASE_URL;
+  if (url.endsWith('/v1')) {
+    url = url.slice(0, -3);
+  }
+  return url.replace(/\/$/, '');
+}
+
+if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
+  console.warn('[NLP] ⚠️  KIMI_API_KEY not set — AI features disabled');
+}
+
+function getKimiResponse(data: any): string {
+  const text = data?.content?.[0]?.text;
+  if (text) return text;
+  return data?.choices?.[0]?.message?.content || '';
+}
+
+async function callKimi(systemPrompt: string, userPrompt: string, temperature: number, maxTokens: number): Promise<string | null> {
+  if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
+    return null;
+  }
+  try {
+    const response = await fetch(`${getKimiBaseUrl()}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${KIMI_API_KEY}`,
+        'User-Agent': 'claude-code/0.1.0',
+      },
+      body: JSON.stringify({
+        model: KIMI_MODEL,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: userPrompt }],
+        temperature,
+        max_tokens: maxTokens,
+      }),
+    });
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      console.error(`[Kimi] API error ${response.status}: ${errText.slice(0, 200)}`);
+      return null;
+    }
+    const data: any = await response.json();
+    return getKimiResponse(data) || null;
+  } catch (err) {
+    console.error('[Kimi] API call failed:', err);
+    return null;
+  }
+}
+
 /**
  * Parse natural language command locally (fast, no API call)
  */
@@ -427,6 +484,38 @@ export async function parseMenuInputWithAI(text: string): Promise<MenuParseResul
 
 // ─── Conversational AI (Smart Assistant) ───
 
+
+export interface BotFeature {
+  key: string;
+  name: string;
+  description: string;
+  category: string;
+}
+
+function buildChatSystemPrompt(features: BotFeature[]): string {
+  const activeFeatures = features.filter(f => f.category !== 'disabled');
+  const featureList = activeFeatures.map((f, i) => `${i + 1}. ${f.name} — ${f.description}`).join('\n');
+
+  return `You are Zend, a friendly Nigerian payment assistant inside a Telegram bot.
+
+Your personality: Warm, concise, helpful. Speak like a knowledgeable Nigerian friend. Light Pidgin like "No wahala" or "Sharp sharp" is fine when natural.
+
+EXACT features Zend has (do NOT mention anything else):
+${featureList || '1. Check balance — Dollars (USDT/USDC) and SOL with live Naira rates'}
+
+EXACT features Zend does NOT have (never mention these):
+- NO airtime recharge
+- NO data bundles
+- NO bill payments (electricity, cable, etc.)
+- NO loans or borrowing
+- NO betting or gambling
+- NO stocks or investment trading
+
+If asked about fees: 1% Zend fee paid in SOL + small network fee. If you don't have enough SOL for the network fee, we cover it and add 0.5% to the Zend fee (so 1.5% total).
+If asked about security: your account is protected with encryption and PIN. We handle identity verification for compliance.
+Keep replies under 150 words. End with a nudge to try something real.`;
+}
+
 export interface ChatReply {
   reply: string;
   suggestedAction?: string;
@@ -435,14 +524,19 @@ export interface ChatReply {
 /**
  * Get a conversational reply from QVAC local LLM when the user's message is not a command.
  */
+
+export async function chatWithKimi(text: string, features?: BotFeature[]): Promise<ChatReply | null> {
+  const systemPrompt = buildChatSystemPrompt(features || []);
+  const reply = await callKimi(systemPrompt, text, 0.7, 400);
+  if (!reply) return null;
+  return { reply: reply.trim() };
+}
+
 export async function chatWithAI(text: string): Promise<ChatReply | null> {
   const reply = await callQVAC(CHAT_SYSTEM_PROMPT, text, 0.7, 400);
   if (!reply) return null;
   return { reply: reply.trim() };
 }
-
-// Backward-compatible alias
-export { chatWithAI as chatWithKimi };
 
 // ─── Voice Transcription (QVAC Whisper) ───
 
@@ -487,6 +581,98 @@ export async function analyzeVoiceWithAI(text: string): Promise<VoiceAnalysis | 
     };
   } catch (err) {
     console.error('[Voice] QVAC analysis parse failed:', err);
+    return null;
+  }
+}
+
+
+// ─── Bulk Send Parser ───
+
+const BULK_SEND_BANK_CODES = [
+  'GTB','UBA','ACC','ZEN','FBN','ECO','WEM','FID','SKY','STA','UNI',
+  'KEC','JAB','TIT','GLO','PRO','SUN','PAR','COR','FSD','RAN','NOV',
+  'OPY','MON','KUD','PAL','PAG','VFD','CAR','BRA','FAI','FCMB','HER','STE','UNI'
+];
+
+const BULK_PARSE_PROMPT = `You are a Nigerian payment parser. Extract recipients from the user's bulk transfer text.
+
+For each recipient, extract:
+- amount_ngn: number (parse '50k' as 50000, '1.5k' as 1500, '₦2000' as 2000)
+- bank_code: 3-letter code from this list: ${BULK_SEND_BANK_CODES.join(', ')}
+- account_number: exactly 10 digits
+- account_name: full name of recipient
+
+Bank name mapping:
+GTBank/Guaranty Trust → GTB
+UBA/United Bank → UBA
+Access Bank → ACC
+Zenith Bank → ZEN
+First Bank → FBN
+Ecobank → ECO
+Wema Bank → WEM
+Fidelity Bank → FID
+Polaris Bank/Skye → SKY
+Stanbic IBTC → STA
+Union Bank → UNI
+Keystone Bank → KEC
+Jaiz Bank → JAB
+Titan Trust → TIT
+Globus Bank → GLO
+Providus Bank → PRO
+SunTrust → SUN
+Parallex Bank → PAR
+Coronation Merchant → COR
+FSDH Merchant → FSD
+Rand Merchant → RAN
+Nova Merchant → NOV
+OPay → OPY
+Moniepoint → MON
+Kuda → KUD
+PalmPay → PAL
+Paga → PAG
+VFD Microfinance → VFD
+Carbon → CAR
+Branch → BRA
+Fairmoney → FAI
+FCMB → FCMB
+Heritage → HER
+Sterling → STE
+
+Return ONLY a JSON array. No explanation, no markdown.
+[
+  {"amount_ngn":50000,"bank_code":"GTB","account_number":"0123456789","account_name":"John Doe"}
+]
+
+If you cannot parse a line, return null for that entry or omit it.`;
+
+export interface BulkRecipient {
+  amount_ngn: number;
+  bank_code: string;
+  account_number: string;
+  account_name: string;
+}
+
+export async function parseBulkSendWithAI(text: string): Promise<BulkRecipient[] | null> {
+  const content = await callKimi(BULK_PARSE_PROMPT, text, 0.1, 800);
+  if (!content) return null;
+  try {
+    const clean = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const parsed = JSON.parse(clean);
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter((r: any) =>
+      r &&
+      typeof r.amount_ngn === 'number' && r.amount_ngn >= 100 &&
+      typeof r.bank_code === 'string' && BULK_SEND_BANK_CODES.includes(r.bank_code.toUpperCase()) &&
+      typeof r.account_number === 'string' && /^\d{10}$/.test(r.account_number) &&
+      typeof r.account_name === 'string' && r.account_name.length >= 2
+    ).map((r: any) => ({
+      amount_ngn: Math.round(r.amount_ngn),
+      bank_code: r.bank_code.toUpperCase(),
+      account_number: r.account_number,
+      account_name: r.account_name.trim(),
+    }));
+  } catch (err) {
+    console.error('[BulkSend] AI parse failed:', err);
     return null;
   }
 }
@@ -588,4 +774,5 @@ export async function askTransactionQuestion(
   });
 
   return summary;
+
 }

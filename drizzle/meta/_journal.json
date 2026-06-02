@@ -40,15 +40,29 @@
     {
       "idx": 5,
       "version": "7",
-      "when": 1778580932982,
-      "tag": "0005_clammy_warlock",
+      "when": 1779188916251,
+      "tag": "0005_aromatic_wild_child",
       "breakpoints": true
     },
     {
       "idx": 6,
       "version": "7",
-      "when": 1778629746956,
-      "tag": "0006_parched_bromley",
+      "when": 1779318445581,
+      "tag": "0006_quick_stone_men",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1779824121000,
+      "tag": "0007_ambassador_referrals",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1779830000000,
+      "tag": "0008_ambassador_program",
       "breakpoints": true
     }
   ]

@@ -1,9 +1,59 @@
 {
-  "id": "edbc7371-9a1e-4021-a381-e7e79a44fb8f",
-  "prevId": "29de4742-aec9-4a95-8fd0-746998952a87",
+  "id": "264bf14c-0d67-414e-ae82-4e8a084ecafc",
+  "prevId": "ac2f9f82-2cad-40f5-a038-1a6b40df64ff",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
+    "public.ambassador_applications": {
+      "name": "ambassador_applications",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "varchar(80)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "tg_handle": {
+          "name": "tg_handle",
+          "type": "varchar(40)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "is_student": {
+          "name": "is_student",
+          "type": "varchar(10)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "focus": {
+          "name": "focus",
+          "type": "varchar(120)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.audit_logs": {
       "name": "audit_logs",
       "schema": "",
@@ -66,8 +116,8 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
-    "public.bill_payments": {
-      "name": "bill_payments",
+    "public.bitrefill_orders": {
+      "name": "bitrefill_orders",
       "schema": "",
       "columns": {
         "id": {
@@ -82,33 +132,51 @@
           "primaryKey": false,
           "notNull": true
         },
-        "type": {
-          "name": "type",
-          "type": "varchar(20)",
+        "bitrefill_invoice_id": {
+          "name": "bitrefill_invoice_id",
+          "type": "varchar(100)",
           "primaryKey": false,
           "notNull": true
         },
-        "provider": {
-          "name": "provider",
+        "product_id": {
+          "name": "product_id",
+          "type": "varchar(100)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "product_name": {
+          "name": "product_name",
+          "type": "varchar(200)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "category": {
+          "name": "category",
           "type": "varchar(50)",
           "primaryKey": false,
           "notNull": true
         },
-        "recipient": {
-          "name": "recipient",
-          "type": "varchar(50)",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "amount_ngn": {
-          "name": "amount_ngn",
+        "amount_fiat": {
+          "name": "amount_fiat",
           "type": "numeric(20, 2)",
           "primaryKey": false,
-          "notNull": true
+          "notNull": false
         },
-        "amount_usdt": {
-          "name": "amount_usdt",
-          "type": "numeric(20, 9)",
+        "currency_fiat": {
+          "name": "currency_fiat",
+          "type": "varchar(10)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "amount_crypto": {
+          "name": "amount_crypto",
+          "type": "numeric(30, 9)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "crypto_currency": {
+          "name": "crypto_currency",
+          "type": "varchar(20)",
           "primaryKey": false,
           "notNull": false
         },
@@ -119,27 +187,33 @@
           "notNull": true,
           "default": "'pending'"
         },
-        "reference": {
-          "name": "reference",
-          "type": "varchar(100)",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "external_reference": {
-          "name": "external_reference",
-          "type": "varchar(100)",
+        "codes": {
+          "name": "codes",
+          "type": "jsonb",
           "primaryKey": false,
           "notNull": false
         },
-        "commission_ngn": {
-          "name": "commission_ngn",
-          "type": "numeric(20, 2)",
+        "recipient_phone": {
+          "name": "recipient_phone",
+          "type": "varchar(20)",
           "primaryKey": false,
           "notNull": false
         },
-        "token": {
-          "name": "token",
+        "recipient_email": {
+          "name": "recipient_email",
           "type": "varchar(255)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "payment_address": {
+          "name": "payment_address",
+          "type": "varchar(100)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "payment_uri": {
+          "name": "payment_uri",
+          "type": "text",
           "primaryKey": false,
           "notNull": false
         },
@@ -165,9 +239,9 @@
       },
       "indexes": {},
       "foreignKeys": {
-        "bill_payments_user_id_users_id_fk": {
-          "name": "bill_payments_user_id_users_id_fk",
-          "tableFrom": "bill_payments",
+        "bitrefill_orders_user_id_users_id_fk": {
+          "name": "bitrefill_orders_user_id_users_id_fk",
+          "tableFrom": "bitrefill_orders",
           "tableTo": "users",
           "columnsFrom": [
             "user_id"
@@ -179,6 +253,166 @@
           "onUpdate": "no action"
         }
       },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.bot_features": {
+      "name": "bot_features",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "key": {
+          "name": "key",
+          "type": "varchar(50)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "varchar(100)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "description": {
+          "name": "description",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "category": {
+          "name": "category",
+          "type": "varchar(30)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "is_active": {
+          "name": "is_active",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": true
+        },
+        "is_ai_visible": {
+          "name": "is_ai_visible",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": true
+        },
+        "sort_order": {
+          "name": "sort_order",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "bot_features_key_unique": {
+          "name": "bot_features_key_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "key"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.device_suspension_requests": {
+      "name": "device_suspension_requests",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "full_name": {
+          "name": "full_name",
+          "type": "varchar(100)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "email": {
+          "name": "email",
+          "type": "varchar(255)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "phone": {
+          "name": "phone",
+          "type": "varchar(30)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "handle": {
+          "name": "handle",
+          "type": "varchar(50)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "device_lost": {
+          "name": "device_lost",
+          "type": "varchar(100)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "last_used": {
+          "name": "last_used",
+          "type": "varchar(50)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "reason": {
+          "name": "reason",
+          "type": "varchar(20)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "details": {
+          "name": "details",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
@@ -821,13 +1055,6 @@
           "primaryKey": false,
           "notNull": false
         },
-        "is_admin": {
-          "name": "is_admin",
-          "type": "boolean",
-          "primaryKey": false,
-          "notNull": true,
-          "default": false
-        },
         "referral_code": {
           "name": "referral_code",
           "type": "varchar(20)",
@@ -839,6 +1066,13 @@
           "type": "varchar(50)",
           "primaryKey": false,
           "notNull": false
+        },
+        "is_admin": {
+          "name": "is_admin",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
         },
         "created_at": {
           "name": "created_at",

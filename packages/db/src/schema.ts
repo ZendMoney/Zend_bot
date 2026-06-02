@@ -29,13 +29,14 @@ export const users = pgTable('users', {
   voiceInputEnabled: boolean('voice_input_enabled').default(true).notNull(),
   transactionPin: varchar('transaction_pin', { length: 255 }), // hashed
   
-  // Admin
-  isAdmin: boolean('is_admin').default(false).notNull(),
-
   // Referral
   referralCode: varchar('referral_code', { length: 20 }).unique(),
   referredBy: varchar('referred_by', { length: 50 }).references((): any => users.id),
-  
+  ambassadorReferralCode: varchar('ambassador_referral_code', { length: 50 }),
+
+  // Admin
+  isAdmin: boolean('is_admin').default(false).notNull(),
+
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
@@ -173,6 +174,29 @@ export const billPayments = pgTable('bill_payments', {
   completedAt: timestamp('completed_at', { withTimezone: true }),
 });
 
+// BitRefill orders (gift cards, airtime, eSIMs)
+export const bitrefillOrders = pgTable('bitrefill_orders', {
+  id: serial('id').primaryKey(),
+  userId: varchar('user_id', { length: 50 }).notNull().references(() => users.id),
+  bitrefillInvoiceId: varchar('bitrefill_invoice_id', { length: 100 }).notNull(),
+  productId: varchar('product_id', { length: 100 }).notNull(),
+  productName: varchar('product_name', { length: 200 }).notNull(),
+  category: varchar('category', { length: 50 }).notNull(),
+  amountFiat: decimal('amount_fiat', { precision: 20, scale: 2 }),
+  currencyFiat: varchar('currency_fiat', { length: 10 }),
+  amountCrypto: decimal('amount_crypto', { precision: 30, scale: 9 }),
+  cryptoCurrency: varchar('crypto_currency', { length: 20 }),
+  status: varchar('status', { length: 20 }).notNull().default('pending'),
+  codes: jsonb('codes'),
+  recipientPhone: varchar('recipient_phone', { length: 20 }),
+  recipientEmail: varchar('recipient_email', { length: 255 }),
+  paymentAddress: varchar('payment_address', { length: 100 }),
+  paymentUri: text('payment_uri'),
+  metadata: jsonb('metadata'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  completedAt: timestamp('completed_at', { withTimezone: true }),
+});
+
 // Audit log (immutable)
 export const auditLogs = pgTable('audit_logs', {
   id: serial('id').primaryKey(),
@@ -183,4 +207,47 @@ export const auditLogs = pgTable('audit_logs', {
   ipAddress: varchar('ip_address', { length: 45 }),
   userAgent: text('user_agent'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// ─── Landing page form submissions ───
+
+export const ambassadorApplications = pgTable('ambassador_applications', {
+  id: serial('id').primaryKey(),
+  name: varchar('name', { length: 80 }).notNull(),
+  tgHandle: varchar('tg_handle', { length: 40 }).notNull(),
+  isStudent: varchar('is_student', { length: 10 }).notNull(),
+  focus: varchar('focus', { length: 120 }).notNull(),
+  customReferralCode: varchar('custom_referral_code', { length: 50 }).unique(),
+  status: varchar('status', { length: 20 }).default('pending').notNull(), // pending | confirmed | removed
+  tier: varchar('tier', { length: 20 }).default('entry').notNull(), // entry | pro | elite
+  confirmedAt: timestamp('confirmed_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const deviceSuspensionRequests = pgTable('device_suspension_requests', {
+  id: serial('id').primaryKey(),
+  fullName: varchar('full_name', { length: 100 }).notNull(),
+  email: varchar('email', { length: 255 }).notNull(),
+  phone: varchar('phone', { length: 30 }).notNull(),
+  handle: varchar('handle', { length: 50 }).notNull(),
+  deviceLost: varchar('device_lost', { length: 100 }).notNull(),
+  lastUsed: varchar('last_used', { length: 50 }).notNull(),
+  reason: varchar('reason', { length: 20 }).notNull(),
+  details: text('details'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// ─── Bot Features (AI awareness + admin toggles) ───
+
+export const botFeatures = pgTable('bot_features', {
+  id: serial('id').primaryKey(),
+  key: varchar('key', { length: 50 }).notNull().unique(),
+  name: varchar('name', { length: 100 }).notNull(),
+  description: text('description').notNull(),
+  category: varchar('category', { length: 30 }).notNull(),
+  isActive: boolean('is_active').default(true).notNull(),
+  isAiVisible: boolean('is_ai_visible').default(true).notNull(),
+  sortOrder: integer('sort_order').default(0).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });

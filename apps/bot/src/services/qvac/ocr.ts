@@ -64,13 +64,13 @@ export async function extractTextFromImage(imageBuffer: Buffer): Promise<string>
     console.log(`[QVAC OCR] BMP conversion took ${Date.now() - t0}ms`);
 
     const t1 = Date.now();
-    const { blocks } = ocr({
+    const { blocks } = await ocr({
       modelId,
       image: bmpPath,
       options: { paragraph: false },
     });
 
-    const result = await withTimeout(blocks, 25000, 'OCR inference') as { text: string }[];
+    const result = await withTimeout(Promise.resolve(blocks), 25000, 'OCR inference') as { text: string }[];
     console.log(`[QVAC OCR] Inference took ${Date.now() - t1}ms`);
 
     const text = result.map((b: { text: string }) => b.text).join('\n');

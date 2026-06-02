@@ -54,6 +54,12 @@ export const SOLANA_TOKENS = {
     decimals: 6,
     name: 'USD Coin',
   },
+  AUDD: {
+    mint: 'AUDDttiEpCydTm7joUMbYddm72jAWXZnCpPZtDoxqBSw',
+    symbol: 'AUDD',
+    decimals: 6,
+    name: 'Australian Digital Dollar',
+  },
 } as const;
 
 // Conversation States
@@ -93,6 +99,12 @@ export enum ConversationState {
   BILL_ENTER_SMARTCARD = 'bill_enter_smartcard',
   BILL_SELECT_BOUQUET = 'bill_select_bouquet',
   BILL_CONFIRM = 'bill_confirm',
+  AWAITING_SHOP_AMOUNT = 'awaiting_shop_amount',
+  AWAITING_SHOP_PHONE = 'awaiting_shop_phone',
+  AWAITING_ADMIN_TXN_SEARCH = 'awaiting_admin_txn_search',
+  AWAITING_ADMIN_USER_SEARCH = 'awaiting_admin_user_search',
+  AWAITING_ADMIN_SET_AMBASSADOR_CODE = 'awaiting_admin_set_ambassador_code',
+  AWAITING_BULK_SEND_INPUT = 'awaiting_bulk_send_input',
 }
 
 // Transaction Types
@@ -147,6 +159,7 @@ export const TIER_LIMITS = {
 // PAJ Constants
 export const PAJ_FEE_BPS = 80; // 0.8%
 export const PAJ_MIN_DEPOSIT_NGN = 1_000;
+export const PAJ_MAX_DEPOSIT_NGN = 10_000_000; // ₦10M max per deposit
 
 // Auto-save rates (in basis points)
 export const AUTO_SAVE_RATES = [100, 200, 300, 500, 1000] as const; // 1%, 2%, 3%, 5%, 10%

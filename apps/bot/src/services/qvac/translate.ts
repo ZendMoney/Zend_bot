@@ -52,7 +52,7 @@ export async function translateText(
       targetLang,
     });
 
-    return result.trim();
+    return typeof result === 'string' ? result.trim() : (result as any).text?.trim() || '';
   } catch (err: any) {
     console.error('[QVAC Translate] Failed:', err.message || err);
     return null;

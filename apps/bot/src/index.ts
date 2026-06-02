@@ -7,7 +7,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 config({ path: resolve(__dirname, '../../../.env') });
 
 import { Telegraf, Markup, Context } from 'telegraf';
-import { Keypair, PublicKey } from '@solana/web3.js';
+import { Keypair, PublicKey, SystemProgram, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import {
   getAssociatedTokenAddress,
   createAssociatedTokenAccountIdempotentInstruction,
@@ -16,13 +16,15 @@ import {
 import bs58 from 'bs58';
 import { message } from 'telegraf/filters';
 import { db, checkConnection } from '@zend/db';
-import { users, transactions, savedBankAccounts, scheduledTransfers } from '@zend/db';
-import { eq, sql, and } from 'drizzle-orm';
+import { users, transactions, savedBankAccounts, scheduledTransfers, bitrefillOrders, ambassadorApplications, deviceSuspensionRequests, botFeatures } from '@zend/db';
+import { eq, sql, and, desc } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
+import { BitRefillClient } from '@zend/bitrefill-client';
 import {
-  parseCommand, transcribeVoice, chatWithAI, analyzeVoiceWithAI,
-  parseMenuInputWithAI, parseReceiptWithQVAC, askTransactionQuestion,
-  indexTransaction, type ParsedCommand,
+  parseCommand, transcribeVoice, chatWithAI, chatWithKimi,
+  analyzeVoiceWithAI, analyzeVoiceWithKimi, parseMenuInputWithAI,
+  parseReceiptWithQVAC, askTransactionQuestion, indexTransaction,
+  parseBulkSendWithAI, type ParsedCommand,
 } from './services/nlp.js';
 import { initQVAC, getQVACStatus } from './services/qvac/index.js';
 import type { PAJClient } from '@zend/paj-client';
@@ -31,6 +33,7 @@ import {
   SOLANA_TOKENS,
   NIGERIAN_BANKS,
   PAJ_MIN_DEPOSIT_NGN,
+  PAJ_MAX_DEPOSIT_NGN,
 } from '@zend/shared';
 
 import crypto from 'crypto';
@@ -72,6 +75,7 @@ interface ZendSession {
     recipientAccountName: string;
     recipientWalletAddress: string;
     zendFeeUsdt?: number;
+    feeSol?: number;
     ngnRate?: number;
     // Swap fields
     fromMint?: string;
@@ -84,10 +88,12 @@ interface ZendSession {
     swapOutAmount?: number;
     swapMinOut?: number;
     swapPriceImpact?: number;
+    isLocalSwap?: boolean;
   }>;
-  pinVerifyAction?: 'send' | 'swap' | 'export' | 'schedule';
+  pinVerifyAction?: 'send' | 'swap' | 'export' | 'schedule' | 'bulk_send';
   pajContact?: string; // email/phone pending OTP
   onrampAmount?: number; // pending on-ramp amount in NGN
+  onrampTargetToken?: 'USDT' | 'AUDD'; // which token the on-ramp should credit
   voiceAnalysis?: {
     text: string;
     amount: number | null;
@@ -128,6 +134,23 @@ interface ZendSession {
     bouquetAmount?: number;
     amount?: number;
   };
+  shopData?: {
+    productId?: string;
+    productName?: string;
+    category?: string;
+    amount?: number;
+    packageId?: string;
+    currency?: string;
+    phoneNumber?: string;
+    invoiceId?: string;
+    paymentUri?: string;
+    paymentAddress?: string;
+    cryptoAmount?: string;
+    cryptoCurrency?: string;
+    bitrefillPriceUsd?: number;
+    totalUsdt?: number;
+  };
+  lastBotMessageId?: number; // message ID of last bot prompt (for cleanup)
 }
 
 interface ZendContext extends Context {
@@ -217,33 +240,160 @@ setInterval(async () => {
 
 // ─── Services ───
 const walletService = new WalletService(SOLANA_RPC);
+const bitrefillClient = process.env.BITREFILL_API_KEY
+  ? new BitRefillClient(process.env.BITREFILL_API_KEY)
+  : null;
 
-const MIN_SOL_FOR_GAS = 0.0005; // ~0.00008 base fee + buffer for bundled tx
-const GAS_SPONSORSHIP_FEE_BPS = 50; // 0.5% extra for gasless users
+const bitrefillBusinessClient = (process.env.BITREFILL_BUSINESS_API_ID && process.env.BITREFILL_BUSINESS_API_SECRET)
+  ? new BitRefillClient(process.env.BITREFILL_BUSINESS_API_ID, process.env.BITREFILL_BUSINESS_API_SECRET)
+  : null;
 
-/** Fund SOL from dev wallet if user has insufficient balance. Returns true if funded. */
-async function fundSolIfNeeded(walletAddress: string): Promise<boolean> {
-  const hasGas = await walletService.hasEnoughSolForGas(walletAddress, MIN_SOL_FOR_GAS);
-  if (hasGas) return false;
+const BITREFILL_MARKUP_BPS = parseInt(process.env.BITREFILL_MARKUP_BPS || '150');
+const ZEND_TREASURY_WALLET = process.env.ZEND_TREASURY_WALLET || ''; // receives shop USDT payments
 
-  const devSecret = process.env.ZEND_DEV_WALLET_SECRET;
-  if (!devSecret) {
-    console.warn('[Gas] No ZEND_DEV_WALLET_SECRET set — cannot fund SOL');
-    return false;
+// Dev wallet for gas sponsorship (supports ZEND_DEV_WALLET_SECRET or PV_KEY)
+const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_KEY || '';
+
+const MIN_SOL_FOR_GAS = 0.0005; // base tx fee buffer
+const ATA_RENT_SOL = 0.002039; // rent to create an Associated Token Account
+// Fee structure:
+// - Normal (user has SOL): 1% fee, capped at $2
+// - Funded (user has no SOL, we cover gas): 1.5% fee, capped at $3
+const ZEND_FEE_NORMAL_BPS = 100;
+const ZEND_FEE_FUNDED_BPS = 150;
+const ZEND_FEE_NORMAL_CAP_USDT = 2;
+const ZEND_FEE_FUNDED_CAP_USDT = 3;
+
+/** Calculate exact SOL a user needs for a send (fees + optional ATA rent). */
+function calcRequiredSol(feeSol: number, needsAta: boolean): number {
+  return feeSol + MIN_SOL_FOR_GAS + (needsAta ? ATA_RENT_SOL : 0);
+}
+
+/**
+ * Calculate the appropriate Zend fee based on user's SOL balance.
+ * Normal (has SOL): 1% capped at $2
+ * Funded (no SOL): 1.5% capped at $3 (includes gas sponsorship cost)
+ */
+async function calculateSendFee(
+  transferUsdt: number,
+  userWalletAddress: string
+): Promise<{
+  zendFeeUsdt: number;
+  feeSol: number;
+  feeBps: number;
+  willFundSol: boolean;
+}> {
+  const solPrice = await getSolPriceInUsdt();
+  
+  // Normal fee: 1%, cap $2
+  const normalFeeUsdt = Math.min(transferUsdt * (ZEND_FEE_NORMAL_BPS / 10000), ZEND_FEE_NORMAL_CAP_USDT);
+  const normalFeeSol = normalFeeUsdt / solPrice;
+  const normalRequired = normalFeeSol + MIN_SOL_FOR_GAS;
+  const solBalance = await walletService.getSolBalance(userWalletAddress);
+  
+  if (solBalance >= normalRequired) {
+    return {
+      zendFeeUsdt: normalFeeUsdt,
+      feeSol: normalFeeSol,
+      feeBps: ZEND_FEE_NORMAL_BPS,
+      willFundSol: false,
+    };
   }
+  
+  // Funded fee: 1.5%, cap $3
+  const fundedFeeUsdt = Math.min(transferUsdt * (ZEND_FEE_FUNDED_BPS / 10000), ZEND_FEE_FUNDED_CAP_USDT);
+  const fundedFeeSol = fundedFeeUsdt / solPrice;
+  
+  return {
+    zendFeeUsdt: fundedFeeUsdt,
+    feeSol: fundedFeeSol,
+    feeBps: ZEND_FEE_FUNDED_BPS,
+    willFundSol: true,
+  };
+}
 
+/** Get dev wallet SOL balance (for gas sponsorship health checks). */
+async function getDevWalletBalance(): Promise<number> {
+  if (!DEV_WALLET_SECRET) return 0;
   try {
-    const devKeypair = Keypair.fromSecretKey(bs58.decode(devSecret));
-    await walletService.sendSol(devKeypair, walletAddress, MIN_SOL_FOR_GAS);
-    console.log('[Gas] Funded', MIN_SOL_FOR_GAS, 'SOL from dev wallet to', walletAddress);
-    return true;
-  } catch (err: any) {
-    console.error('[Gas] Failed to fund SOL:', err.message);
-    return false;
+    const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+    return await walletService.getSolBalance(devKeypair.publicKey.toBase58());
+  } catch {
+    return 0;
   }
 }
 
+/**
+ * Smart gas funding — tops up the user with exactly the shortfall.
+ * If recipient needs an ATA, includes ATA rent in the calculation.
+ * Returns { funded: boolean; gasSponsored: boolean; shortfall?: number; error?: string }
+ */
+async function fundSolIfNeeded(
+  walletAddress: string,
+  feeSol: number,
+  recipientAddress?: string,
+  mintAddress?: string
+): Promise<{ funded: boolean; gasSponsored: boolean; shortfall?: number; error?: string }> {
+  let needsAta = false;
+  if (recipientAddress && mintAddress) {
+    try {
+      needsAta = !(await walletService.ataExists(recipientAddress, mintAddress));
+    } catch {
+      needsAta = true; // assume worst case
+    }
+  }
+
+  const required = calcRequiredSol(feeSol, needsAta);
+  const balance = await walletService.getSolBalance(walletAddress);
+
+  if (balance >= required) {
+    return { funded: false, gasSponsored: false };
+  }
+
+  const shortfall = required - balance;
+
+  if (!DEV_WALLET_SECRET) {
+    console.warn('[Gas] No dev wallet secret set — cannot fund SOL');
+    return { funded: false, gasSponsored: false, shortfall, error: 'Dev wallet not configured' };
+  }
+
+  const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+  const devBalance = await walletService.getSolBalance(devKeypair.publicKey.toBase58());
+  const devNeeds = shortfall + MIN_SOL_FOR_GAS; // dev needs shortfall + its own tx fee
+  if (devBalance < devNeeds) {
+    console.error(`[Gas] Dev wallet has ${devBalance.toFixed(6)} SOL but needs ${devNeeds.toFixed(6)} SOL to fund user ${walletAddress}`);
+    return { funded: false, gasSponsored: false, shortfall, error: `Dev wallet low on SOL (${devBalance.toFixed(6)}). Please top up the dev wallet.` };
+  }
+
+  // Retry up to 3 times with jitter
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await walletService.sendSol(devKeypair, walletAddress, shortfall);
+      console.log('[Gas] Funded exact shortfall:', shortfall.toFixed(6), 'SOL (needsAta:', needsAta, ') to', walletAddress);
+      return { funded: true, gasSponsored: true, shortfall };
+    } catch (err: any) {
+      console.error(`[Gas] Attempt ${attempt}/3 failed to fund SOL:`, err.message);
+      if (attempt === 3) {
+        return { funded: false, gasSponsored: false, shortfall, error: err.message };
+      }
+      // Jittered backoff: 500ms, 1000ms, 1500ms
+      await new Promise(r => setTimeout(r, attempt * 500 + Math.random() * 200));
+    }
+  }
+
+  return { funded: false, gasSponsored: false, shortfall, error: 'Funding failed after 3 retries' };
+}
+
 // ─── Helpers ───
+// Escape Telegram Markdown v1 special chars in user-generated text
+function md(text: string | undefined | null): string {
+  if (!text) return '';
+  return text
+    .replace(/_/g, '＿')
+    .replace(/\*/g, '•')
+    .replace(/`/g, "'");
+}
+
 function generateTxId(): string {
   return 'ZND-' + Math.random().toString(36).substring(2, 7).toUpperCase();
 }
@@ -333,11 +483,35 @@ async function getSolPriceInUsdt(): Promise<number> {
   try {
     const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
     const data = await res.json();
-    const price = data?.solana?.usd || 140;
+    const price = (data as any)?.solana?.usd || 140;
     _solPriceCache = { price, time: Date.now() };
     return price;
   } catch {
     return _solPriceCache?.price || 140;
+  }
+}
+
+// ─── AUDD Price (CoinGecko) ───
+let _auddPriceCache: { price: number; time: number } | null = null;
+
+async function getAuddPriceInUsdt(): Promise<number> {
+  if (_auddPriceCache && Date.now() - _auddPriceCache.time < 120000) {
+    return _auddPriceCache.price;
+  }
+  try {
+    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=novatti-australian-digital-dollar&vs_currencies=usd');
+    const data = await res.json();
+    const price = (data as any)?.['novatti-australian-digital-dollar']?.usd;
+    if (typeof price === 'number' && price > 0) {
+      _auddPriceCache = { price, time: Date.now() };
+      return price;
+    }
+    throw new Error(`CoinGecko returned invalid AUDD price: ${JSON.stringify(data)}`);
+  } catch (err: any) {
+    if (_auddPriceCache) {
+      return _auddPriceCache.price;
+    }
+    throw new Error(`Failed to fetch AUDD price from CoinGecko: ${err.message}`);
   }
 }
 
@@ -355,6 +529,83 @@ async function updateLoading(ctx: ZendContext, messageId: number, text: string):
 
 async function finishLoading(ctx: ZendContext, messageId: number, text: string, parseMode?: string): Promise<void> {
   await ctx.telegram.editMessageText(ctx.chat!.id, messageId, undefined, text, parseMode ? { parse_mode: parseMode as any } : undefined);
+}
+
+// ─── Ambassador Program Helpers ───
+
+async function getAmbassadorActiveUserCount(code: string): Promise<number> {
+  const result = await db.select({ count: sql`count(distinct ${users.id})` })
+    .from(users)
+    .where(
+      and(
+        eq(users.ambassadorReferralCode, code),
+        sql`exists (select 1 from ${transactions} where ${transactions.userId} = ${users.id} and ${transactions.status} = 'completed')`
+      )
+    );
+  return Number(result[0]?.count || 0);
+}
+
+async function getAmbassadorMonthlyVolume(code: string, year: number, month: number): Promise<number> {
+  const start = new Date(year, month - 1, 1).toISOString();
+  const end = new Date(year, month, 1).toISOString();
+  const result = await db.select({ sum: sql`coalesce(sum(${transactions.ngnAmount}), 0)` })
+    .from(transactions)
+    .innerJoin(users, eq(transactions.userId, users.id))
+    .where(
+      and(
+        eq(users.ambassadorReferralCode, code),
+        eq(transactions.status, 'completed'),
+        sql`${transactions.createdAt} >= ${start}`,
+        sql`${transactions.createdAt} < ${end}`
+      )
+    );
+  return Number(result[0]?.sum || 0);
+}
+
+async function getAmbassadorTotalVolume(code: string): Promise<number> {
+  const result = await db.select({ sum: sql`coalesce(sum(${transactions.ngnAmount}), 0)` })
+    .from(transactions)
+    .innerJoin(users, eq(transactions.userId, users.id))
+    .where(
+      and(
+        eq(users.ambassadorReferralCode, code),
+        eq(transactions.status, 'completed')
+      )
+    );
+  return Number(result[0]?.sum || 0);
+}
+
+function getAmbassadorTierFromCount(activeCount: number): 'entry' | 'pro' | 'elite' {
+  if (activeCount >= 300) return 'elite';
+  if (activeCount >= 75) return 'pro';
+  return 'entry';
+}
+
+function getCommissionRateBps(tier: string): number {
+  const map: Record<string, number> = { entry: 25, pro: 30, elite: 35 };
+  return map[tier] || 25;
+}
+
+function calculateCommissionNgn(volumeNgn: number, tier: string): number {
+  return volumeNgn * (getCommissionRateBps(tier) / 10000);
+}
+
+function formatAmbassadorTier(tier: string): string {
+  const map: Record<string, string> = {
+    entry: '🥉 ZendER (Entry)',
+    pro: '🥈 ZendER Pro',
+    elite: '🥇 ZendER Elite',
+  };
+  return map[tier] || tier;
+}
+
+function formatAmbassadorStatus(status: string): string {
+  const map: Record<string, string> = {
+    pending: '⏳ Pending',
+    confirmed: '✅ Confirmed',
+    removed: '❌ Removed',
+  };
+  return map[status] || status;
 }
 
 // ─── Rate Cache ───
@@ -383,12 +634,60 @@ async function getPAJRates(): Promise<{ onRampRate: number; offRampRate: number 
   }
 }
 
+// ─── Bot Features (AI awareness) ───
+let _botFeaturesCache: any[] | null = null;
+let _botFeaturesCacheTime = 0;
+
+async function getBotFeatures(): Promise<any[]> {
+  if (_botFeaturesCache && Date.now() - _botFeaturesCacheTime < 300000) {
+    return _botFeaturesCache;
+  }
+  try {
+    const rows = await db.select().from(botFeatures).where(eq(botFeatures.isActive, true));
+    _botFeaturesCache = rows;
+    _botFeaturesCacheTime = Date.now();
+    return rows;
+  } catch (err) {
+    console.log('[Features] DB fetch failed, using cache/empty');
+    return _botFeaturesCache || [];
+  }
+}
+
+async function seedBotFeatures() {
+  try {
+    const existing = await db.select({ count: sql`count(*)` }).from(botFeatures);
+    if (Number(existing[0]?.count) > 0) return;
+
+    const features = [
+      { key: 'balance', name: 'Check Balance', description: 'Dollars (USDT/USDC) and SOL with live Naira rates', category: 'payment', sortOrder: 1 },
+      { key: 'add_naira', name: 'Add Naira', description: 'Bank transfer to a virtual account, get Dollars in your wallet', category: 'payment', sortOrder: 2 },
+      { key: 'send', name: 'Send to Bank', description: 'Send money to any Nigerian bank (GTB, UBA, Access, OPay, Kuda, etc.)', category: 'payment', sortOrder: 3 },
+      { key: 'receive', name: 'Receive Money', description: 'Crypto address for direct deposit + virtual bank account for Naira', category: 'payment', sortOrder: 4 },
+      { key: 'swap', name: 'Convert Currency', description: 'Exchange SOL ↔ USDT ↔ USDC ↔ AUDD', category: 'payment', sortOrder: 5 },
+      { key: 'deposit_crypto', name: 'Deposit from Other Apps', description: 'Send Dollars or AUDD from Binance, MetaMask, Trust Wallet → receive in Zend', category: 'payment', sortOrder: 6 },
+      { key: 'history', name: 'Transaction History', description: 'View all past transactions', category: 'info', sortOrder: 7 },
+      { key: 'voice', name: 'Voice Commands', description: 'Send a voice note to execute commands', category: 'info', sortOrder: 8 },
+      { key: 'scheduled', name: 'Scheduled Transfers', description: 'Schedule automatic recurring or one-time future payments', category: 'payment', sortOrder: 9 },
+      { key: 'shop', name: 'Shop (Airtime & Gift Cards)', description: 'Buy airtime, data bundles and retail vouchers via BitRefill', category: 'payment', sortOrder: 10 },
+      { key: 'settings', name: 'Settings', description: 'PIN, language, auto-save, PAJ linking, wallet export', category: 'settings', sortOrder: 11 },
+      { key: 'community', name: 'Community', description: 'Join the Zend Telegram community', category: 'info', sortOrder: 12 },
+    ];
+
+    for (const f of features) {
+      await db.insert(botFeatures).values(f);
+    }
+    console.log('[Features] Seeded', features.length, 'features');
+  } catch (err) {
+    console.error('[Features] Seed failed:', err);
+  }
+}
+
 // ─── Bank Verification ───
 // Cache PAJ bank list to map our bank codes ↔ PAJ bank IDs
 let _pajBankCache: Array<{ id: string; name: string; code: string }> | null = null;
 let _pajBankCacheTime = 0;
 
-async function getPajBankList(sessionToken: string): Promise<Array<{ id: string; name: string; code: string }>> {
+async function getPajBankList(sessionToken: string, userId?: string): Promise<Array<{ id: string; name: string; code: string }>> {
   if (_pajBankCache && Date.now() - _pajBankCacheTime < 3600000) {
     return _pajBankCache;
   }
@@ -399,8 +698,11 @@ async function getPajBankList(sessionToken: string): Promise<Array<{ id: string;
     _pajBankCache = banks.map((b: any) => ({ id: b.id, name: b.name, code: b.code || '' }));
     _pajBankCacheTime = Date.now();
     return _pajBankCache || [];
-  } catch (err) {
+  } catch (err: any) {
     console.error('[PAJ] Failed to fetch bank list:', err);
+    if (isPajSessionError(err) && userId) {
+      await clearPajSession(userId);
+    }
     return _pajBankCache || [];
   }
 }
@@ -458,18 +760,42 @@ function scoreBankMatch(pajName: string, ourCode: string): number {
   return 0;
 }
 
+// ─── PAJ Session Helpers ───
+
+function isPajSessionError(err: any): boolean {
+  const msg = (err?.message || '').toLowerCase();
+  const status = err?.statusCode || err?.status || err?.response?.status;
+  return status === 401 ||
+    msg.includes('session is invalid') ||
+    msg.includes('session expired') ||
+    msg.includes('unauthorized') ||
+    msg.includes('invalid token');
+}
+
+async function clearPajSession(userId: string) {
+  console.log('[PAJ] Clearing expired session for user:', userId);
+  try {
+    await db.update(users)
+      .set({ pajSessionToken: null, pajSessionExpiresAt: null, pajContact: null })
+      .where(eq(users.id, userId));
+  } catch (e) {
+    console.error('[PAJ] Failed to clear session:', e);
+  }
+}
+
 async function verifyBankAccount(
   sessionToken: string,
   ourBankCode: string,
-  accountNumber: string
-): Promise<{ verified: boolean; accountName?: string; error?: string }> {
+  accountNumber: string,
+  userId?: string
+): Promise<{ verified: boolean; accountName?: string; error?: string; sessionExpired?: boolean }> {
   const pajClient = await getPAJClient();
   if (!pajClient) {
     return { verified: false, error: 'PAJ not available' };
   }
 
   try {
-    const pajBanks = await getPajBankList(sessionToken);
+    const pajBanks = await getPajBankList(sessionToken, userId);
     const ourBank = NIGERIAN_BANKS.find(b => b.code === ourBankCode);
     if (!ourBank) {
       return { verified: false, error: 'Unknown bank code' };
@@ -494,18 +820,19 @@ async function verifyBankAccount(
     return { verified: true, accountName: result.accountName };
   } catch (err: any) {
     console.error('[PAJ] Bank verification failed:', err);
+    if (isPajSessionError(err) && userId) {
+      await clearPajSession(userId);
+      return { verified: false, error: 'Your PAJ session expired. Please re-link in Settings.', sessionExpired: true };
+    }
     return { verified: false, error: err.message || 'Could not verify account' };
   }
 }
 
 // ─── Keyboards ───
 const mainMenu = Markup.keyboard([
-  ['💰 Balance', '📤 Send'],
-  ['💵 Add Naira', '💴 Cash Out'],
-  ['🔄 Swap', '📥 Receive'],
-  ['📅 Schedule', '📋 History'],
-  ['💳 Bills', '⚙️ Settings'],
-  ['🌐 Community'],
+  ['💰 Balance', '📤 Send', '🔄 Swap'],
+  ['📥 Receive', '🎁 Shop', '📋 History'],
+  ['💳 Bills', '⚙️ Settings', '🌐 Community'],
 ]).resize();
 
 const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
@@ -524,6 +851,11 @@ const adminMenu = Markup.keyboard([
   ['📅 Scheduled', '🤖 QVAC Status'],
   ['🔙 Back to Menu'],
 ]).resize();
+
+// Escape Telegram legacy Markdown special chars in user-generated / AI text
+function escapeTelegramMarkdown(text: string): string {
+  return text.replace(/([_*\[\`])/g, '\\$1');
+}
 
 // ─── Bot ───
 const bot = new Telegraf<ZendContext>(BOT_TOKEN);
@@ -566,7 +898,7 @@ bot.use(async (ctx, next) => {
 // Track & auto-delete user messages during sensitive flows
 bot.on(message('text'), async (ctx, next) => {
   const userId = ctx.from?.id?.toString();
-  if (!userId || !ctx.chat) return next();
+  if (!userId || !ctx.chat || !ctx.message?.message_id) return next();
   const session = getSession(userId);
   const sensitiveStates = [
     ConversationState.AWAITING_PIN,
@@ -581,11 +913,35 @@ bot.on(message('text'), async (ctx, next) => {
     ConversationState.AWAITING_EMAIL,
     ConversationState.AWAITING_SEND_RECIPIENT,
     ConversationState.AWAITING_BANK_DETAILS,
+    ConversationState.AWAITING_SHOP_PHONE,
   ];
-  if (sensitiveStates.includes(session.state)) {
-    trackMessage(ctx.chat.id, ctx.message.message_id, session.state === ConversationState.AWAITING_PIN || session.state === ConversationState.AWAITING_PIN_VERIFY);
+  const isSensitive = sensitiveStates.includes(session.state);
+  const isPin = session.state === ConversationState.AWAITING_PIN || session.state === ConversationState.AWAITING_PIN_VERIFY;
+
+  if (isSensitive) {
+    trackMessage(ctx.chat.id, ctx.message.message_id, isPin);
   }
-  return next();
+
+  await next(); // let the main handler process the message
+
+  // Immediately delete user messages for sensitive flows (more reliable than queue)
+  if (isSensitive) {
+    try {
+      await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id);
+      console.log(`[AutoDelete] Deleted user message ${ctx.message.message_id} in state ${session.state}`);
+    } catch (err: any) {
+      console.log(`[AutoDelete] Failed to delete user message ${ctx.message.message_id}:`, err.message);
+    }
+    // For PIN flows, also delete the bot's previous prompt message
+    if (isPin && session.lastBotMessageId) {
+      try {
+        await ctx.telegram.deleteMessage(ctx.chat.id, session.lastBotMessageId);
+        console.log(`[AutoDelete] Deleted bot prompt ${session.lastBotMessageId}`);
+      } catch (err: any) {
+        console.log(`[AutoDelete] Failed to delete bot prompt ${session.lastBotMessageId}:`, err.message);
+      }
+    }
+  }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -644,7 +1000,7 @@ function isGroupChat(ctx: ZendContext): boolean {
 }
 
 function getBotUsername(ctx: ZendContext): string {
-  return ctx.botInfo?.username || 'ZendBot';
+  return ctx.botInfo?.username || 'zend_money_bot';
 }
 
 async function promptPrivateChat(ctx: ZendContext, action: string) {
@@ -658,6 +1014,266 @@ async function promptPrivateChat(ctx: ZendContext, action: string) {
     ])
   );
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// /MYREF — Ambassador Self-Service Stats
+// ═════════════════════════════════════════════════════════════════════════════
+
+bot.command('myref', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  const handle = username ? username.toLowerCase().replace(/^@/, '') : '';
+
+  if (!handle) {
+    await ctx.reply('❌ You need a Telegram username to be an ambassador. Set one in Telegram Settings.');
+    return;
+  }
+
+  const ambRows = await db.select().from(ambassadorApplications)
+    .where(sql`LOWER(${ambassadorApplications.tgHandle}) = LOWER(${handle})`)
+    .limit(1);
+
+  if (ambRows.length === 0) {
+    await ctx.reply(
+      `🧑‍🎓 *ZendER Programme*\n\n` +
+      `You are not registered as a Zend ambassador.\n\n` +
+      `Apply at: https://zend-simple-payments-production.up.railway.app/ambassador`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  const amb = ambRows[0];
+
+  if (amb.status === 'pending') {
+    await ctx.reply(
+      `⏳ *ZendER Application Pending*\n\n` +
+      `Hi ${escapeTelegramMarkdown(amb.name)}, your application is being reviewed.\n\n` +
+      `Complete your starter tasks and the team will confirm you soon.`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  if (amb.status === 'removed') {
+    await ctx.reply(
+      `❌ *ZendER Status Removed*\n\n` +
+      `Your ambassador access has been revoked. Contact the programme manager for more info.`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  // Confirmed ambassador — show stats
+  let activeCount = 0;
+  let totalVolume = 0;
+  let currentMonthVolume = 0;
+  if (amb.customReferralCode) {
+    activeCount = await getAmbassadorActiveUserCount(amb.customReferralCode);
+    totalVolume = await getAmbassadorTotalVolume(amb.customReferralCode);
+    const now = new Date();
+    currentMonthVolume = await getAmbassadorMonthlyVolume(amb.customReferralCode, now.getFullYear(), now.getMonth() + 1);
+  }
+
+  const computedTier = getAmbassadorTierFromCount(activeCount);
+  const rate = getCommissionRateBps(computedTier);
+  const monthCommission = calculateCommissionNgn(currentMonthVolume, computedTier);
+  const totalCommission = calculateCommissionNgn(totalVolume, computedTier);
+  const nextTier = computedTier === 'entry' ? 'Pro (75)' : computedTier === 'pro' ? 'Elite (300)' : 'Maxed';
+  const toNext = computedTier === 'entry' ? Math.max(0, 75 - activeCount) : computedTier === 'pro' ? Math.max(0, 300 - activeCount) : 0;
+
+  let text =
+    `🎯 *Your ZendER Dashboard*\n\n` +
+    `*Name:* ${escapeTelegramMarkdown(amb.name)}\n` +
+    `*Tier:* ${formatAmbassadorTier(computedTier)}\n` +
+    `*Commission Rate:* ${(rate / 100).toFixed(2)}%\n\n`;
+
+  if (amb.customReferralCode) {
+    text +=
+      `🔗 *Your Referral Link*\n` +
+      `\`t.me/zend_money_bot?start=${amb.customReferralCode}\`\n\n`;
+  }
+
+  text +=
+    `📊 *Stats*\n` +
+    `• Active Users: ${activeCount}${toNext > 0 ? ` (${toNext} to ${nextTier})` : ''}\n` +
+    `• Total Volume: ₦${totalVolume.toLocaleString()}\n` +
+    `• This Month Volume: ₦${currentMonthVolume.toLocaleString()}\n` +
+    `• Est. Monthly Commission: ₦${Math.round(monthCommission).toLocaleString()}\n` +
+    `• Est. Total Commission: ₦${Math.round(totalCommission).toLocaleString()}\n\n` +
+    `💡 Only users who sign up *and complete a transaction* count as active.`;
+
+  await ctx.reply(text, { parse_mode: 'Markdown' });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// /BULKSEND — Batch Send to Multiple Recipients
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function startBulkSend(ctx: ZendContext, userId: string) {
+  setSession(userId, { state: ConversationState.AWAITING_BULK_SEND_INPUT, pendingTransaction: { bulkRecipients: [] } as any });
+  await ctx.reply(
+    `📦 *Bulk Send*\n\n` +
+    `Send money to multiple people at once.\n\n` +
+    `Paste your recipient list. One per line, format:\n` +
+    `\`AMOUNT BANK_CODE ACCOUNT_NUMBER ACCOUNT_NAME\`\n\n` +
+    `*Example:*\n` +
+    `\`\`\`\n` +
+    `50000 GTB 0123456789 John Doe\n` +
+    `30000 UBA 9876543210 Jane Smith\n` +
+    `25000 OPY 1234567890 Mike Johnson\n` +
+    `\`\`\`\n\n` +
+    `Supported banks: GTB, UBA, ACC, ZEN, FBN, ECO, OPY, KUD, MON, etc.`,
+    { parse_mode: 'Markdown', ...cancelKeyboard }
+  );
+}
+
+bot.command('bulksend', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  await startBulkSend(ctx, userId);
+});
+
+bot.hears('📦 Bulk Send', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  await startBulkSend(ctx, userId);
+});
+
+// ─── Parse bulk recipient line ───
+function parseBulkRecipient(line: string): { amountNgn: number; bankCode: string; bankName: string; accountNumber: string; accountName: string } | null {
+  const tokens = line.trim().split(/\s+/);
+  if (tokens.length < 4) return null;
+
+  const amount = parseInt(tokens[0].replace(/[^0-9]/g, ''), 10);
+  if (!amount || amount < 100) return null;
+
+  const bankCodeInput = tokens[1].toUpperCase();
+  const bank = NIGERIAN_BANKS.find(b => b.code === bankCodeInput);
+  if (!bank) return null;
+
+  const accountNumber = tokens[2];
+  if (!/^\d{10}$/.test(accountNumber)) return null;
+
+  const accountName = tokens.slice(3).join(' ');
+  if (accountName.length < 2) return null;
+
+  return { amountNgn: amount, bankCode: bank.code, bankName: bank.name, accountNumber, accountName };
+}
+
+// ─── Execute bulk send ───
+async function executeBulkSend(
+  ctx: ZendContext,
+  userId: string,
+  recipients: Array<{ amountNgn: number; bankCode: string; bankName: string; accountNumber: string; accountName: string }>
+): Promise<void> {
+  const loading = await showLoading(ctx, `Executing ${recipients.length} transfers...`);
+
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  const walletAddress = user[0]?.walletAddress;
+
+  const pajClient = await getPAJClient();
+  let rate = 1550;
+  try {
+    if (pajClient) {
+      const rates = await getPAJRates();
+      rate = rates.offRampRate;
+    }
+  } catch { /* fallback */ }
+
+  const results: Array<{ success: boolean; recipient: string; amountNgn: number; error?: string; txId?: string }> = [];
+
+  for (let i = 0; i < recipients.length; i++) {
+    const r = recipients[i];
+    const transferUsdt = r.amountNgn / rate;
+
+    // Calculate per-recipient fee based on current SOL balance
+    const feeInfo = walletAddress
+      ? await calculateSendFee(transferUsdt, walletAddress)
+      : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
+    const amountUsdt = transferUsdt + feeInfo.zendFeeUsdt;
+
+    await updateLoading(ctx, loading.message_id, `Transfer ${i + 1}/${recipients.length}: ${r.accountName}...`);
+
+    try {
+      const result = await executeSendCore(userId, {
+        amountNgn: r.amountNgn,
+        amountUsdt,
+        ngnRate: rate,
+        zendFeeUsdt: feeInfo.zendFeeUsdt,
+        feeSol: feeInfo.feeSol,
+        recipientBankCode: r.bankCode,
+        recipientBankName: r.bankName,
+        recipientAccountNumber: r.accountNumber,
+        recipientAccountName: r.accountName,
+        recipientName: r.accountName,
+      });
+
+      results.push({
+        success: result.success,
+        recipient: r.accountName,
+        amountNgn: r.amountNgn,
+        txId: result.txId,
+        error: result.error,
+      });
+    } catch (err: any) {
+      results.push({
+        success: false,
+        recipient: r.accountName,
+        amountNgn: r.amountNgn,
+        error: err.message || 'Transfer failed',
+      });
+    }
+  }
+
+  const successCount = results.filter(r => r.success).length;
+  const failCount = results.filter(r => !r.success).length;
+  const totalSent = results.filter(r => r.success).reduce((sum, r) => sum + r.amountNgn, 0);
+
+  let report = `📦 *Bulk Send Complete*\n\n`;
+  report += `✅ Successful: ${successCount}\n`;
+  report += `❌ Failed: ${failCount}\n`;
+  report += `💰 Total Sent: ₦${totalSent.toLocaleString()}\n\n`;
+
+  if (failCount > 0) {
+    report += `*Failed transfers:*\n`;
+    report += results.filter(r => !r.success).map(r =>
+      `• ${escapeTelegramMarkdown(r.recipient)} — ₦${r.amountNgn.toLocaleString()}: ${escapeTelegramMarkdown(r.error || 'Unknown error')}`
+    ).join('\n');
+    report += '\n\n';
+  }
+
+  if (successCount > 0) {
+    report += `*Successful transfers:*\n`;
+    report += results.filter(r => r.success).map(r =>
+      `• ${escapeTelegramMarkdown(r.recipient)} — ₦${r.amountNgn.toLocaleString()}${r.txId ? ` (\`${r.txId}\`)` : ''}`
+    ).join('\n');
+  }
+
+  await finishLoading(ctx, loading.message_id, report, 'Markdown');
+  await ctx.reply('Menu:', mainMenu);
+}
+
+bot.action('bulk_send_confirm', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const session = getSession(userId);
+  const recipients = (session.pendingTransaction as any)?.bulkRecipients as Array<{ amountNgn: number; bankCode: string; bankName: string; accountNumber: string; accountName: string }> | undefined;
+
+  if (!recipients || recipients.length === 0) {
+    await ctx.answerCbQuery('Session expired');
+    await ctx.editMessageText('❌ Session expired. Please start over.', mainMenu);
+    return;
+  }
+
+  setSession(userId, { state: ConversationState.IDLE });
+  await ctx.answerCbQuery('Executing...');
+  await executeBulkSend(ctx, userId, recipients);
+});
+
+bot.action('bulk_send_cancel', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  setSession(userId, { state: ConversationState.IDLE });
+  await ctx.answerCbQuery('Cancelled');
+  await ctx.editMessageText('❌ Bulk send cancelled.', mainMenu);
+});
 
 // ═════════════════════════════════════════════════════════════════════════════
 // /START — Onboarding
@@ -676,6 +1292,29 @@ bot.command('start', async (ctx) => {
     return;
   }
 
+  // Parse deep link referral param: /start <code>
+  const startPayload = ctx.message?.text?.split(' ')[1]?.trim() || '';
+  let ambassadorRefCode: string | undefined;
+  let referredByUserId: string | undefined;
+
+  if (startPayload) {
+    // Check if it's a confirmed ambassador's custom code
+    const ambassadorMatch = await db.select().from(ambassadorApplications)
+      .where(and(
+        eq(ambassadorApplications.customReferralCode, startPayload.toLowerCase()),
+        eq(ambassadorApplications.status, 'confirmed')
+      )).limit(1);
+    if (ambassadorMatch.length > 0) {
+      ambassadorRefCode = startPayload.toLowerCase();
+    } else {
+      // Check if it's a regular user referral code
+      const refUser = await db.select({ id: users.id }).from(users).where(eq(users.referralCode, startPayload.toUpperCase())).limit(1);
+      if (refUser.length > 0) {
+        referredByUserId = refUser[0].id;
+      }
+    }
+  }
+
   // Generate wallet
   const wallet = walletService.generateWallet();
   const encryptedKey = await encryptPrivateKey(wallet.secretKey);
@@ -689,6 +1328,8 @@ bot.command('start', async (ctx) => {
     walletAddress: wallet.publicKey,
     walletEncryptedKey: encryptedKey,
     referralCode,
+    referredBy: referredByUserId,
+    ambassadorReferralCode: ambassadorRefCode,
   });
 
   await ctx.reply(
@@ -708,6 +1349,763 @@ bot.command('start', async (ctx) => {
     `💡 Tap *💵 Add Naira* to get your virtual bank account.`,
     { parse_mode: 'Markdown', ...mainMenu }
   );
+  await ctx.reply('📋 Tap to copy your address:', Markup.inlineKeyboard([
+    [{ text: '📋 Copy Address', copy_text: { text: wallet.publicKey } } as any]
+  ]));
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// /ADMIN — Admin Dashboard
+// ═════════════════════════════════════════════════════════════════════════════
+
+const ADMIN_TELEGRAM_IDS = (process.env.ADMIN_TELEGRAM_IDS || process.env.ADMIN_TELEGRAM_ID || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
+async function checkAdmin(userId: string, username?: string): Promise<boolean> {
+  if (ADMIN_TELEGRAM_IDS.length > 0) {
+    if (ADMIN_TELEGRAM_IDS.includes(userId)) return true;
+    if (username && ADMIN_TELEGRAM_IDS.includes(username.toLowerCase())) return true;
+  }
+  const u = await db.select({ isAdmin: users.isAdmin, telegramUsername: users.telegramUsername }).from(users).where(eq(users.id, userId)).limit(1);
+  if (u.length > 0 && u[0].isAdmin) return true;
+  if (u.length > 0 && u[0].telegramUsername && ADMIN_TELEGRAM_IDS.includes(u[0].telegramUsername.toLowerCase())) return true;
+  return false;
+}
+
+// ─── Admin Navigation ───
+const adminMainKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback('📊 Overview', 'admin_page:overview')],
+  [Markup.button.callback('👤 Users', 'admin_page:users'), Markup.button.callback('🧑‍🎓 Ambassadors', 'admin_page:ambassadors')],
+  [Markup.button.callback('🚨 Suspensions', 'admin_page:suspensions'), Markup.button.callback('💰 Fees & Revenue', 'admin_page:fees')],
+  [Markup.button.callback('🎯 Ref Links', 'admin_page:ambassador_refs'), Markup.button.callback('🔍 Search', 'admin_page:search')],
+  [Markup.button.callback('⚙️ Features', 'admin_page:features')],
+]);
+
+bot.command('admin', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) {
+    await ctx.reply('❌ You do not have permission to access the admin panel.');
+    return;
+  }
+  await ctx.reply('🛠 *Zend Admin Panel*\n\nChoose a section:', { parse_mode: 'Markdown', ...adminMainKeyboard });
+});
+
+bot.action('admin_back', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  await ctx.editMessageText('🛠 *Zend Admin Panel*\n\nChoose a section:', { parse_mode: 'Markdown', ...adminMainKeyboard });
+  await ctx.answerCbQuery();
+});
+
+// ─── Overview ───
+bot.action('admin_page:overview', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const userCount = await db.select({ count: sql`count(*)` }).from(users);
+  const txCount = await db.select({ count: sql`count(*)` }).from(transactions);
+  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_send'));
+  const totalNgnIn = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
+  const totalZendFee = await db.select({ sum: sql`coalesce(sum(zend_fee_usdt), 0)` }).from(transactions).where(eq(transactions.status, 'completed'));
+  const activeFeatures = await db.select().from(botFeatures).where(eq(botFeatures.isActive, true));
+
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const newToday = await db.select({ count: sql`count(*)` }).from(users).where(sql`${users.createdAt} >= ${todayStart.toISOString()}`);
+
+  const text =
+    `📊 *Overview*\n\n` +
+    `👤 Total Users: ${userCount[0]?.count || 0} (+${newToday[0]?.count || 0} today)\n` +
+    `📋 Total Transactions: ${txCount[0]?.count || 0}\n` +
+    `💰 Total NGN In: ₦${Number(totalNgnIn[0]?.sum || 0).toLocaleString()}\n` +
+    `💸 Total NGN Out: ₦${Number(totalNgnOut[0]?.sum || 0).toLocaleString()}\n` +
+    `🪙 Zend Fees (USDT): $${Number(totalZendFee[0]?.sum || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}\n` +
+    `✅ Active Features: ${activeFeatures.length}\n`;
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+// ─── Users (paginated) ───
+const USERS_PER_PAGE = 20;
+
+bot.action('admin_page:users', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const total = await db.select({ count: sql`count(*)` }).from(users);
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const newToday = await db.select({ count: sql`count(*)` }).from(users).where(sql`${users.createdAt} >= ${todayStart.toISOString()}`);
+  const weekStart = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const newWeek = await db.select({ count: sql`count(*)` }).from(users).where(sql`${users.createdAt} >= ${weekStart.toISOString()}`);
+
+  const recentUsers = await db.select({
+    id: users.id,
+    name: users.firstName,
+    username: users.telegramUsername,
+    createdAt: users.createdAt,
+    wallet: users.walletAddress,
+  }).from(users).orderBy(sql`${users.createdAt} desc`).limit(USERS_PER_PAGE);
+
+  let userList = recentUsers.map(u =>
+    `- ${escapeTelegramMarkdown(u.name || 'Unknown')}${u.username ? ` (@${escapeTelegramMarkdown(u.username.replace(/^@/, ''))})` : ''} | \`${u.wallet?.slice(0, 6)}...${u.wallet?.slice(-4)}\``
+  ).join('\n');
+
+  const text =
+    `👤 *Users* (page 1)\n\n` +
+    `Total: ${total[0]?.count || 0} | New today: ${newToday[0]?.count || 0} | This week: ${newWeek[0]?.count || 0}\n\n` +
+    `${userList || 'No users yet.'}`;
+
+  const navButtons = [];
+  if (Number(total[0]?.count || 0) > USERS_PER_PAGE) {
+    navButtons.push(Markup.button.callback('➡️ Next', 'admin_users_page:1'));
+  }
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([navButtons, [Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_users_page:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const page = parseInt(ctx.match[1], 10);
+  const offset = page * USERS_PER_PAGE;
+
+  const total = await db.select({ count: sql`count(*)` }).from(users);
+  const pageUsers = await db.select({
+    id: users.id,
+    name: users.firstName,
+    username: users.telegramUsername,
+    wallet: users.walletAddress,
+  }).from(users).orderBy(sql`${users.createdAt} desc`).limit(USERS_PER_PAGE).offset(offset);
+
+  let userList = pageUsers.map(u =>
+    `- ${escapeTelegramMarkdown(u.name || 'Unknown')}${u.username ? ` (@${escapeTelegramMarkdown(u.username.replace(/^@/, ''))})` : ''} | \`${u.wallet?.slice(0, 6)}...${u.wallet?.slice(-4)}\``
+  ).join('\n');
+
+  const totalCount = Number(total[0]?.count || 0);
+  const text = `👤 *Users* (page ${page + 1})\n\n${userList || 'No more users.'}`;
+
+  const navButtons = [];
+  if (page > 0) navButtons.push(Markup.button.callback('⬅️ Prev', `admin_users_page:${page - 1}`));
+  if (totalCount > offset + USERS_PER_PAGE) navButtons.push(Markup.button.callback('➡️ Next', `admin_users_page:${page + 1}`));
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([navButtons, [Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+// ─── Ambassadors (paginated) ───
+const AMBS_PER_PAGE = 20;
+
+bot.action('admin_page:ambassadors', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const total = await db.select({ count: sql`count(*)` }).from(ambassadorApplications);
+  const apps = await db.select().from(ambassadorApplications).orderBy(sql`${ambassadorApplications.createdAt} desc`).limit(AMBS_PER_PAGE);
+
+  let list = apps.map((a, i) =>
+    `${i + 1}. *${escapeTelegramMarkdown(a.name)}* (@${escapeTelegramMarkdown(a.tgHandle.replace(/^@/, ''))})\n` +
+    `   Student: ${escapeTelegramMarkdown(a.isStudent)} | Focus: ${escapeTelegramMarkdown(a.focus)}`
+  ).join('\n\n');
+
+  const text = `🧑‍🎓 *Ambassadors* (page 1) — ${total[0]?.count || 0} total\n\n${list || 'No applications yet.'}`;
+
+  const navButtons = [];
+  if (Number(total[0]?.count || 0) > AMBS_PER_PAGE) {
+    navButtons.push(Markup.button.callback('➡️ Next', 'admin_ambassadors_page:1'));
+  }
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([navButtons, [Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_ambassadors_page:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const page = parseInt(ctx.match[1], 10);
+  const offset = page * AMBS_PER_PAGE;
+
+  const total = await db.select({ count: sql`count(*)` }).from(ambassadorApplications);
+  const apps = await db.select().from(ambassadorApplications).orderBy(sql`${ambassadorApplications.createdAt} desc`).limit(AMBS_PER_PAGE).offset(offset);
+
+  let list = apps.map((a, i) =>
+    `${offset + i + 1}. *${escapeTelegramMarkdown(a.name)}* (@${escapeTelegramMarkdown(a.tgHandle.replace(/^@/, ''))})\n` +
+    `   Student: ${escapeTelegramMarkdown(a.isStudent)} | Focus: ${escapeTelegramMarkdown(a.focus)}`
+  ).join('\n\n');
+
+  const totalCount = Number(total[0]?.count || 0);
+  const text = `🧑‍🎓 *Ambassadors* (page ${page + 1}) — ${totalCount} total\n\n${list || 'No more applications.'}`;
+
+  const navButtons = [];
+  if (page > 0) navButtons.push(Markup.button.callback('⬅️ Prev', `admin_ambassadors_page:${page - 1}`));
+  if (totalCount > offset + AMBS_PER_PAGE) navButtons.push(Markup.button.callback('➡️ Next', `admin_ambassadors_page:${page + 1}`));
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([navButtons, [Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+// ─── Suspensions (paginated) ───
+const SUSP_PER_PAGE = 20;
+
+bot.action('admin_page:suspensions', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const total = await db.select({ count: sql`count(*)` }).from(deviceSuspensionRequests);
+  const reqs = await db.select().from(deviceSuspensionRequests).orderBy(sql`${deviceSuspensionRequests.createdAt} desc`).limit(SUSP_PER_PAGE);
+
+  let list = reqs.map((r, i) =>
+    `${i + 1}. *${escapeTelegramMarkdown(r.fullName)}* (@${escapeTelegramMarkdown(r.handle.replace(/^@/, ''))})\n` +
+    `   📧 ${escapeTelegramMarkdown(r.email)} | 📱 ${escapeTelegramMarkdown(r.phone)}\n` +
+    `   Device: ${escapeTelegramMarkdown(r.deviceLost)}${r.details ? `\n   Details: ${escapeTelegramMarkdown(r.details.slice(0, 100))}` : ''}`
+  ).join('\n\n');
+
+  const text = `🚨 *Suspensions* (page 1) — ${total[0]?.count || 0} total\n\n${list || 'No requests yet.'}`;
+
+  const navButtons = [];
+  if (Number(total[0]?.count || 0) > SUSP_PER_PAGE) navButtons.push(Markup.button.callback('➡️ Next', 'admin_suspensions_page:1'));
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([navButtons, [Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_suspensions_page:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const page = parseInt(ctx.match[1], 10);
+  const offset = page * SUSP_PER_PAGE;
+
+  const total = await db.select({ count: sql`count(*)` }).from(deviceSuspensionRequests);
+  const reqs = await db.select().from(deviceSuspensionRequests).orderBy(sql`${deviceSuspensionRequests.createdAt} desc`).limit(SUSP_PER_PAGE).offset(offset);
+
+  let list = reqs.map((r, i) =>
+    `${offset + i + 1}. *${escapeTelegramMarkdown(r.fullName)}* (@${escapeTelegramMarkdown(r.handle.replace(/^@/, ''))})\n` +
+    `   📧 ${escapeTelegramMarkdown(r.email)} | 📱 ${escapeTelegramMarkdown(r.phone)}\n` +
+    `   Device: ${escapeTelegramMarkdown(r.deviceLost)}${r.details ? `\n   Details: ${escapeTelegramMarkdown(r.details.slice(0, 100))}` : ''}`
+  ).join('\n\n');
+
+  const totalCount = Number(total[0]?.count || 0);
+  const text = `🚨 *Suspensions* (page ${page + 1}) — ${totalCount} total\n\n${list || 'No more requests.'}`;
+
+  const navButtons = [];
+  if (page > 0) navButtons.push(Markup.button.callback('⬅️ Prev', `admin_suspensions_page:${page - 1}`));
+  if (totalCount > offset + SUSP_PER_PAGE) navButtons.push(Markup.button.callback('➡️ Next', `admin_suspensions_page:${page + 1}`));
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([navButtons, [Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+// ─── Fees & Revenue ───
+bot.action('admin_page:fees', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const totalZendFee = await db.select({ sum: sql`coalesce(sum(zend_fee_usdt), 0)` }).from(transactions).where(eq(transactions.status, 'completed'));
+  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_send'));
+  const totalNgnIn = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
+
+  const offrampCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'ngn_send'));
+  const onrampCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
+  const swapCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'swap'));
+  const shopCount = await db.select({ count: sql`count(*)` }).from(bitrefillOrders);
+  const shopVolume = await db.select({ sum: sql`coalesce(sum(amount_fiat), 0)` }).from(bitrefillOrders).where(eq(bitrefillOrders.status, 'completed'));
+
+  const text =
+    `💰 *Fees & Revenue*\n\n` +
+    `🪙 Total Zend Fees: $${Number(totalZendFee[0]?.sum || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}\n\n` +
+    `📊 *Volume by Type:*\n` +
+    `📤 Off-Ramp: ${offrampCount[0]?.count || 0} tx | ₦${Number(totalNgnOut[0]?.sum || 0).toLocaleString()}\n` +
+    `📥 On-Ramp: ${onrampCount[0]?.count || 0} tx | ₦${Number(totalNgnIn[0]?.sum || 0).toLocaleString()}\n` +
+    `🔄 Swaps: ${swapCount[0]?.count || 0} tx\n` +
+    `🎁 Shop Orders: ${shopCount[0]?.count || 0} | $${Number(shopVolume[0]?.sum || 0).toLocaleString()}\n`;
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_back')]]) });
+  await ctx.answerCbQuery();
+});
+
+// ─── Features ───
+bot.action('admin_page:features', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const features = await db.select().from(botFeatures).orderBy(botFeatures.sortOrder);
+  const buttons = features.map(f => [
+    Markup.button.callback(`${f.isActive ? '🟢' : '🔴'} ${f.name}`, `admin_toggle_feature:${f.id}`)
+  ]);
+  buttons.push([Markup.button.callback('◀️ Back', 'admin_back')]);
+
+  const activeCount = features.filter(f => f.isActive).length;
+  const text = `⚙️ *Features* — ${activeCount} / ${features.length} active\n\nTap to toggle:`;
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_toggle_feature:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const featureId = parseInt(ctx.match[1], 10);
+  const feature = await db.select().from(botFeatures).where(eq(botFeatures.id, featureId)).limit(1);
+  if (feature.length === 0) { await ctx.answerCbQuery('Feature not found'); return; }
+
+  const newState = !feature[0].isActive;
+  await db.update(botFeatures).set({ isActive: newState }).where(eq(botFeatures.id, featureId));
+  _botFeaturesCache = null;
+
+  await ctx.answerCbQuery(`${feature[0].name} is now ${newState ? 'ON' : 'OFF'}`);
+
+  // Refresh features page
+  const features = await db.select().from(botFeatures).orderBy(botFeatures.sortOrder);
+  const buttons = features.map(f => [
+    Markup.button.callback(`${f.isActive ? '🟢' : '🔴'} ${f.name}`, `admin_toggle_feature:${f.id}`)
+  ]);
+  buttons.push([Markup.button.callback('◀️ Back', 'admin_back')]);
+  const activeCount = features.filter(f => f.isActive).length;
+  const text = `⚙️ *Features* — ${activeCount} / ${features.length} active\n\nTap to toggle:`;
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+});
+
+// ─── Ambassador Referrals ───
+
+bot.action('admin_page:ambassador_refs', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const ambassadors = await db.select().from(ambassadorApplications).orderBy(desc(ambassadorApplications.createdAt));
+
+  // Compute stats per ambassador
+  const stats: Record<number, { signups: number; active: number; volume: number }> = {};
+  for (const a of ambassadors) {
+    if (a.customReferralCode) {
+      const signups = await db.select({ count: sql`count(*)` }).from(users).where(eq(users.ambassadorReferralCode, a.customReferralCode));
+      const active = await getAmbassadorActiveUserCount(a.customReferralCode);
+      const volume = await getAmbassadorTotalVolume(a.customReferralCode);
+      stats[a.id] = { signups: Number(signups[0]?.count || 0), active, volume };
+    } else {
+      stats[a.id] = { signups: 0, active: 0, volume: 0 };
+    }
+  }
+
+  let list = ambassadors.map((a, i) => {
+    const s = stats[a.id];
+    const tierBadge = a.tier === 'elite' ? '🥇' : a.tier === 'pro' ? '🥈' : '🥉';
+    const statusIcon = a.status === 'confirmed' ? '✅' : a.status === 'removed' ? '❌' : '⏳';
+    return `${i + 1}. ${tierBadge} ${statusIcon} *${escapeTelegramMarkdown(a.name)}*\n   Active: ${s.active} | Vol: ₦${s.volume.toLocaleString()} | Code: ${a.customReferralCode ? `\`${a.customReferralCode}\`` : '—'}`;
+  }).join('\n\n');
+
+  const text = `🎯 *Ambassador Programme* — ${ambassadors.length} total\n\n${list || 'No ambassadors yet.'}\n\nTap an ambassador for details:`;
+
+  const buttons = ambassadors.map(a => [
+    Markup.button.callback(`${escapeTelegramMarkdown(a.name)}`, `admin_ambassador_detail:${a.id}`)
+  ]);
+  buttons.push([Markup.button.callback('🏆 Leaderboard', 'admin_ambassador_leaderboard')]);
+  buttons.push([Markup.button.callback('◀️ Back', 'admin_back')]);
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
+});
+
+bot.action('admin_ambassador_leaderboard', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const ambassadors = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.status, 'confirmed'));
+
+  const board = [];
+  for (const a of ambassadors) {
+    if (!a.customReferralCode) continue;
+    const active = await getAmbassadorActiveUserCount(a.customReferralCode);
+    const volume = await getAmbassadorTotalVolume(a.customReferralCode);
+    board.push({ ...a, active, volume });
+  }
+  board.sort((a, b) => b.active - a.active);
+
+  let list = board.slice(0, 10).map((a, i) => {
+    const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
+    return `${medal} *${escapeTelegramMarkdown(a.name)}* — ${a.active} active | ₦${a.volume.toLocaleString()}`;
+  }).join('\n\n');
+
+  const text = `🏆 *ZendER Leaderboard* — Top ${board.length}\n\n${list || 'No confirmed ambassadors yet.'}`;
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_page:ambassador_refs')]]) });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_ambassador_detail:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const ambId = parseInt(ctx.match[1], 10);
+  const ambRows = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.id, ambId)).limit(1);
+  if (ambRows.length === 0) { await ctx.answerCbQuery('Ambassador not found'); return; }
+  const amb = ambRows[0];
+
+  let activeCount = 0;
+  let totalVolume = 0;
+  if (amb.customReferralCode) {
+    activeCount = await getAmbassadorActiveUserCount(amb.customReferralCode);
+    totalVolume = await getAmbassadorTotalVolume(amb.customReferralCode);
+  }
+
+  const computedTier = getAmbassadorTierFromCount(activeCount);
+  const rate = getCommissionRateBps(computedTier);
+  const commission = calculateCommissionNgn(totalVolume, computedTier);
+
+  const text =
+    `🧑‍🎓 *Ambassador Detail*\n\n` +
+    `*Name:* ${escapeTelegramMarkdown(amb.name)}\n` +
+    `*Handle:* @${escapeTelegramMarkdown(amb.tgHandle.replace(/^@/, ''))}\n` +
+    `*Focus:* ${escapeTelegramMarkdown(amb.focus)}\n` +
+    `*Student:* ${escapeTelegramMarkdown(amb.isStudent)}\n` +
+    `*Status:* ${formatAmbassadorStatus(amb.status)}\n` +
+    `*Tier:* ${formatAmbassadorTier(amb.tier)} (computed: ${formatAmbassadorTier(computedTier)})\n\n` +
+    `*Referral Code:* ${amb.customReferralCode ? `\`${amb.customReferralCode}\`` : '_(not set)_'}\n` +
+    `*Active Users:* ${activeCount}\n` +
+    `*Total Volume:* ₦${totalVolume.toLocaleString()}\n` +
+    `*Commission Rate:* ${(rate / 100).toFixed(2)}%\n` +
+    `*Est. Commission:* ₦${Math.round(commission).toLocaleString()}\n` +
+    `${amb.customReferralCode ? `*Link:* \`t.me/zend_money_bot?start=${amb.customReferralCode}\`` : ''}`;
+
+  const buttons = [
+    [Markup.button.callback('✏️ Set Code', `admin_set_ambassador_code:${amb.id}`)],
+    [Markup.button.callback('👥 View Active Users', `admin_ambassador_signups:${amb.id}`)],
+  ];
+  if (amb.status === 'pending') {
+    buttons.push([Markup.button.callback('✅ Confirm', `admin_confirm_ambassador:${amb.id}`)]);
+  }
+  if (amb.status !== 'removed') {
+    buttons.push([Markup.button.callback('❌ Remove', `admin_remove_ambassador:${amb.id}`)]);
+  }
+  buttons.push([Markup.button.callback('◀️ Back', 'admin_page:ambassador_refs')]);
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_confirm_ambassador:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const ambId = parseInt(ctx.match[1], 10);
+  await db.update(ambassadorApplications)
+    .set({ status: 'confirmed', confirmedAt: new Date() })
+    .where(eq(ambassadorApplications.id, ambId));
+
+  await ctx.answerCbQuery('✅ Ambassador confirmed');
+  await ctx.editMessageText('✅ Ambassador confirmed successfully.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', `admin_ambassador_detail:${ambId}`)]]));
+});
+
+bot.action(/admin_remove_ambassador:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const ambId = parseInt(ctx.match[1], 10);
+  await db.update(ambassadorApplications)
+    .set({ status: 'removed' })
+    .where(eq(ambassadorApplications.id, ambId));
+
+  await ctx.answerCbQuery('❌ Ambassador removed');
+  await ctx.editMessageText('❌ Ambassador removed. Their referral link is now deactivated.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', `admin_ambassador_detail:${ambId}`)]]));
+});
+
+bot.action(/admin_set_ambassador_code:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const ambId = parseInt(ctx.match[1], 10);
+  const ambRows = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.id, ambId)).limit(1);
+  if (ambRows.length === 0) { await ctx.answerCbQuery('Ambassador not found'); return; }
+
+  setSession(userId, { state: ConversationState.AWAITING_ADMIN_SET_AMBASSADOR_CODE, pendingTransaction: { recipientName: String(ambId) } as any });
+
+  await ctx.editMessageText(
+    `✏️ *Set Referral Code*\n\n` +
+    `Ambassador: *${escapeTelegramMarkdown(ambRows[0].name)}*\n\n` +
+    `Enter a unique code (lowercase, no spaces, e.g., \`ajemark\`, \`ghali\`):\n\n` +
+    `Current: ${ambRows[0].customReferralCode ? `\`${ambRows[0].customReferralCode}\`` : '_(none)_'}`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', `admin_ambassador_detail:${ambId}`)]]) }
+  );
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_ambassador_signups:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const ambId = parseInt(ctx.match[1], 10);
+  const ambRows = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.id, ambId)).limit(1);
+  if (ambRows.length === 0) { await ctx.answerCbQuery('Ambassador not found'); return; }
+  const amb = ambRows[0];
+
+  if (!amb.customReferralCode) {
+    await ctx.editMessageText('❌ This ambassador has no referral code set.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', `admin_ambassador_detail:${ambId}`)]]));
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  // Show ACTIVE users only (users with ≥1 completed transaction)
+  const activeUsers = await db.select({
+    id: users.id,
+    name: users.firstName,
+    username: users.telegramUsername,
+    createdAt: users.createdAt,
+  }).from(users)
+    .where(
+      and(
+        eq(users.ambassadorReferralCode, amb.customReferralCode),
+        sql`exists (select 1 from ${transactions} where ${transactions.userId} = ${users.id} and ${transactions.status} = 'completed')`
+      )
+    )
+    .orderBy(desc(users.createdAt))
+    .limit(20);
+
+  const totalActive = await getAmbassadorActiveUserCount(amb.customReferralCode);
+
+  let list = activeUsers.map((u, i) =>
+    `${i + 1}. ${escapeTelegramMarkdown(u.name || 'Unknown')}${u.username ? ` (@${escapeTelegramMarkdown(u.username.replace(/^@/, ''))})` : ''} — ${new Date(u.createdAt).toLocaleDateString('en-NG')}`
+  ).join('\n');
+
+  const text =
+    `👥 *Active Users via ${escapeTelegramMarkdown(amb.name)}*\n` +
+    `Code: \`${amb.customReferralCode}\` | Active: ${totalActive}\n\n` +
+    (list || 'No active users yet.');
+
+  const buttons = activeUsers.map(u => [Markup.button.callback(`View ${escapeTelegramMarkdown(u.name || 'User')}`, `admin_user:${u.id}`)]);
+  buttons.push([Markup.button.callback('◀️ Back', `admin_ambassador_detail:${ambId}`)]);
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
+});
+
+// ─── Admin Search ───
+
+const adminSearchKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback('🔎 Search Transaction', 'admin_search:txn')],
+  [Markup.button.callback('👤 Search User', 'admin_search:user')],
+  [Markup.button.callback('◀️ Back', 'admin_back')],
+]);
+
+bot.action('admin_page:search', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  await ctx.editMessageText('🔍 *Search*\n\nWhat do you want to look up?', { parse_mode: 'Markdown', ...adminSearchKeyboard });
+  await ctx.answerCbQuery();
+});
+
+bot.action('admin_search:txn', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  setSession(userId, { state: ConversationState.AWAITING_ADMIN_TXN_SEARCH });
+  await ctx.editMessageText('🔎 *Search Transaction*\n\nEnter the transaction ID (e.g., `ZND-12345`):', { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'admin_cancel_search')]]) });
+  await ctx.answerCbQuery();
+});
+
+bot.action('admin_search:user', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  setSession(userId, { state: ConversationState.AWAITING_ADMIN_USER_SEARCH });
+  await ctx.editMessageText('👤 *Search User*\n\nEnter a Telegram user ID or @username:', { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'admin_cancel_search')]]) });
+  await ctx.answerCbQuery();
+});
+
+bot.action('admin_cancel_search', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  setSession(userId, { state: ConversationState.IDLE });
+  await ctx.editMessageText('🔍 *Search*\n\nWhat do you want to look up?', { parse_mode: 'Markdown', ...adminSearchKeyboard });
+  await ctx.answerCbQuery('Cancelled');
+});
+
+function formatTxnStatus(status: string): string {
+  const map: Record<string, string> = {
+    pending: '⏳ Pending',
+    processing: '⏳ Processing',
+    completed: '✅ Completed',
+    failed: '❌ Failed',
+    cancelled: '🚫 Cancelled',
+  };
+  return map[status] || status;
+}
+
+function formatTxnType(type: string): string {
+  const map: Record<string, string> = {
+    offramp: '📤 Off-Ramp',
+    ngn_receive: '📥 On-Ramp',
+    swap: '🔄 Swap',
+    deposit: '⬇️ Deposit',
+    withdraw: '⬆️ Withdraw',
+  };
+  return map[type] || type;
+}
+
+async function buildTxnDetailText(txn: any): Promise<string> {
+  const userRows = await db.select({ firstName: users.firstName, telegramUsername: users.telegramUsername }).from(users).where(eq(users.id, txn.userId)).limit(1);
+  const u = userRows[0];
+
+  let text = `📋 *Transaction Detail*\n\n`;
+  text += `*ID:* \`${txn.id}\`\n`;
+  text += `*Type:* ${formatTxnType(txn.type)}\n`;
+  text += `*Status:* ${formatTxnStatus(txn.status)}\n`;
+  text += `*User:* ${escapeTelegramMarkdown(u?.firstName || 'Unknown')}${u?.telegramUsername ? ` (@${escapeTelegramMarkdown(u.telegramUsername.replace(/^@/, ''))})` : ''}\n`;
+  text += `*User ID:* \`${txn.userId}\`\n`;
+
+  if (txn.ngnAmount) {
+    text += `\n💰 *Fiat:*\n`;
+    text += `   NGN Amount: ₦${Number(txn.ngnAmount).toLocaleString()}\n`;
+    if (txn.ngnRate) text += `   Rate: ₦${Number(txn.ngnRate).toLocaleString()}\n`;
+  }
+
+  if (txn.fromAmount || txn.toAmount) {
+    text += `\n🪙 *Crypto:*\n`;
+    if (txn.fromAmount && txn.fromMint) text += `   From: ${Number(txn.fromAmount).toLocaleString(undefined, { maximumFractionDigits: 6 })} ${txn.fromMint.slice(0, 4)}...\n`;
+    if (txn.toAmount && txn.toMint) text += `   To: ${Number(txn.toAmount).toLocaleString(undefined, { maximumFractionDigits: 6 })} ${txn.toMint.slice(0, 4)}...\n`;
+  }
+
+  text += `\n📊 *Fees:*\n`;
+  if (txn.pajFeeBps) text += `   PAJ Fee: ${(txn.pajFeeBps / 100).toFixed(2)}%\n`;
+  if (txn.zendSpreadBps) text += `   Zend Spread: ${(txn.zendSpreadBps / 100).toFixed(2)}%\n`;
+  if (txn.zendFeeUsdt) text += `   Zend Fee: $${Number(txn.zendFeeUsdt).toLocaleString(undefined, { maximumFractionDigits: 6 })}\n`;
+
+  if (txn.recipientBankName || txn.recipientAccountNumber) {
+    text += `\n🏦 *Recipient:*\n`;
+    if (txn.recipientBankName) text += `   Bank: ${escapeTelegramMarkdown(txn.recipientBankName)}\n`;
+    if (txn.recipientAccountNumber) text += `   Account: \`${txn.recipientAccountNumber}\`\n`;
+    if (txn.recipientAccountName) text += `   Name: ${escapeTelegramMarkdown(txn.recipientAccountName)}\n`;
+  }
+
+  if (txn.recipientWalletAddress) {
+    text += `\n📬 *Wallet Recipient:*\n   \`${txn.recipientWalletAddress}\`\n`;
+  }
+
+  if (txn.solanaTxHash) {
+    text += `\n🔗 *Solana Tx:*\n   [View on Solscan](https://solscan.io/tx/${txn.solanaTxHash})\n`;
+  }
+
+  if (txn.pajReference) text += `\n📌 *PAJ Ref:* \`${txn.pajReference}\`\n`;
+  if (txn.chainrailsIntentAddress) text += `📌 *ChainRails:* \`${txn.chainrailsIntentAddress}\`\n`;
+
+  if (txn.createdAt) text += `\n🕐 *Created:* ${new Date(txn.createdAt).toLocaleString('en-NG')}\n`;
+  if (txn.completedAt) text += `🕐 *Completed:* ${new Date(txn.completedAt).toLocaleString('en-NG')}\n`;
+
+  if (txn.metadata) {
+    try {
+      const meta = typeof txn.metadata === 'string' ? JSON.parse(txn.metadata) : txn.metadata;
+      const metaStr = JSON.stringify(meta, null, 2).slice(0, 300);
+      if (metaStr.length > 10) text += `\n📝 *Metadata:*\n\`\`\`\n${escapeTelegramMarkdown(metaStr)}\n\`\`\``;
+    } catch { /* ignore */ }
+  }
+
+  return text;
+}
+
+async function buildUserDetailText(userRow: any): Promise<string> {
+  const txCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.userId, userRow.id));
+  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(and(eq(transactions.userId, userRow.id), eq(transactions.type, 'ngn_send')));
+  const totalNgnIn = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(and(eq(transactions.userId, userRow.id), eq(transactions.type, 'ngn_receive')));
+
+  const recentTxns = await db.select().from(transactions)
+    .where(eq(transactions.userId, userRow.id))
+    .orderBy(desc(transactions.createdAt))
+    .limit(5);
+
+  let text = `👤 *User Detail*\n\n`;
+  text += `*Name:* ${escapeTelegramMarkdown(userRow.firstName || 'Unknown')} ${escapeTelegramMarkdown(userRow.lastName || '')}\n`;
+  text += `*Username:* ${userRow.telegramUsername ? `@${escapeTelegramMarkdown(userRow.telegramUsername.replace(/^@/, ''))}` : 'N/A'}\n`;
+  text += `*ID:* \`${userRow.id}\`\n`;
+  text += `*Wallet:* \`${userRow.walletAddress}\`\n`;
+  text += `*Tier:* ${userRow.tier || 1} | *Lang:* ${userRow.language || 'en'}\n`;
+  if (userRow.autoSaveRateBps) text += `*Auto-save:* ${(userRow.autoSaveRateBps / 100).toFixed(1)}%\n`;
+  if (userRow.pajContact) text += `*PAJ Contact:* ${escapeTelegramMarkdown(userRow.pajContact)}\n`;
+
+  if (userRow.virtualAccount) {
+    try {
+      const va = typeof userRow.virtualAccount === 'string' ? JSON.parse(userRow.virtualAccount) : userRow.virtualAccount;
+      if (va?.accountNumber) text += `\n🏦 *Virtual Account:*\n   Bank: ${escapeTelegramMarkdown(va.bankName || 'N/A')}\n   Number: \`${va.accountNumber}\`\n`;
+    } catch { /* ignore */ }
+  }
+
+  text += `\n📊 *Stats:*\n`;
+  text += `   Total Txns: ${txCount[0]?.count || 0}\n`;
+  text += `   NGN In: ₦${Number(totalNgnIn[0]?.sum || 0).toLocaleString()}\n`;
+  text += `   NGN Out: ₦${Number(totalNgnOut[0]?.sum || 0).toLocaleString()}\n`;
+
+  if (recentTxns.length > 0) {
+    text += `\n📋 *Recent Transactions:*\n`;
+    text += recentTxns.map((t: any) =>
+      `   • ${formatTxnType(t.type)} ${formatTxnStatus(t.status)} | ₦${Number(t.ngnAmount || 0).toLocaleString()} | \`${t.id}\``
+    ).join('\n');
+  }
+
+  text += `\n\n🕐 *Joined:* ${new Date(userRow.createdAt).toLocaleString('en-NG')}`;
+  return text;
+}
+
+bot.action(/admin_txn:(.+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const txnId = ctx.match[1];
+  const txnRows = await db.select().from(transactions).where(eq(transactions.id, txnId)).limit(1);
+  if (txnRows.length === 0) {
+    await ctx.editMessageText('❌ Transaction not found.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_page:search')]]));
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  const text = await buildTxnDetailText(txnRows[0]);
+  const buttons = [
+    [Markup.button.callback('👤 View User', `admin_user:${txnRows[0].userId}`)],
+    [Markup.button.callback('🔍 New Search', 'admin_page:search')],
+  ];
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_user:(.+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const targetId = ctx.match[1];
+  const userRows = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
+  if (userRows.length === 0) {
+    await ctx.editMessageText('❌ User not found.', Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_page:search')]]));
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  const text = await buildUserDetailText(userRows[0]);
+  const buttons = [
+    [Markup.button.url('💬 Open Chat', `tg://user?id=${targetId}`)],
+    [Markup.button.callback('🔍 New Search', 'admin_page:search')],
+  ];
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -751,18 +2149,866 @@ bot.command('wallet', async (ctx) => {
     `👛 *Your Account*\n\n` +
     `*Your Address:*\n\n` +
     `${u.walletAddress}\n\n` +
-    `Tap and hold the address above to copy it.\n\n` +
-    `*Currencies:* SOL, USDT, USDC\n\n` +
+    `*Currencies:* SOL, USDT, USDC, AUDD\n\n` +
     `⚠️ To view your secret code, go to *⚙️ Settings*.`;
+
+  const copyBtn = Markup.inlineKeyboard([
+    [{ text: '📋 Copy Address', copy_text: { text: u.walletAddress } } as any]
+  ]);
 
   if (isGroupChat(ctx)) {
     const name = ctx.from?.first_name || 'there';
     await ctx.reply(`📩 ${name}, check your DM for your address.`);
-    await ctx.telegram.sendMessage(ctx.from!.id, msg, { parse_mode: 'Markdown' });
+    await ctx.telegram.sendMessage(ctx.from!.id, msg, { parse_mode: 'Markdown', ...copyBtn });
     return;
   }
 
-  await ctx.reply(msg, { parse_mode: 'Markdown' });
+  await ctx.reply(msg, { parse_mode: 'Markdown', ...copyBtn });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 🎁 SHOP — BitRefill Integration
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Cache for BitRefill products (TTL: 10 minutes)
+const bitrefillProductCache = new Map<string, { products: any[]; fetchedAt: number }>();
+const BITREFILL_CACHE_TTL = 10 * 60 * 1000;
+
+async function getCachedProducts(country: string, category?: string): Promise<any[]> {
+  const key = `${country}:${category || 'all'}`;
+  const cached = bitrefillProductCache.get(key);
+  if (cached && Date.now() - cached.fetchedAt < BITREFILL_CACHE_TTL) {
+    return cached.products;
+  }
+  const client = bitrefillClient || bitrefillBusinessClient;
+  if (!client) return [];
+  try {
+    const res = await client.getProducts({ country, category, limit: 50 });
+    const products = Array.isArray(res) ? res : (res.data || []);
+    console.log('[BitRefill] Fetched', products.length, 'products for', country, '- names:', products.map((p: any) => p.name).join(', '));
+    bitrefillProductCache.set(key, { products, fetchedAt: Date.now() });
+    return products;
+  } catch (err) {
+    console.error('[BitRefill] Failed to fetch products:', err);
+    return [];
+  }
+}
+
+// ─── Shop entry ───
+bot.command('shop', async (ctx) => {
+  await showShop(ctx);
+});
+
+bot.hears('🎁 Shop', async (ctx) => {
+  await showShop(ctx);
+});
+
+async function showShop(ctx: ZendContext) {
+  if (!bitrefillClient && !bitrefillBusinessClient) {
+    await ctx.reply(
+      '🎁 *Shop*\n\n' +
+      'Shopping is temporarily unavailable. Please try again later.',
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+    return;
+  }
+
+  await ctx.reply(
+    '🛒 *Shop with Crypto*\n\n' +
+    'What do you want to buy?',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('📱 Airtime', 'shop_cat:refill')],
+        [Markup.button.callback('📶 Data Bundles', 'shop_cat:data')],
+        [Markup.button.callback('🌍 Gift Cards', 'shop_cat:gift-card')],
+        [Markup.button.callback('🌐 eSIM', 'shop_cat:esim')],
+        [Markup.button.callback('📋 All Products', 'shop_cat:all')],
+        [Markup.button.callback('📦 My Orders', 'shop_orders')],
+      ]),
+    }
+  );
+}
+
+// ─── Category selection ───
+bot.action(/shop_cat:(.+)/, async (ctx) => {
+  const category = ctx.match[1];
+  const userId = ctx.from!.id.toString();
+
+  await ctx.answerCbQuery('Loading products...');
+
+  // BitRefill Nigeria products don't use standard categories — fetch all and filter client-side
+  const products = await getCachedProducts('NG');
+  let filtered = products.filter((p: any) => p.in_stock !== false);
+
+  const DATA_KEYWORDS = ['data', 'bundle', 'internet', 'sme', 'social', 'night', 'weekly', 'monthly', 'daily', 'subscription', 'pack'];
+  const CARRIER_NAMES = ['airtel', 'mtn', 'glo', '9mobile'];
+  const isDataProduct = (p: any) =>
+    p.type === 'bundle' ||
+    p.type === 'data_bundle' ||
+    DATA_KEYWORDS.some(k => p.name.toLowerCase().includes(k));
+  const isCarrierProduct = (p: any) =>
+    CARRIER_NAMES.some(c => p.name.toLowerCase().includes(c));
+
+  if (category === 'all') {
+    // Show everything, no extra filtering
+  } else if (category === 'data') {
+    filtered = filtered.filter((p: any) => isCarrierProduct(p) && isDataProduct(p));
+  } else if (category === 'refill') {
+    // Airtime: carrier products that are NOT data bundles
+    filtered = filtered.filter((p: any) => isCarrierProduct(p) && !isDataProduct(p));
+  } else if (category === 'gift-card') {
+    // Retail vouchers / gift cards: not carrier products
+    filtered = filtered.filter((p: any) => !isCarrierProduct(p));
+  } else if (category === 'esim') {
+    filtered = filtered.filter((p: any) =>
+      p.name.toLowerCase().includes('esim') || p.name.toLowerCase().includes('e-sim')
+    );
+  }
+
+  console.log('[BitRefill] Category:', category, '-', filtered.length, 'products:', filtered.map((p: any) => p.name).join(', '));
+
+  if (!filtered.length) {
+    await ctx.editMessageText(
+      '🎁 *Shop*\n\n' +
+      'No products available in this category right now.\n\n' +
+      'Please try again later.',
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
+        [Markup.button.callback('⬅️ Back', 'shop_back')],
+      ]) }
+    );
+    return;
+  }
+
+  const buttons = filtered.slice(0, 10).map((p: any) =>
+    [Markup.button.callback(p.name, `shop_product:${p.id}`)]
+  );
+  buttons.push([Markup.button.callback('⬅️ Back', 'shop_back')]);
+
+  await ctx.editMessageText(
+    `🛒 *Shop — ${category === 'refill' ? 'Airtime' : category === 'gift-card' ? 'Gift Cards' : category === 'esim' ? 'eSIM' : category === 'all' ? 'All Products' : 'Data Bundles'}*\n\n` +
+    `Choose a product:`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
+  );
+});
+
+// ─── Product selection ───
+bot.action(/shop_product:(.+)/, async (ctx) => {
+  const productId = ctx.match[1];
+  const userId = ctx.from!.id.toString();
+
+  await ctx.answerCbQuery('Loading...');
+
+  const client = bitrefillClient || bitrefillBusinessClient;
+  if (!client) return;
+
+  try {
+    const product = await client.getProduct(productId);
+    const session = getSession(userId);
+    session.shopData = {
+      productId: product.id,
+      productName: product.name,
+      category: product.category,
+    };
+
+    // Build amount buttons
+    const buttons: any[] = [];
+
+    if (product.packages && product.packages.length > 0) {
+      // Fixed packages
+      for (const pkg of product.packages.slice(0, 8)) {
+        const pkgCurrency = pkg.currency || product.currency || '';
+        const isNgn = product.currency === 'NGN' || pkg.currency === 'NGN' || pkg.price_currency === 'NGN';
+        const priceSymbol = isNgn ? '₦' : (pkg.price_currency === 'USD' ? '$' : (pkg.price_currency || '$') + ' ');
+        buttons.push([Markup.button.callback(
+          `${pkg.value.toLocaleString()} ${pkgCurrency} — ~${priceSymbol}${pkg.price.toLocaleString()}`,
+          `shop_pkg:${pkg.package_id}`
+        )]);
+      }
+    } else if (product.range) {
+      // Variable amount
+      const presets = [500, 1000, 2000, 5000, 10000];
+      const validPresets = presets.filter(a =>
+        a >= product.range!.min && a <= product.range!.max
+      );
+      for (const amt of validPresets.slice(0, 5)) {
+        buttons.push([Markup.button.callback(
+          `${product.currency} ${amt.toLocaleString()}`,
+          `shop_amount:${amt}`
+        )]);
+      }
+      buttons.push([Markup.button.callback('✏️ Custom Amount', 'shop_custom_amount')]);
+    }
+
+    buttons.push([Markup.button.callback('⬅️ Back', 'shop_back')]);
+
+    await ctx.editMessageText(
+      `🛒 *${md(product.name)}*\n\n` +
+      `${product.in_stock ? '✅ In Stock' : '❌ Out of Stock'}\n` +
+      `Country: ${product.country || 'Nigeria'}\n` +
+      `Currency: ${product.currency}\n\n` +
+      `Choose an amount:`,
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
+    );
+  } catch (err) {
+    console.error('[Shop] Product fetch error:', err);
+    await ctx.editMessageText(
+      '❌ Could not load product details. Please try again.',
+      Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'shop_back')]])
+    );
+  }
+});
+
+// ─── Package selection ───
+bot.action(/shop_pkg:(.+)/, async (ctx) => {
+  const packageId = ctx.match[1];
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+
+  if (!session.shopData) return;
+
+  // Find package details from cache
+  const products = await getCachedProducts('NG');
+  const product = products.find((p: any) => p.id === session.shopData!.productId);
+  const pkg = product?.packages?.find((p: any) => p.package_id === packageId);
+
+  session.shopData.packageId = packageId;
+  session.shopData.amount = typeof pkg?.value === 'string' ? parseFloat(pkg.value) || 0 : (pkg?.value || 0);
+  session.shopData.currency = pkg?.currency || product?.currency || 'NGN';
+
+  await askForPhoneNumber(ctx, userId);
+});
+
+// ─── Amount selection ───
+bot.action(/shop_amount:(.+)/, async (ctx) => {
+  const amount = parseFloat(ctx.match[1]);
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+
+  if (!session.shopData) return;
+
+  session.shopData.amount = amount;
+
+  const products = await getCachedProducts('NG');
+  const product = products.find((p: any) => p.id === session.shopData!.productId);
+  session.shopData.currency = product?.currency || 'NGN';
+
+  await askForPhoneNumber(ctx, userId);
+});
+
+// ─── Custom amount ───
+bot.action('shop_custom_amount', async (ctx) => {
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+
+  if (!session.shopData) return;
+
+  session.state = ConversationState.AWAITING_SHOP_AMOUNT;
+
+  await ctx.editMessageText(
+    `🛒 *${session.shopData.productName}*\n\n` +
+    `Enter the amount you want to buy (in ${session.shopData.currency || 'NGN'}):`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ─── Handle custom amount text input ───
+bot.use(async (ctx, next) => {
+  if (!ctx.message || !('text' in ctx.message)) return next();
+
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+
+  if (session.state === ConversationState.AWAITING_SHOP_AMOUNT) {
+    const text = ctx.message.text.trim().replace(/,/g, '');
+    const amount = parseFloat(text);
+
+    if (isNaN(amount) || amount <= 0) {
+      await ctx.reply('❌ Please enter a valid amount.', mainMenu);
+      return;
+    }
+
+    session.shopData!.amount = amount;
+    session.state = ConversationState.IDLE;
+
+    const products = await getCachedProducts('NG');
+    const product = products.find((p: any) => p.id === session.shopData!.productId);
+    session.shopData!.currency = product?.currency || 'NGN';
+
+    await askForPhoneNumber(ctx, userId);
+    return;
+  }
+
+  return next();
+});
+
+// ─── Ask for phone number ───
+async function askForPhoneNumber(ctx: ZendContext, userId: string) {
+  const session = getSession(userId);
+  session.state = ConversationState.AWAITING_SHOP_PHONE;
+
+  const isAirtime = session.shopData?.category === 'refill' ||
+                    session.shopData?.productName?.toLowerCase().includes('mtn') ||
+                    session.shopData?.productName?.toLowerCase().includes('airtel');
+
+  await ctx.reply(
+    `🛒 *${session.shopData!.productName}*\n\n` +
+    `Amount: *${session.shopData!.currency} ${session.shopData!.amount!.toLocaleString()}*\n\n` +
+    `${isAirtime ? '📱 Enter the phone number to recharge:' : '📧 Enter your email (optional) or type "skip":'}`,
+    { parse_mode: 'Markdown', ...cancelKeyboard }
+  );
+}
+
+// ─── Handle phone number input ───
+bot.use(async (ctx, next) => {
+  if (!ctx.message || !('text' in ctx.message)) return next();
+
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+
+  if (session.state === ConversationState.AWAITING_SHOP_PHONE) {
+    const text = ctx.message.text.trim();
+
+    if (text === '❌ Cancel') {
+      session.state = ConversationState.IDLE;
+      session.shopData = undefined;
+      await ctx.reply('❌ Order cancelled.', mainMenu);
+      return;
+    }
+
+    // Simple phone validation for Nigeria
+    const phoneRegex = /^\+?234\d{10}$|^0\d{10}$/;
+    const isAirtime = session.shopData?.category === 'refill' ||
+                      session.shopData?.productName?.toLowerCase().includes('mtn') ||
+                      session.shopData?.productName?.toLowerCase().includes('airtel');
+
+    if (isAirtime && !phoneRegex.test(text)) {
+      await ctx.reply(
+        '❌ Please enter a valid Nigerian phone number.\n\n' +
+        'Examples: `+2348012345678` or `08012345678`',
+        { parse_mode: 'Markdown', ...cancelKeyboard }
+      );
+      return;
+    }
+
+    session.shopData!.phoneNumber = text;
+    session.state = ConversationState.IDLE;
+
+    await showShopConfirm(ctx, userId);
+    return;
+  }
+
+  return next();
+});
+
+// ─── Show order confirmation ───
+async function showShopConfirm(ctx: ZendContext, userId: string) {
+  const session = getSession(userId);
+  const sd = session.shopData!;
+
+  await ctx.reply('⏳ Calculating price...');
+
+  try {
+    const cachedProducts = await getCachedProducts('NG');
+    const product = cachedProducts.find((p: any) => p.id === sd.productId);
+    const pkg = product?.packages?.find((p: any) => p.value === sd.amount);
+
+    // Calculate BitRefill price in USD
+    let bitrefillPriceUsd = 0;
+    if (pkg) {
+      const isNgnPrice = pkg.price_currency === 'NGN' || product.currency === 'NGN';
+      if (isNgnPrice) {
+        // Convert NGN price to USD using live PAJ rate
+        let ngnRate = 1550;
+        try {
+          const rates = await getPAJRates();
+          ngnRate = rates.offRampRate;
+        } catch { /* use fallback */ }
+        bitrefillPriceUsd = pkg.price / ngnRate;
+      } else {
+        bitrefillPriceUsd = pkg.price;
+      }
+    } else if (product?.range && sd.amount) {
+      // Estimate: use amount as proxy for USD (NGN is ~1600:1, but BitRefill might price differently)
+      // For variable products, we'll need to create an invoice to get exact price
+      let ngnRate = 1600;
+      try {
+        const rates = await getPAJRates();
+        ngnRate = rates.offRampRate;
+      } catch { /* use fallback */ }
+      bitrefillPriceUsd = sd.amount / ngnRate;
+    }
+
+    // Add Zend margin
+    const marginMultiplier = 1 + BITREFILL_MARKUP_BPS / 10000;
+    const totalUsdt = bitrefillPriceUsd * marginMultiplier;
+
+    sd.bitrefillPriceUsd = bitrefillPriceUsd;
+    sd.totalUsdt = totalUsdt;
+
+    const canUseBalance = !!bitrefillBusinessClient && !!ZEND_TREASURY_WALLET;
+
+    const buttons: any[] = [];
+    if (canUseBalance) {
+      buttons.push([Markup.button.callback(`✅ Pay $${totalUsdt.toFixed(2)} USDT`, 'shop_pay_balance')]);
+    }
+    buttons.push([Markup.button.callback('💳 Pay with Crypto (External)', 'shop_pay_crypto')]);
+    buttons.push([Markup.button.callback('❌ Cancel', 'shop_cancel')]);
+
+    await ctx.reply(
+      `🧾 *Order Summary*\n\n` +
+      `Product: ${sd.productName}\n` +
+      `Amount: ${sd.currency} ${sd.amount?.toLocaleString()}\n` +
+      `${sd.phoneNumber ? `Phone: \`${sd.phoneNumber}\`\n` : ''}` +
+      `\n` +
+      `Base Price: ~$${bitrefillPriceUsd.toFixed(2)} USDT\n` +
+      `Zend Fee (${(BITREFILL_MARKUP_BPS / 100).toFixed(2)}%): ~$${(totalUsdt - bitrefillPriceUsd).toFixed(4)} USDT\n` +
+      `*Total: $${totalUsdt.toFixed(2)} USDT*\n\n` +
+      `${canUseBalance
+        ? 'Pay instantly from your Zend balance — no external wallet needed.'
+        : 'Pay directly with your crypto wallet.'}`,
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
+    );
+  } catch (err: any) {
+    console.error('[Shop] Confirm error:', err);
+    await ctx.reply('❌ Could not calculate price. Please try again.', mainMenu);
+    session.shopData = undefined;
+  }
+}
+
+// ─── Pay with Zend Balance (Phase 2) ───
+bot.action('shop_pay_balance', async (ctx) => {
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+  const sd = session.shopData;
+
+  if (!sd || !bitrefillBusinessClient || !ZEND_TREASURY_WALLET) {
+    await ctx.answerCbQuery('Not available');
+    return;
+  }
+
+  await ctx.answerCbQuery('Processing...');
+  await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+
+  try {
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    if (!user.length) {
+      await ctx.reply('❌ User not found.', mainMenu);
+      session.shopData = undefined;
+      return;
+    }
+
+    const walletAddress = user[0].walletAddress;
+
+    // Check USDT balance
+    const usdtBalance = await walletService.getTokenBalance(walletAddress, SOLANA_TOKENS.USDT.mint);
+    if (usdtBalance < (sd.totalUsdt || 0)) {
+      await ctx.reply(
+        `❌ *Insufficient Balance*\n\n` +
+        `You need *$${(sd.totalUsdt || 0).toFixed(2)} USDT* but only have *$${usdtBalance.toFixed(2)} USDT*.\n\n` +
+        `Tap 💵 *Add Naira* or 📥 *Receive* to top up.`,
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
+      session.shopData = undefined;
+      return;
+    }
+
+    // Check SOL for gas
+    const hasGas = await walletService.hasEnoughSolForGas(walletAddress, MIN_SOL_FOR_GAS);
+    if (!hasGas) {
+      const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+      await walletService.sendSol(devKeypair, walletAddress, MIN_SOL_FOR_GAS);
+      console.log('[Gas] Funded SOL for shop purchase');
+    }
+
+    // ─── Step 1: Create BitRefill invoice FIRST (don't charge user yet)
+    await ctx.reply('⏳ Creating order with BitRefill...');
+
+    const products: any[] = [{
+      product_id: sd.productId,
+      quantity: 1,
+    }];
+
+    // Use package_id if user selected a package (data bundles)
+    if (sd.packageId) {
+      products[0].package_id = sd.packageId;
+    } else if (sd.amount && sd.amount > 0) {
+      // For value-based products (airtime) or custom amounts
+      products[0].value = sd.amount;
+    }
+
+    // Fallback: try to match package by value for legacy sessions
+    if (!products[0].package_id && !products[0].value) {
+      const cachedProducts = await getCachedProducts('NG');
+      const product = cachedProducts.find((p: any) => p.id === sd.productId);
+      const pkg = product?.packages?.find((p: any) => String(p.value) === String(sd.amount));
+      if (pkg) {
+        products[0].package_id = pkg.package_id;
+      } else if (sd.amount && sd.amount > 0) {
+        products[0].value = sd.amount;
+      }
+    }
+
+    if (sd.phoneNumber && sd.phoneNumber !== 'skip') {
+      products[0].phone_number = sd.phoneNumber;
+    }
+
+    const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || '';
+    const webhookUrl = webhookBaseUrl ? `${webhookBaseUrl.replace(/\/$/, '')}/webhooks/bitrefill` : undefined;
+
+    const invoice = await bitrefillBusinessClient.createInvoice({
+      products,
+      payment_method: 'balance',
+      auto_pay: false,
+      webhook_url: webhookUrl,
+      email: user[0]?.email || undefined,
+    });
+
+    console.log('[Shop] Invoice created:', invoice.id, 'status:', invoice.status);
+
+    // Save order immediately (pending)
+    await db.insert(bitrefillOrders).values({
+      userId,
+      bitrefillInvoiceId: invoice.id,
+      productId: sd.productId!,
+      productName: sd.productName!,
+      category: sd.category || 'refill',
+      amountFiat: String(sd.amount || 0),
+      currencyFiat: sd.currency,
+      amountCrypto: String(sd.totalUsdt || 0),
+      cryptoCurrency: 'USDT',
+      status: 'pending',
+      recipientPhone: sd.phoneNumber,
+      recipientEmail: user[0]?.email,
+      metadata: invoice,
+    });
+
+    // ─── Step 2: Ping BitRefill until invoice needs payment or fails ───
+    let checkedInvoice = invoice;
+    let attempts = 0;
+    const maxAttempts = 15;
+
+    while (attempts < maxAttempts) {
+      attempts++;
+      checkedInvoice = await bitrefillBusinessClient.getInvoice(invoice.id);
+      console.log(`[Shop] Poll ${attempts}: invoice ${invoice.id} status = ${checkedInvoice.status}`);
+
+      if (checkedInvoice.status === 'complete') {
+        // Already complete (rare but possible)
+        break;
+      }
+      if (checkedInvoice.status === 'failed') {
+        await db.update(bitrefillOrders)
+          .set({ status: 'failed', metadata: checkedInvoice })
+          .where(eq(bitrefillOrders.bitrefillInvoiceId, invoice.id));
+        throw new Error('BitRefill order failed');
+      }
+      if (checkedInvoice.status === 'unpaid') {
+        // Invoice is valid and awaiting payment — proceed
+        break;
+      }
+      // Wait 1.5s before next poll
+      await new Promise(r => setTimeout(r, 1500));
+    }
+
+    if (attempts >= maxAttempts && checkedInvoice.status !== 'complete' && checkedInvoice.status !== 'unpaid') {
+      await db.update(bitrefillOrders)
+        .set({ status: 'failed', metadata: checkedInvoice })
+        .where(eq(bitrefillOrders.bitrefillInvoiceId, invoice.id));
+      throw new Error('BitRefill invoice did not reach payable state');
+    }
+
+    // ─── Step 3: Charge user only after invoice is valid ───
+    const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
+    const keypair = Keypair.fromSecretKey(secretKey);
+
+    await ctx.reply('⏳ Sending USDT payment...');
+    const txHash = await walletService.sendUsdt(keypair, ZEND_TREASURY_WALLET, sd.totalUsdt || 0);
+    console.log('[Shop] USDT payment sent:', txHash);
+
+    // ─── Step 4: Pay the invoice with business balance ───
+    await ctx.reply('⏳ Fulfilling your order...');
+    await bitrefillBusinessClient.payInvoice(invoice.id);
+    console.log('[Shop] Invoice paid:', invoice.id);
+
+    // ─── Step 5: Poll until complete or failed ───
+    let finalInvoice = checkedInvoice;
+    let pollAttempts = 0;
+    const maxPollAttempts = 30;
+
+    while (pollAttempts < maxPollAttempts) {
+      pollAttempts++;
+      await new Promise(r => setTimeout(r, 2000));
+      finalInvoice = await bitrefillBusinessClient.getInvoice(invoice.id);
+      console.log(`[Shop] Post-pay poll ${pollAttempts}: status = ${finalInvoice.status}`);
+
+      if (finalInvoice.status === 'complete') {
+        break;
+      }
+      if (finalInvoice.status === 'failed') {
+        break;
+      }
+    }
+
+    // ─── Step 6: Deliver result ───
+    if (finalInvoice.status === 'complete' && finalInvoice.orders?.length) {
+      const orderId = finalInvoice.orders[0].id;
+      const order = await bitrefillBusinessClient.getOrder(orderId);
+
+      await db.update(bitrefillOrders)
+        .set({
+          status: 'complete',
+          codes: order.redemption_info ? [order.redemption_info] : [],
+          completedAt: new Date(),
+        })
+        .where(eq(bitrefillOrders.bitrefillInvoiceId, invoice.id));
+
+      const codeText = order.redemption_info
+        ? order.redemption_info.pin
+          ? `Code: \`${order.redemption_info.code}\`\nPin: \`${order.redemption_info.pin}\``
+          : `Code: \`${order.redemption_info.code}\``
+        : '✅ Your order has been fulfilled.';
+
+      await ctx.reply(
+        `🎉 *Order Complete!*\n\n` +
+        `${sd.productName}\n` +
+        `${sd.currency} ${sd.amount?.toLocaleString()}\n\n` +
+        `${codeText}\n\n` +
+        `Paid: $${(sd.totalUsdt || 0).toFixed(2)} USDT\n` +
+        `Ref: \`${invoice.id}\``,
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
+    } else if (finalInvoice.status === 'failed') {
+      await db.update(bitrefillOrders)
+        .set({ status: 'failed', metadata: finalInvoice })
+        .where(eq(bitrefillOrders.bitrefillInvoiceId, invoice.id));
+
+      await ctx.reply(
+        `❌ *Order Failed*\n\n` +
+        `${sd.productName}\n` +
+        `Amount: ${sd.currency} ${sd.amount?.toLocaleString()}\n\n` +
+        `The payment was sent but BitRefill could not fulfil the order.\n` +
+        `Our team has been notified and will refund your USDT.\n` +
+        `Ref: \`${invoice.id}\``,
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
+    } else {
+      // Still processing — webhook will handle completion
+      await ctx.reply(
+        `⏳ *Order Processing*\n\n` +
+        `${sd.productName}\n` +
+        `Amount: ${sd.currency} ${sd.amount?.toLocaleString()}\n\n` +
+        `Paid: $${(sd.totalUsdt || 0).toFixed(2)} USDT\n` +
+        `You'll receive a notification when it's ready.`,
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
+    }
+
+    session.shopData = undefined;
+
+  } catch (err: any) {
+    console.error('[Shop] Balance payment failed:', err);
+    await ctx.reply(
+      `❌ *Payment Failed*\n\n` +
+      `Error: ${err.message || 'Unknown error'}\n\n` +
+      `If USDT was deducted, it will be refunded. Please try again.`,
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+    session.shopData = undefined;
+  }
+});
+
+// ─── Pay with Crypto (Phase 1 fallback) ───
+bot.action('shop_pay_crypto', async (ctx) => {
+  const userId = ctx.from!.id.toString();
+  await ctx.answerCbQuery('Creating invoice...');
+  await createBitRefillInvoice(ctx, userId);
+});
+
+// ─── Cancel order ───
+bot.action('shop_cancel', async (ctx) => {
+  const userId = ctx.from!.id.toString();
+  const session = getSession(userId);
+  session.shopData = undefined;
+  await ctx.answerCbQuery('Cancelled');
+  await ctx.editMessageText('❌ Order cancelled.');
+});
+
+// ─── Create invoice (Phase 1 — direct crypto payment) ───
+async function createBitRefillInvoice(ctx: ZendContext, userId: string) {
+  const session = getSession(userId);
+  const sd = session.shopData!;
+
+  const client = bitrefillClient || bitrefillBusinessClient;
+  if (!client) {
+    await ctx.reply('❌ Shop is not configured. Please try again later.', mainMenu);
+    return;
+  }
+
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  const email = user[0]?.email || undefined;
+
+  await ctx.reply('⏳ Creating your invoice...');
+
+  try {
+    const products: any[] = [{
+      product_id: sd.productId,
+      quantity: 1,
+    }];
+
+    const cachedProducts = await getCachedProducts('NG');
+    const product = cachedProducts.find((p: any) => p.id === sd.productId);
+    const pkg = product?.packages?.find((p: any) => p.value === sd.amount);
+
+    if (pkg) {
+      products[0].package_id = pkg.package_id;
+    } else {
+      products[0].value = sd.amount;
+    }
+
+    if (sd.phoneNumber && sd.phoneNumber !== 'skip') {
+      products[0].phone_number = sd.phoneNumber;
+    }
+
+    const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || '';
+    const webhookUrl = webhookBaseUrl ? `${webhookBaseUrl.replace(/\/$/, '')}/webhooks/bitrefill` : undefined;
+
+    const invoice = await client.createInvoice({
+      products,
+      payment_method: 'bitcoin',
+      refund_address: user[0]?.walletAddress,
+      webhook_url: webhookUrl,
+      email,
+    });
+
+    await db.insert(bitrefillOrders).values({
+      userId,
+      bitrefillInvoiceId: invoice.id,
+      productId: sd.productId!,
+      productName: sd.productName!,
+      category: sd.category || 'refill',
+      amountFiat: String(sd.amount || 0),
+      currencyFiat: sd.currency,
+      status: 'pending',
+      recipientPhone: sd.phoneNumber,
+      recipientEmail: email,
+      paymentAddress: invoice.payment?.address,
+      paymentUri: invoice.payment?.BIP21,
+      cryptoCurrency: invoice.crypto_currency || invoice.payment?.currency,
+      amountCrypto: invoice.crypto_amount || invoice.payment?.amount,
+      metadata: invoice,
+    });
+
+    const paymentText = invoice.payment?.BIP21
+      ? `[Pay with Bitcoin](${invoice.payment.BIP21})`
+      : invoice.payment?.address
+        ? `Address: \`${invoice.payment.address}\``
+        : 'Payment details will be sent shortly.';
+
+    await ctx.reply(
+      `🧾 *Invoice Created*\n\n` +
+      `Product: ${sd.productName}\n` +
+      `Amount: ${sd.currency} ${sd.amount?.toLocaleString()}\n` +
+      `${sd.phoneNumber ? `Phone: \`${sd.phoneNumber}\`\n` : ''}` +
+      `\n` +
+      `*Payment Required:*\n` +
+      `Amount: ${invoice.crypto_amount || invoice.payment?.amount || '...'} ${invoice.crypto_currency || invoice.payment?.currency || 'BTC'}\n` +
+      `${paymentText}\n\n` +
+      `⏱️ Your order will be processed once payment is confirmed.\n` +
+      `You'll receive a notification here when it's ready.`,
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+
+    session.shopData = undefined;
+
+  } catch (err: any) {
+    console.error('[Shop] Invoice creation failed:', err);
+    await ctx.reply(
+      `❌ *Order Failed*\n\n` +
+      `Could not create invoice.\n` +
+      `Error: ${err.message || 'Unknown error'}\n\n` +
+      `Please try again later.`,
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+    session.shopData = undefined;
+  }
+}
+
+// ─── My Orders ───
+bot.action('shop_orders', async (ctx) => {
+  const userId = ctx.from!.id.toString();
+
+  await ctx.answerCbQuery('Loading orders...');
+
+  const orders = await db.select().from(bitrefillOrders)
+    .where(eq(bitrefillOrders.userId, userId))
+    .orderBy(bitrefillOrders.createdAt)
+    .limit(10);
+
+  if (!orders.length) {
+    await ctx.editMessageText(
+      '📦 *My Orders*\n\n' +
+      'You have no orders yet.\n\n' +
+      'Tap 🎁 *Shop* to get started!',
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
+        [Markup.button.callback('🎁 Go to Shop', 'shop_back')],
+      ]) }
+    );
+    return;
+  }
+
+  let msg = '📦 *My Orders*\n\n';
+  const buttons: any[] = [];
+
+  for (let i = 0; i < orders.length; i++) {
+    const o = orders[i];
+    const statusEmoji = o.status === 'complete' ? '✅' : o.status === 'pending' ? '⏳' : '❌';
+    msg += `${i + 1}. ${statusEmoji} *${o.productName}* — ${o.currencyFiat} ${o.amountFiat}\n`;
+    if (o.status === 'complete' && o.codes) {
+      buttons.push([Markup.button.callback(`📋 Copy ${o.productName} Code`, `shop_copy:${o.id}`)]);
+    }
+  }
+
+  buttons.push([Markup.button.callback('⬅️ Back to Shop', 'shop_back')]);
+
+  await ctx.editMessageText(msg, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+});
+
+// ─── Copy code from order ───
+bot.action(/shop_copy:(.+)/, async (ctx) => {
+  const orderId = parseInt(ctx.match[1]);
+  const userId = ctx.from!.id.toString();
+
+  const orders = await db.select().from(bitrefillOrders)
+    .where(and(eq(bitrefillOrders.id, orderId), eq(bitrefillOrders.userId, userId)))
+    .limit(1);
+
+  if (!orders.length) {
+    await ctx.answerCbQuery('Order not found');
+    return;
+  }
+
+  const codes = orders[0].codes as any[];
+  if (!codes?.length) {
+    await ctx.answerCbQuery('No code available');
+    return;
+  }
+
+  const codeText = codes.map((c: any) => c.pin ? `${c.code} (Pin: ${c.pin})` : c.code).join('\n');
+
+  await ctx.reply(
+    `📋 *Your Code*\n\n` +
+    `${orders[0].productName}\n\n` +
+    `\`${codeText}\``,
+    { parse_mode: 'Markdown' }
+  );
+  await ctx.answerCbQuery('Code sent!');
+});
+
+// ─── Back button ───
+bot.action('shop_back', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showShop(ctx);
 });
 
 // ─── Export key helper (called after PIN is verified) ───
@@ -827,7 +3073,8 @@ bot.action('export_key', async (ctx) => {
       `Enter your 4-digit PIN to view your secret code:`,
       { parse_mode: 'Markdown' }
     );
-    await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    const waitMsg = await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    getSession(userId).lastBotMessageId = waitMsg.message_id;
     return;
   }
 
@@ -868,7 +3115,7 @@ async function buildBalanceMessage(userId: string): Promise<string | null> {
         ngnEquiv = bal.amount * offRampRate;
       }
       totalNgn += ngnEquiv;
-      const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : '🟡';
+      const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : bal.symbol === 'AUDD' ? '🇦🇺' : '🟡';
       msg += `${emoji} *${bal.symbol}*  ${formatBalance(bal.amount, bal.symbol)}  (≈${formatNgn(ngnEquiv)})\n`;
     }
 
@@ -876,8 +3123,12 @@ async function buildBalanceMessage(userId: string): Promise<string | null> {
     msg += `💵 Total: ≈${formatNgn(totalNgn)}\n`;
     msg += `📈 Rate: ${formatNgn(offRampRate)} per Dollar`;
     return msg;
-  } catch (err) {
+  } catch (err: any) {
     console.error('Balance error:', err);
+    const isRateLimit = err?.message?.includes('429') || err?.message?.includes('Too many requests');
+    if (isRateLimit) {
+      return `⏳ *Rate Limited*\n\nThe Solana network is busy right now. Please wait a few seconds and tap *Balance* again.`;
+    }
     return null;
   }
 }
@@ -917,8 +3168,7 @@ bot.hears('💰 Balance', async (ctx) => {
 // 💵 ADD NAIRA (On-Ramp) — With PAJ OTP Flow
 // ═════════════════════════════════════════════════════════════════════════════
 
-bot.hears('💵 Add Naira', async (ctx) => {
-  const userId = ctx.from.id.toString();
+async function startAddNaira(ctx: ZendContext, userId: string) {
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
 
   if (user.length === 0) {
@@ -934,7 +3184,7 @@ bot.hears('💵 Add Naira', async (ctx) => {
   }
 
   // Step 1: Ask how much NGN they want to add
-  setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT });
+  setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampTargetToken: 'USDT' });
 
   await ctx.reply(
     `💵 *Add Naira*\n\n` +
@@ -943,6 +3193,54 @@ bot.hears('💵 Add Naira', async (ctx) => {
     `Enter the amount (numbers only):`,
     { parse_mode: 'Markdown', ...cancelKeyboard }
   );
+}
+
+bot.hears('💵 Add Naira', async (ctx) => {
+  await startAddNaira(ctx, ctx.from.id.toString());
+});
+
+bot.action('add_naira_start', async (ctx) => {
+  await ctx.answerCbQuery();
+  await startAddNaira(ctx, ctx.from!.id.toString());
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 🇦🇺 ADD AUDD (On-Ramp with hidden USDT→AUDD swap)
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function startAddAudd(ctx: ZendContext, userId: string) {
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+
+  if (user.length === 0) {
+    await ctx.reply('Please run /start first.', mainMenu);
+    return;
+  }
+
+  const pajClient = await getPAJClient();
+  if (!pajClient) {
+    await ctx.reply('❌ PAJ service is not configured. Please contact support.', mainMenu);
+    return;
+  }
+
+  setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampTargetToken: 'AUDD' });
+
+  await ctx.reply(
+    `🇦🇺 *Add AUDD*\n\n` +
+    `How much NGN do you want to deposit?\n\n` +
+    `You'll receive Australian Digital Dollars (AUDD) in your wallet.\n\n` +
+    `Minimum: ${formatNgn(PAJ_MIN_DEPOSIT_NGN)}\n\n` +
+    `Enter the amount (numbers only):`,
+    { parse_mode: 'Markdown', ...cancelKeyboard }
+  );
+}
+
+bot.command('addaudd', async (ctx) => {
+  await startAddAudd(ctx, ctx.from.id.toString());
+});
+
+bot.action('add_aud_start', async (ctx) => {
+  await ctx.answerCbQuery();
+  await startAddAudd(ctx, ctx.from!.id.toString());
 });
 
 // Handle PAJ email/phone input
@@ -952,10 +3250,8 @@ bot.on(message('text'), async (ctx, next) => {
   const session = getSession(userId);
 
   // ─── Pass menu buttons to bot.hears() handlers ───
-  const menuButtons = ['💰 Balance', '💵 Add Naira', '📤 Send', '💴 Cash Out', '📥 Receive', '🔄 Swap', '📅 Schedule', '📋 History', '⚙️ Settings', '🌐 Community'];
-  const adminButtons = ['📊 Stats', '👤 Users', '💸 Transactions', '🏦 Bank Accounts', '📅 Scheduled', '🤖 QVAC Status', '🔙 Back to Menu'];
-  const billsButtons = ['📱 Airtime', '🌐 Data', '⚡ Electricity', '📺 Cable TV'];
-  if (menuButtons.includes(text) || adminButtons.includes(text) || billsButtons.includes(text)) {
+  const menuButtons = ['💰 Balance', '📤 Send', '📥 Receive', '🔄 Swap', '🎁 Shop', '📋 History', '⚙️ Settings', '🌐 Community'];
+  if (menuButtons.includes(text)) {
     return next();
   }
 
@@ -971,6 +3267,227 @@ bot.on(message('text'), async (ctx, next) => {
     return;
   }
 
+  // ─── ADMIN: SEARCH TRANSACTION ───
+  if (session.state === ConversationState.AWAITING_ADMIN_TXN_SEARCH) {
+    setSession(userId, { state: ConversationState.IDLE });
+    const txnId = text.trim().toUpperCase();
+    const txnRows = await db.select().from(transactions).where(eq(transactions.id, txnId)).limit(1);
+    if (txnRows.length === 0) {
+      await ctx.reply('❌ Transaction not found. Try again or tap 🔍 Search to go back.', adminSearchKeyboard);
+      return;
+    }
+    const detailText = await buildTxnDetailText(txnRows[0]);
+    const buttons = [
+      [Markup.button.callback('👤 View User', `admin_user:${txnRows[0].userId}`)],
+      [Markup.button.callback('🔍 New Search', 'admin_page:search')],
+    ];
+    await ctx.reply(detailText, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+    return;
+  }
+
+  // ─── ADMIN: SEARCH USER ───
+  if (session.state === ConversationState.AWAITING_ADMIN_USER_SEARCH) {
+    setSession(userId, { state: ConversationState.IDLE });
+    const query = text.trim();
+    let targetId = query;
+    if (query.startsWith('@')) targetId = query.slice(1);
+
+    // Try exact ID match first
+    let userRows = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
+    // Fallback to username match (case-insensitive via sql)
+    if (userRows.length === 0) {
+      userRows = await db.select().from(users).where(sql`LOWER(${users.telegramUsername}) = LOWER(${targetId})`).limit(1);
+    }
+    if (userRows.length === 0) {
+      await ctx.reply('❌ User not found. Try again or tap 🔍 Search to go back.', adminSearchKeyboard);
+      return;
+    }
+    const detailText = await buildUserDetailText(userRows[0]);
+    const buttons = [
+      [Markup.button.url('💬 Open Chat', `tg://user?id=${userRows[0].id}`)],
+      [Markup.button.callback('🔍 New Search', 'admin_page:search')],
+    ];
+    await ctx.reply(detailText, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+    return;
+  }
+
+  // ─── ADMIN: SET AMBASSADOR REFERRAL CODE ───
+  if (session.state === ConversationState.AWAITING_ADMIN_SET_AMBASSADOR_CODE) {
+    setSession(userId, { state: ConversationState.IDLE });
+    const ambId = parseInt((session as any).pendingTransaction?.recipientName || '0', 10);
+    if (!ambId) {
+      await ctx.reply('❌ Something went wrong. Please try again.', adminMainKeyboard);
+      return;
+    }
+
+    const code = text.trim().toLowerCase().replace(/\s+/g, '');
+    if (!code || code.length < 3 || code.length > 50) {
+      await ctx.reply('❌ Code must be 3–50 characters. Try again.', Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', `admin_ambassador_detail:${ambId}`)]]));
+      return;
+    }
+
+    // Check uniqueness
+    const existing = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.customReferralCode, code)).limit(1);
+    if (existing.length > 0 && existing[0].id !== ambId) {
+      await ctx.reply('❌ That code is already taken. Try another.', Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', `admin_ambassador_detail:${ambId}`)]]));
+      return;
+    }
+
+    await db.update(ambassadorApplications).set({ customReferralCode: code }).where(eq(ambassadorApplications.id, ambId));
+    await ctx.reply(
+      `✅ Referral code updated!\n\n` +
+      `Ambassador link:\n` +
+      `\`t.me/zend_money_bot?start=${code}\``,
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', `admin_ambassador_detail:${ambId}`)]]) }
+    );
+    return;
+  }
+
+  // ─── BULK SEND: AWAITING_BULK_SEND_INPUT ───
+  if (session.state === ConversationState.AWAITING_BULK_SEND_INPUT) {
+    const rawText = text.trim();
+    if (!rawText) {
+      await ctx.reply('❌ No recipients found. Please paste at least one recipient.', cancelKeyboard);
+      return;
+    }
+
+    // Try AI parsing first
+    const aiRecipients = await parseBulkSendWithAI(rawText);
+
+    let recipients: Array<{ amountNgn: number; bankCode: string; bankName: string; accountNumber: string; accountName: string }> = [];
+    let usedAI = false;
+
+    if (aiRecipients && aiRecipients.length > 0) {
+      usedAI = true;
+      for (const r of aiRecipients) {
+        const bank = NIGERIAN_BANKS.find(b => b.code === r.bank_code);
+        if (bank) {
+          recipients.push({
+            amountNgn: r.amount_ngn,
+            bankCode: r.bank_code,
+            bankName: bank.name,
+            accountNumber: r.account_number,
+            accountName: r.account_name,
+          });
+        }
+      }
+    }
+
+    // Fallback to strict parser if AI returned nothing
+    if (recipients.length === 0) {
+      const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
+      for (const line of lines) {
+        const parsed = parseBulkRecipient(line);
+        if (parsed) recipients.push(parsed);
+      }
+    }
+
+    if (recipients.length === 0) {
+      await ctx.reply(
+        `❌ Could not parse any valid recipients.\n\n` +
+        `Try describing each recipient naturally, e.g.:\n` +
+        `\`Send 50k to John Doe at GTBank 0123456789\`\n` +
+        `\`₦30,000 to Jane Smith UBA 9876543210\`\n\n` +
+        `Or use the strict format:\n` +
+        `\`AMOUNT BANK_CODE ACCOUNT_NUMBER ACCOUNT_NAME\``,
+        { parse_mode: 'Markdown', ...cancelKeyboard }
+      );
+      return;
+    }
+
+    // Store recipients in session
+    setSession(userId, { state: ConversationState.IDLE, pendingTransaction: { bulkRecipients: recipients } as any });
+
+    // Calculate totals
+    const totalNgn = recipients.reduce((sum, r) => sum + r.amountNgn, 0);
+    const pajClient = await getPAJClient();
+    let rate = 1550;
+    try {
+      if (pajClient) {
+        const rates = await getPAJRates();
+        rate = rates.offRampRate;
+      }
+    } catch { /* fallback */ }
+
+    // Calculate per-recipient fees based on user's SOL balance
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    const walletAddress = user[0]?.walletAddress;
+
+    let totalUsdt = 0;
+    let totalFeeUsdt = 0;
+    let anyFunded = false;
+    for (const r of recipients) {
+      const transferUsdt = r.amountNgn / rate;
+      const feeInfo = walletAddress
+        ? await calculateSendFee(transferUsdt, walletAddress)
+        : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
+      totalUsdt += transferUsdt;
+      totalFeeUsdt += feeInfo.zendFeeUsdt;
+      if (feeInfo.willFundSol) anyFunded = true;
+    }
+    const grandTotalUsdt = totalUsdt + totalFeeUsdt;
+
+    // Check total balance
+    let balanceOk = true;
+    let balanceMsg = '';
+    if (walletAddress) {
+      const tokenBalance = await walletService.getTokenBalance(walletAddress, SOLANA_TOKENS.USDT.mint);
+      const solBalance = await walletService.getSolBalance(walletAddress);
+      const solPrice = await getSolPriceInUsdt();
+      const feeSol = totalFeeUsdt / solPrice;
+
+      if (tokenBalance < totalUsdt) {
+        balanceOk = false;
+        balanceMsg = `❌ Insufficient USDT. Need ${totalUsdt.toFixed(2)} USDT, have ${tokenBalance.toFixed(2)} USDT.`;
+      } else if (solBalance < feeSol + MIN_SOL_FOR_GAS) {
+        balanceOk = false;
+        balanceMsg = `❌ Insufficient SOL for fees. Need ~${(feeSol + MIN_SOL_FOR_GAS).toFixed(4)} SOL.`;
+      }
+    }
+
+    const feeRateText = anyFunded
+      ? `1.5% (includes gas) capped at $3`
+      : `1% capped at $2`;
+
+    let summary =
+      `📦 *Bulk Send Summary*\n\n` +
+      `Recipients: ${recipients.length}\n` +
+      `Total NGN: ₦${totalNgn.toLocaleString()}\n` +
+      `Rate: ₦${rate.toLocaleString()} / USDT\n` +
+      `Transfer: ${totalUsdt.toFixed(2)} USDT\n` +
+      `Zend Fee: ${totalFeeUsdt.toFixed(2)} USDT (${feeRateText})\n` +
+      `Grand Total: ${grandTotalUsdt.toFixed(2)} USDT\n\n` +
+      `*Recipients:*\n`;
+
+    summary += recipients.map((r, i) =>
+      `${i + 1}. ${escapeTelegramMarkdown(r.accountName)} — ₦${r.amountNgn.toLocaleString()} → ${escapeTelegramMarkdown(r.bankName)} (\`${r.accountNumber}\`)`
+    ).join('\n');
+
+    if (!balanceOk) {
+      summary += `\n\n${balanceMsg}`;
+      await ctx.reply(summary, { parse_mode: 'Markdown', ...cancelKeyboard });
+      return;
+    }
+
+    // Require PIN if set
+    if (user[0]?.transactionPin) {
+      setSession(userId, { state: ConversationState.AWAITING_PIN_VERIFY, pinVerifyAction: 'bulk_send', pendingTransaction: { bulkRecipients: recipients } as any });
+      await ctx.reply(
+        `${summary}\n\n🔐 Enter your 4-digit PIN to confirm this bulk send:`,
+        { parse_mode: 'Markdown', ...cancelKeyboard }
+      );
+      return;
+    }
+
+    // No PIN — confirm directly
+    const confirmButtons = Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Confirm Bulk Send', 'bulk_send_confirm')],
+      [Markup.button.callback('❌ Cancel', 'bulk_send_cancel')],
+    ]);
+    await ctx.reply(summary, { parse_mode: 'Markdown', ...confirmButtons });
+    return;
+  }
+
   // ─── ADD NAIRA: AWAITING_ONRAMP_AMOUNT ───
   if (session.state === ConversationState.AWAITING_ONRAMP_AMOUNT) {
     const amount = parseInt(text.replace(/[^0-9]/g, ''), 10);
@@ -979,6 +3496,14 @@ bot.on(message('text'), async (ctx, next) => {
       await ctx.reply(
         `❌ Please enter a valid amount.\n` +
         `Minimum deposit is ${formatNgn(PAJ_MIN_DEPOSIT_NGN)}.`,
+        cancelKeyboard
+      );
+      return;
+    }
+    if (amount > PAJ_MAX_DEPOSIT_NGN) {
+      await ctx.reply(
+        `❌ Amount too large.\n` +
+        `Maximum deposit is ${formatNgn(PAJ_MAX_DEPOSIT_NGN)}.`,
         cancelKeyboard
       );
       return;
@@ -1012,8 +3537,9 @@ bot.on(message('text'), async (ctx, next) => {
 
     if (hasPajSession && user[0]) {
       // Already authenticated — create order and show VA
-      setSession(userId, { state: ConversationState.IDLE, onrampAmount: amount });
-      await showVirtualAccount(ctx, userId, user[0].pajSessionToken!, amount, rate, feeNgn);
+      const targetToken = session.onrampTargetToken || 'USDT';
+      setSession(userId, { state: ConversationState.IDLE, onrampAmount: amount, onrampTargetToken: targetToken });
+      await showVirtualAccount(ctx, userId, user[0].pajSessionToken!, amount, rate, feeNgn, targetToken);
       return;
     }
 
@@ -1150,6 +3676,9 @@ bot.on(message('text'), async (ctx, next) => {
         `Reference: \`${txId}\``,
         { parse_mode: 'Markdown', ...mainMenu }
       );
+      await ctx.reply('📋 Tap to copy the address:', Markup.inlineKeyboard([
+        [{ text: '📋 Copy Address', copy_text: { text: intent.intent_address } } as any]
+      ]));
     } catch (err: any) {
       console.error('[Bridge] Failed:', err);
       await ctx.reply(
@@ -1293,6 +3822,7 @@ bot.on(message('text'), async (ctx, next) => {
 
       // Now show virtual account (with pending amount if any)
       const onrampAmount = session.onrampAmount;
+      const targetToken = session.onrampTargetToken || 'USDT';
       if (onrampAmount) {
         // Get rate for the pending amount
         let rate = 1550;
@@ -1300,13 +3830,13 @@ bot.on(message('text'), async (ctx, next) => {
         try {
           const rateData = await pajClient.getRateByAmount(onrampAmount);
           rate = rateData.rate.rate;
-          fee = rateData.fee || 0;
+          fee = (rateData as any).fee || 0;
         } catch (err) {
           console.log('Using fallback rate for on-ramp after verify');
         }
-        await showVirtualAccount(ctx, userId, verified.token, onrampAmount, rate, fee);
+        await showVirtualAccount(ctx, userId, verified.token, onrampAmount, rate, fee, targetToken);
       } else {
-        await showVirtualAccount(ctx, userId, verified.token);
+        await showVirtualAccount(ctx, userId, verified.token, undefined, undefined, undefined, targetToken);
       }
     } catch (err: any) {
       console.error('[PAJ] Verify failed:', err);
@@ -1375,21 +3905,26 @@ bot.on(message('text'), async (ctx, next) => {
       console.log('Using fallback rate');
     }
 
-    const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
-    const zendFeeUsdt = (amount / rate) * (zendFeeBps / 10000);
-    const usdtNeeded = (amount / rate) + zendFeeUsdt;
+    const transferUsdt = amount / rate;
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    const feeInfo = user[0]?.walletAddress
+      ? await calculateSendFee(transferUsdt, user[0].walletAddress)
+      : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
+    const usdtNeeded = transferUsdt + feeInfo.zendFeeUsdt;
 
     session.pendingTransaction = {
+      ...session.pendingTransaction,
       amountNgn: amount,
       amountUsdt: usdtNeeded,
-      zendFeeUsdt,
+      zendFeeUsdt: feeInfo.zendFeeUsdt,
+      feeSol: feeInfo.feeSol,
     };
     session.state = ConversationState.AWAITING_SEND_RECIPIENT;
     setSession(userId, session);
 
     let msg = `📤 Send ${formatNgn(amount)}\n` +
       `Rate: ${formatNgn(rate)} per Dollar\n` +
-      `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${zendFeeUsdt.toFixed(4)} USDT\n` +
+      `Zend fee (${(feeInfo.feeBps / 100).toFixed(2)}%${feeInfo.willFundSol ? ' includes gas' : ''}): ${feeInfo.feeSol.toFixed(6)} SOL (~${feeInfo.zendFeeUsdt.toFixed(2)} USDT)\n` +
       `You pay: *${usdtNeeded.toFixed(2)} USDT*\n\n` +
       `Who should receive it?\n\n` +
       `Just tell me naturally — e.g. "Mark OPay 7082406410" or "send to Amaka at GTB 0123456789"`;
@@ -1501,10 +4036,21 @@ bot.on(message('text'), async (ctx, next) => {
 
     if (user[0]?.pajSessionToken) {
       verifyMsg = await showLoading(ctx, 'Verifying account...');
-      const verification = await verifyBankAccount(user[0].pajSessionToken, bankCode, accountNumber);
+      const verification = await verifyBankAccount(user[0].pajSessionToken, bankCode, accountNumber, userId);
       if (verification.verified && verification.accountName) {
         verifiedName = verification.accountName;
         verifiedStatus = 'verified';
+      } else if (verification.sessionExpired) {
+        await ctx.reply(
+          `⚠️ *PAJ Session Expired*\n\n` +
+          `Your bank verification link has expired.\n` +
+          `Please go to *⚙️ Settings → 🔗 Link PAJ* to reconnect.`,
+          { parse_mode: 'Markdown', ...mainMenu }
+        );
+        session.state = ConversationState.IDLE;
+        session.pendingTransaction = undefined;
+        setSession(userId, session);
+        return;
       } else {
         console.log('[Verify] Failed:', verification.error);
       }
@@ -1532,17 +4078,16 @@ bot.on(message('text'), async (ctx, next) => {
       confirmMsg += `⚠️ *Could not verify account* — please double-check details\n`;
     }
 
-    const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
-    const feeLine = session.pendingTransaction?.zendFeeUsdt
-      ? `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${session.pendingTransaction.zendFeeUsdt.toFixed(4)} USDT\n`
+    const feeLine = session.pendingTransaction?.feeSol
+      ? `Zend fee: ${session.pendingTransaction.feeSol.toFixed(6)} SOL (~${session.pendingTransaction.zendFeeUsdt?.toFixed(2)} USDT)\n`
       : '';
 
     const menuFromMint = session.pendingTransaction?.fromMint || SOLANA_TOKENS.USDT.mint;
     const menuFromToken = Object.values(SOLANA_TOKENS).find(t => t.mint === menuFromMint) || SOLANA_TOKENS.USDT;
     confirmMsg += `\n` +
       `Amount: *${formatNgn(amountNgn!)}*\n` +
-      `To: *${verifiedName}*\n` +
-      `Bank: *${bank.name}*\n` +
+      `To: *${md(verifiedName)}*\n` +
+      `Bank: *${md(bank.name)}*\n` +
       `Account: \`${accountNumber}\`\n\n` +
       feeLine +
       `You pay: *${amountUsdt!.toFixed(2)} ${menuFromToken.symbol}*\n` +
@@ -1711,27 +4256,33 @@ bot.on(message('text'), async (ctx, next) => {
 
         // Use Kimi for conversational responses when details are missing
         if (!parsed.amount) {
-          const reply = await chatWithAI(
+          const features = await getBotFeatures();
+          const reply = await chatWithKimi(
             `The user said: "${text}". They want to send money but didn't specify an amount. ` +
-            `Respond conversationally in Nigerian Pidgin style. Ask how much they want to send.`
+            `Respond conversationally in Nigerian Pidgin style. Ask how much they want to send.`,
+            features
           );
-          await ctx.reply(reply?.reply || 'How much do you want to send?', { parse_mode: 'Markdown', ...cancelKeyboard });
+          await ctx.reply(escapeTelegramMarkdown(reply?.reply || 'How much do you want to send?'), { parse_mode: 'Markdown', ...cancelKeyboard });
           setSession(userId, { state: ConversationState.AWAITING_SEND_AMOUNT, pendingTransaction: { recipientName: parsed.recipientName } });
           return;
         }
         if (parsed.amount < 100) {
-          const reply = await chatWithAI(
+          const features = await getBotFeatures();
+          const reply = await chatWithKimi(
             `The user wants to send ${parsed.amount} Naira. Minimum is ₦100. ` +
-            `Respond in Nigerian Pidgin style telling them the minimum.`
+            `Respond in Nigerian Pidgin style telling them the minimum.`,
+            features
           );
           await ctx.reply(reply?.reply || `Minimum send amount is ${formatNgn(100)}.`, cancelKeyboard);
           return;
         }
         if (!parsed.accountNumber && !parsed.walletAddress) {
           // We have amount + recipient name but missing bank/account
-          const reply = await chatWithAI(
+          const features = await getBotFeatures();
+          const reply = await chatWithKimi(
             `The user said: "${text}". I understood they want to send ${formatNgn(parsed.amount)} to ${parsed.recipientName || 'someone'}. ` +
-            `But I need the bank name and account number. Respond conversationally in Nigerian Pidgin style.`
+            `But I need the bank name and account number. Respond conversationally in Nigerian Pidgin style.`,
+            features
           );
           await ctx.reply(reply?.reply || `I got that you want to send ${formatNgn(parsed.amount)}. What's the bank and account number?`, cancelKeyboard);
           setSession(userId, {
@@ -1783,16 +4334,53 @@ bot.on(message('text'), async (ctx, next) => {
           console.log('Using fallback rate for NLP send');
         }
 
-        const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
-        const zendFeeUsdt = (parsed.amount / rate) * (zendFeeBps / 10000);
-        const usdtNeeded = (parsed.amount / rate) + zendFeeUsdt;
+        const fromMint = parsed.fromToken === 'USDC' ? SOLANA_TOKENS.USDC.mint :
+                           parsed.fromToken === 'SOL' ? SOLANA_TOKENS.SOL.mint :
+                           SOLANA_TOKENS.USDT.mint;
+        const fromTokenInfo = Object.values(SOLANA_TOKENS).find(t => t.mint === fromMint) || SOLANA_TOKENS.USDT;
+
+        const transferUsdt = parsed.amount / rate;
+        const feeInfo = user[0]?.walletAddress
+          ? await calculateSendFee(transferUsdt, user[0].walletAddress)
+          : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
+        const usdtNeeded = transferUsdt + feeInfo.zendFeeUsdt;
+
+        // ─── Check wallet balance before showing confirmation ───
+        if (user[0]?.walletAddress) {
+          const tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, fromMint);
+          const solBalance = await walletService.getSolBalance(user[0].walletAddress);
+          if (tokenBalance < transferUsdt) {
+            const shortfall = transferUsdt - tokenBalance;
+            await ctx.reply(
+              `❌ *Insufficient Balance*\n\n` +
+              `You want to send ${formatNgn(parsed.amount)}\n` +
+              `You need: *${transferUsdt.toFixed(2)} ${fromTokenInfo.symbol}*\n` +
+              `You have: *${tokenBalance.toFixed(2)} ${fromTokenInfo.symbol}*\n` +
+              `Short by: *${shortfall.toFixed(2)} ${fromTokenInfo.symbol}*\n\n` +
+              `Add more Dollars to your wallet or send a smaller amount.`,
+              { parse_mode: 'Markdown', ...mainMenu }
+            );
+            return;
+          }
+          if (!feeInfo.willFundSol && solBalance < feeInfo.feeSol + MIN_SOL_FOR_GAS) {
+            await ctx.reply(
+              `❌ *Insufficient SOL for fee*\n\n` +
+              `Fee: ${feeInfo.feeSol.toFixed(6)} SOL\n` +
+              `Gas: ~${MIN_SOL_FOR_GAS} SOL\n` +
+              `You have: ${solBalance.toFixed(6)} SOL\n\n` +
+              `Top up your SOL balance first.`,
+              { parse_mode: 'Markdown', ...mainMenu }
+            );
+            return;
+          }
+        }
 
         // ─── Verify bank account with PAJ ───
         let verifiedName = parsed.recipientName;
         let verifiedStatus: 'verified' | 'unverified' | 'no_paj' = 'unverified';
 
         if (parsed.bankCode && parsed.accountNumber && user[0]?.pajSessionToken) {
-          const verification = await verifyBankAccount(user[0].pajSessionToken, parsed.bankCode, parsed.accountNumber);
+          const verification = await verifyBankAccount(user[0].pajSessionToken, parsed.bankCode, parsed.accountNumber, userId);
           if (verification.verified && verification.accountName) {
             verifiedName = verification.accountName;
             verifiedStatus = 'verified';
@@ -1803,15 +4391,11 @@ bot.on(message('text'), async (ctx, next) => {
           verifiedStatus = 'no_paj';
         }
 
-        const fromMint = parsed.fromToken === 'USDC' ? SOLANA_TOKENS.USDC.mint :
-                           parsed.fromToken === 'SOL' ? SOLANA_TOKENS.SOL.mint :
-                           SOLANA_TOKENS.USDT.mint;
-        const fromTokenInfo = Object.values(SOLANA_TOKENS).find(t => t.mint === fromMint) || SOLANA_TOKENS.USDT;
-
         session.pendingTransaction = {
           amountNgn: parsed.amount,
           amountUsdt: usdtNeeded,
-          zendFeeUsdt,
+          zendFeeUsdt: feeInfo.zendFeeUsdt,
+          feeSol: feeInfo.feeSol,
           fromMint,
           recipientName: verifiedName,
           recipientAccountName: verifiedName,
@@ -1835,18 +4419,20 @@ bot.on(message('text'), async (ctx, next) => {
 
         const fromSymbol = fromTokenInfo.symbol;
         msg += `\n` +
-          `To: *${verifiedName || 'Recipient'}*\n` +
-          `Bank: ${parsed.bankName || 'Solana'}\n` +
+          `To: *${md(verifiedName || 'Recipient')}*\n` +
+          `Bank: ${md(parsed.bankName) || 'Solana'}\n` +
           `Account: \`${parsed.accountNumber || parsed.walletAddress}\`\n` +
           `Amount: ${formatNgn(parsed.amount)}\n` +
-          `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${zendFeeUsdt.toFixed(4)} USDT\n` +
+          `Zend fee (${(feeInfo.feeBps / 100).toFixed(2)}%${feeInfo.willFundSol ? ' includes gas' : ''}): ${feeInfo.feeSol.toFixed(6)} SOL (~${feeInfo.zendFeeUsdt.toFixed(2)} USDT)\n` +
           `You pay: *${usdtNeeded.toFixed(2)} ${fromSymbol}*\n` +
           `Rate: ${formatNgn(rate)} per Dollar\n\n` +
           `Confirm?`;
 
+        const addressToCopy = parsed.accountNumber || parsed.walletAddress;
         await ctx.reply(msg, {
           parse_mode: 'Markdown',
           ...Markup.inlineKeyboard([
+            [{ text: '📋 Copy Account/Address', copy_text: { text: addressToCopy } } as any],
             [Markup.button.callback('✅ Confirm', 'confirm_send')],
             [Markup.button.callback('❌ Cancel', 'cancel_send')],
           ]),
@@ -1856,6 +4442,13 @@ bot.on(message('text'), async (ctx, next) => {
 
       case 'add_naira': {
         // Simulate clicking Add Naira
+        if (parsed.amount && parsed.amount > PAJ_MAX_DEPOSIT_NGN) {
+          await ctx.reply(
+            `❌ Amount too large.\nMaximum deposit is ${formatNgn(PAJ_MAX_DEPOSIT_NGN)}.`,
+            mainMenu
+          );
+          return;
+        }
         await ctx.reply(`💵 *Add Naira*\n\n` +
           (parsed.amount
             ? `Amount: ${formatNgn(parsed.amount)}\n\nHow much do you want to add? (Minimum ₦1,000)`
@@ -1892,7 +4485,7 @@ bot.on(message('text'), async (ctx, next) => {
               ngnEquiv = bal.amount * offRampRate;
             }
             totalNgn += ngnEquiv;
-            const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : '🟡';
+            const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : bal.symbol === 'AUDD' ? '🇦🇺' : '🟡';
             msg += `${emoji} *${bal.symbol}*  ${formatBalance(bal.amount, bal.symbol)}  (≈${formatNgn(ngnEquiv)})\n`;
           }
 
@@ -1915,7 +4508,8 @@ bot.on(message('text'), async (ctx, next) => {
 
       default: {
         // Try conversational AI for unknown intents
-        const aiReply = await chatWithAI(text);
+        const features = await getBotFeatures();
+        const aiReply = await chatWithKimi(text, features);
         if (aiReply) {
           await ctx.reply(aiReply.reply, mainMenu);
         } else {
@@ -1989,6 +4583,7 @@ bot.on(message('text'), async (ctx, next) => {
         amountUsdt: pt.amountUsdt!,
         ngnRate: pt.ngnRate,
         zendFeeUsdt: pt.zendFeeUsdt,
+        feeSol: pt.feeSol,
         fromMint: pt.fromMint,
         recipientBankCode: pt.recipientBankCode,
         recipientBankName: pt.recipientBankName,
@@ -2015,8 +4610,8 @@ bot.on(message('text'), async (ctx, next) => {
       await saveScheduledTransfer(userId, sd, sd.startAt);
       await ctx.reply(
         `✅ *Scheduled Transfer Created!*\n\n` +
-        `To: ${sd.recipientName}\n` +
-        `Bank: ${sd.bankName}\n` +
+        `To: ${md(sd.recipientName)}\n` +
+        `Bank: ${md(sd.bankName)}\n` +
         `Account: \`${sd.accountNumber}\`\n` +
         `Amount: ${formatNgn(sd.amountNgn!)}\n` +
         `Frequency: ${sd.frequency}\n` +
@@ -2024,6 +4619,14 @@ bot.on(message('text'), async (ctx, next) => {
         `Use *📅 Schedule* to view or cancel.`,
         { parse_mode: 'Markdown', ...mainMenu }
       );
+    } else if (action === 'bulk_send') {
+      const pt = session.pendingTransaction;
+      const recipients = (pt as any)?.bulkRecipients as Array<{ amountNgn: number; bankCode: string; bankName: string; accountNumber: string; accountName: string }> | undefined;
+      if (!recipients || recipients.length === 0) {
+        await ctx.reply('❌ Session expired. Please start over.', mainMenu);
+        return;
+      }
+      await executeBulkSend(ctx, userId, recipients);
     } else {
       await ctx.reply('✅ PIN verified.', mainMenu);
     }
@@ -2075,7 +4678,7 @@ bot.on(message('text'), async (ctx, next) => {
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     if (user[0]?.pajSessionToken) {
       try {
-        const verification = await verifyBankAccount(user[0].pajSessionToken, bank.code, accountNumber);
+        const verification = await verifyBankAccount(user[0].pajSessionToken, bank.code, accountNumber, userId);
         if (verification.verified && verification.accountName) {
           accountName = verification.accountName;
         }
@@ -2107,8 +4710,8 @@ bot.on(message('text'), async (ctx, next) => {
 
     await ctx.reply(
       `✅ *Recipient Saved*\n\n` +
-      `Name: ${accountName}\n` +
-      `Bank: ${bank.name}\n` +
+      `Name: ${md(accountName)}\n` +
+      `Bank: ${md(bank.name)}\n` +
       `Account: \`${accountNumber}\`\n\n` +
       `How much NGN do you want to send each time?\n` +
       `Example: 50000`,
@@ -2181,11 +4784,12 @@ bot.on(message('text'), async (ctx, next) => {
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     if (user.length > 0 && user[0].transactionPin) {
       setSession(userId, { ...session, state: ConversationState.AWAITING_PIN_VERIFY, pinVerifyAction: 'schedule' });
-      await ctx.reply(
+      const pinMsg = await ctx.reply(
         `🔐 *Security Check*\n\n` +
         `Enter your 4-digit PIN to confirm this scheduled transfer:`,
         cancelKeyboard
       );
+      getSession(userId).lastBotMessageId = pinMsg.message_id;
       return;
     }
 
@@ -2195,8 +4799,8 @@ bot.on(message('text'), async (ctx, next) => {
 
     await ctx.reply(
       `✅ *Scheduled Transfer Created!*\n\n` +
-      `To: ${sd.recipientName}\n` +
-      `Bank: ${sd.bankName}\n` +
+      `To: ${md(sd.recipientName)}\n` +
+      `Bank: ${md(sd.bankName)}\n` +
       `Account: \`${sd.accountNumber}\`\n` +
       `Amount: ${formatNgn(sd.amountNgn!)}\n` +
       `Frequency: ${sd.frequency}\n` +
@@ -2294,6 +4898,13 @@ bot.on(message('voice'), async (ctx) => {
         const pajClient = await getPAJClient();
         if (!pajClient) {
           await ctx.reply('❌ PAJ service is not configured. Please contact support.', mainMenu);
+          return;
+        }
+        if (analysis.amount && analysis.amount > PAJ_MAX_DEPOSIT_NGN) {
+          await ctx.reply(
+            `❌ Amount too large.\nMaximum deposit is ${formatNgn(PAJ_MAX_DEPOSIT_NGN)}.`,
+            mainMenu
+          );
           return;
         }
         setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampAmount: analysis.amount || undefined });
@@ -2595,7 +5206,8 @@ async function showVirtualAccount(
   sessionToken: string,
   amount?: number,
   rate?: number,
-  fee?: number
+  fee?: number,
+  targetToken: 'USDT' | 'AUDD' = 'USDT'
 ): Promise<void> {
   const pajClient = await getPAJClient();
   if (!pajClient) {
@@ -2607,7 +5219,7 @@ async function showVirtualAccount(
   const walletAddress = user[0].walletAddress;
 
   // Use provided amount or default to minimum
-  const fiatAmount = amount && amount >= PAJ_MIN_DEPOSIT_NGN ? amount : PAJ_MIN_DEPOSIT_NGN;
+  const fiatAmount = amount && amount >= PAJ_MIN_DEPOSIT_NGN && amount <= PAJ_MAX_DEPOSIT_NGN ? amount : PAJ_MIN_DEPOSIT_NGN;
 
   // Get rate if not provided
   let _rate = rate || 1550;
@@ -2621,71 +5233,99 @@ async function showVirtualAccount(
     }
   }
   const usdtAmount = fiatAmount / _rate;
+  const receiveLabel = targetToken === 'AUDD' ? 'AUDD' : 'Dollars';
 
   // Check if we have a cached virtual account to reuse (max 24h old)
   let virtualAccount: any = user[0]?.virtualAccount;
   const VA_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
-  const vaAge = virtualAccount?.createdAt ? Date.now() - new Date(virtualAccount.createdAt).getTime() : Infinity;
-  const hasCachedVA = virtualAccount?.accountNumber && virtualAccount?.bankName && vaAge < VA_MAX_AGE_MS;
-
   const webhookUrl = process.env.WEBHOOK_BASE_URL
-    ? `${process.env.WEBHOOK_BASE_URL}/webhooks/paj`
+    ? `${process.env.WEBHOOK_BASE_URL.replace(/\/$/, '')}/webhooks/paj`
     : 'https://example.com/webhook';
 
-  if (!hasCachedVA) {
-    const loadingVA = await showLoading(ctx, 'Creating your virtual bank account...');
-    try {
-      const order = await pajClient.createOnramp({
-        fiatAmount,
-        currency: Currency.NGN,
-        recipient: walletAddress,
-        mint: SOLANA_TOKENS.USDT.mint,
-        chain: Chain.SOLANA,
-        webhookURL: webhookUrl,
-      }, sessionToken);
+  // Always generate a fresh virtual account — PAJ accounts are one-time use
+  const loadingVA = await showLoading(ctx, 'Creating your virtual bank account...');
+  let order: any;
+  try {
+    order = await pajClient.createOnramp({
+      fiatAmount,
+      currency: Currency.NGN,
+      recipient: walletAddress,
+      mint: SOLANA_TOKENS.USDT.mint,
+      chain: Chain.SOLANA,
+      webhookURL: webhookUrl,
+    }, sessionToken);
 
-      virtualAccount = {
-        bankCode: 'WEM', // PAJ uses Wema Bank
-        bankName: order.bank,
-        accountNumber: order.accountNumber,
-        accountName: order.accountName,
-        orderId: order.id,
-        amount: fiatAmount,
-        createdAt: new Date().toISOString(),
-      };
+    virtualAccount = {
+      bankCode: 'WEM', // PAJ uses Wema Bank
+      bankName: order.bank,
+      accountNumber: order.accountNumber,
+      accountName: order.accountName,
+      orderId: order.id,
+      amount: fiatAmount,
+      createdAt: new Date().toISOString(),
+    };
 
-      // Cache in DB (overwrite previous)
-      await db.update(users)
-        .set({ virtualAccount })
-        .where(eq(users.id, userId));
+    // Cache in DB (overwrite previous)
+    await db.update(users)
+      .set({ virtualAccount })
+      .where(eq(users.id, userId));
 
-      console.log('[PAJ] Virtual account created:', order.accountNumber, 'for ₦', fiatAmount);
-    } catch (err: any) {
-      console.error('[PAJ] createOnramp failed:', err);
-      await finishLoading(ctx, loadingVA.message_id, `❌ Could not create virtual account.\nError: ${err.message || 'Unknown error'}`);
-      await ctx.reply('Menu:', mainMenu);
+    console.log('[PAJ] Virtual account created:', order.accountNumber, 'for ₦', fiatAmount, 'bank:', order.bank, 'name:', order.accountName, 'orderId:', order.id, 'fullOrder:', JSON.stringify(order));
+  } catch (err: any) {
+    console.error('[PAJ] createOnramp failed:', err);
+    if (isPajSessionError(err)) {
+      await clearPajSession(userId);
+      await finishLoading(ctx, loadingVA.message_id, '⚠️ Your PAJ session expired. Please re-link in Settings.');
+      await ctx.reply(
+        `⚠️ *PAJ Session Expired*\n\n` +
+        `Go to *⚙️ Settings → 🔗 Link PAJ* to reconnect.`,
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
       return;
     }
-  } else {
-    console.log('[PAJ] Reusing cached virtual account:', virtualAccount.accountNumber);
+    await finishLoading(ctx, loadingVA.message_id, `❌ Could not create virtual account.\nError: ${err.message || 'Unknown error'}`);
+    await ctx.reply('Menu:', mainMenu);
+    return;
   }
 
+  const txId = generateTxId();
+  await db.insert(transactions).values({
+    id: txId,
+    userId,
+    type: 'ngn_receive',
+    status: 'pending',
+    ngnAmount: String(fiatAmount),
+    ngnRate: String(order?.rate || _rate),
+    fromAmount: String(order?.amount || usdtAmount),
+    pajReference: order.id,
+    pajPoolAddress: walletAddress,
+    recipientWalletAddress: walletAddress,
+    metadata: { virtualAccount, source: 'fresh', targetToken },
+  });
+
+  const displayRate = order?.rate || _rate;
+  const displayFee = order?.fee || _fee;
+  const displayReceive = order?.amount || usdtAmount;
+
+  const isExactAmount = amount && amount >= PAJ_MIN_DEPOSIT_NGN;
+  const menuTitle = targetToken === 'AUDD' ? '🇦🇺 Add AUDD' : '💵 Add Naira';
   await ctx.reply(
-    `💵 *Add Naira*\n\n` +
+    `${menuTitle}\n\n` +
     `*Deposit Details:*\n` +
-    `Amount: ${formatNgn(fiatAmount)}\n` +
-    `Rate: ₦${_rate.toLocaleString()}/USD\n` +
-    `Fee: ${formatNgn(_fee)}\n` +
-    `You receive: ~${usdtAmount.toFixed(2)} Dollars\n\n` +
+    (isExactAmount ? `Amount: ${formatNgn(fiatAmount)}\n` : `Minimum: ${formatNgn(PAJ_MIN_DEPOSIT_NGN)}\n`) +
+    `Rate: ₦${displayRate.toLocaleString()}/USD\n` +
+    `Fee: ${formatNgn(displayFee)}\n` +
+    `You receive: ~${Number(displayReceive).toFixed(2)} ${receiveLabel}\n\n` +
     `*Send bank transfer to:*\n` +
-    `🏦 *${virtualAccount.bankName}*\n` +
+    `🏦 *${md(virtualAccount.bankName)}*\n` +
     `🔢 \`${virtualAccount.accountNumber}\`\n` +
-    `👤 *${virtualAccount.accountName}*\n\n` +
+    `👤 *${md(virtualAccount.accountName)}*\n\n` +
     `⏱️ Arrives in: 2-5 minutes\n\n` +
-    `📋 Tap to copy account number\n\n` +
     `⚠️ *Important:* Send from a bank account in your name.`,
     { parse_mode: 'Markdown', ...mainMenu }
   );
+  // Send account number as plain text for easy copying
+  await ctx.reply(virtualAccount.accountNumber);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2706,17 +5346,44 @@ bot.hears('📤 Send', async (ctx) => {
     return;
   }
 
-  setSession(userId, {
-    state: ConversationState.AWAITING_SEND_AMOUNT,
-    pendingTransaction: {},
-  });
-
+  // Ask which token to send from
   await ctx.reply(
     `📤 *Send Money*\n\n` +
+    `Send from which balance?`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('USDT', 'send_token:USDT')],
+        [Markup.button.callback('AUDD', 'send_token:AUDD')],
+        [Markup.button.callback('❌ Cancel', 'cancel_send')],
+      ]),
+    }
+  );
+});
+
+bot.action(/send_token:([A-Z]+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const tokenSymbol = ctx.match[1];
+  const token = Object.values(SOLANA_TOKENS).find(t => t.symbol === tokenSymbol);
+
+  if (!token) {
+    await ctx.editMessageText('❌ Invalid token selected.');
+    return;
+  }
+
+  setSession(userId, {
+    state: ConversationState.AWAITING_SEND_AMOUNT,
+    pendingTransaction: { fromMint: token.mint },
+  });
+
+  await ctx.editMessageText(
+    `📤 *Send Money (${tokenSymbol})*\n\n` +
     `How much do you want to send? (in Naira)\n\n` +
     `Examples:\n• 50000\n• 100000\n• 5000`,
-    { parse_mode: 'Markdown', ...cancelKeyboard }
+    { parse_mode: 'Markdown' }
   );
+  await ctx.reply('Waiting for amount...', cancelKeyboard);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2731,6 +5398,7 @@ async function executeSendCore(
     amountUsdt: number;
     ngnRate?: number;
     zendFeeUsdt?: number;
+    feeSol?: number;
     fromMint?: string;
     recipientBankCode?: string;
     recipientBankName?: string;
@@ -2739,9 +5407,11 @@ async function executeSendCore(
     recipientName?: string;
   }
 ): Promise<{ success: boolean; txId: string; solanaTxHash?: string; offRampRef?: string; error?: string }> {
-  const fromMint = txData.fromMint || SOLANA_TOKENS.USDT.mint;
-  const fromToken = Object.values(SOLANA_TOKENS).find(t => t.mint === fromMint) || SOLANA_TOKENS.USDT;
-  const fromSymbol = fromToken.symbol;
+  const userFromMint = txData.fromMint || SOLANA_TOKENS.USDT.mint;
+  const userFromToken = Object.values(SOLANA_TOKENS).find(t => t.mint === userFromMint) || SOLANA_TOKENS.USDT;
+  const userFromSymbol = userFromToken.symbol;
+  const pajMint = SOLANA_TOKENS.USDT.mint; // PAJ only accepts USDT
+  const pajToken = SOLANA_TOKENS.USDT;
   const finalAccountName = txData.recipientAccountName || txData.recipientName || 'Recipient';
   const finalBankName = txData.recipientBankName || 'Unknown';
   const finalBankCode = txData.recipientBankCode || 'UNKNOWN';
@@ -2757,7 +5427,7 @@ async function executeSendCore(
     ngnAmount: txData.amountNgn.toString(),
     ngnRate: (txData.ngnRate || 1550).toString(),
     fromAmount: txData.amountUsdt.toString(),
-    fromMint: fromMint,
+    fromMint: userFromMint,
     zendFeeUsdt: feeUsdt.toString(),
     recipientBankCode: finalBankCode,
     recipientBankName: finalBankName,
@@ -2785,23 +5455,33 @@ async function executeSendCore(
     if (pajClient && user[0].pajSessionToken) {
       const pajBanks = await getPajBankList(user[0].pajSessionToken);
       const ourBank = NIGERIAN_BANKS.find(b => b.code === finalBankCode);
-      const pajBank = pajBanks.find(pb =>
-        pb.name.toLowerCase().includes(ourBank?.name.toLowerCase() || '') ||
-        (ourBank?.name.toLowerCase() || '').includes(pb.name.toLowerCase())
-      );
-      if (!pajBank) {
+
+      // Use the same robust scoring as verifyBankAccount
+      let bestMatch: { bank: any; score: number } | null = null;
+      for (const pb of pajBanks) {
+        const score = scoreBankMatch(pb.name, finalBankCode);
+        if (score > 0 && (!bestMatch || score > bestMatch.score)) {
+          bestMatch = { bank: pb, score };
+        }
+      }
+
+      if (!bestMatch || bestMatch.score < 20) {
+        console.log('[PAJ] Available banks for send:', pajBanks.map(b => b.name).join(', '));
         throw new Error(`Bank "${ourBank?.name}" not found on PAJ`);
       }
 
+      const pajBank = bestMatch.bank;
+      console.log(`[PAJ] Send bank matched: ${ourBank?.name} → ${pajBank.name} (score: ${bestMatch.score})`);
+
       const webhookUrl = process.env.WEBHOOK_BASE_URL
-        ? `${process.env.WEBHOOK_BASE_URL}/webhooks/paj`
+        ? `${process.env.WEBHOOK_BASE_URL.replace(/\/$/, '')}/webhooks/paj`
         : 'https://example.com/webhook';
       const order = await pajClient.createOfframp({
         bank: pajBank.id,
         accountNumber: finalAccountNumber,
         currency: Currency.NGN,
         fiatAmount: txData.amountNgn,
-        mint: fromMint,
+        mint: pajMint,
         chain: Chain.SOLANA,
         webhookURL: webhookUrl,
       } as any, user[0].pajSessionToken);
@@ -2809,10 +5489,54 @@ async function executeSendCore(
       offRampRef = order.id;
       console.log('[PAJ] Off-ramp order created:', order.id, 'deposit address:', order.address, 'amount:', order.amount);
 
-      let tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, fromMint);
+      let tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, pajMint);
+
+      // Auto-swap AUDD → USDT via local pool (hidden from user)
+      if (userFromMint === SOLANA_TOKENS.AUDD.mint) {
+        const auddBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.AUDD.mint);
+        if (auddBalance <= 0) {
+          throw new Error('No AUDD balance. Please deposit AUDD first.');
+        }
+        const usdtNeeded = order.amount;
+        const auddRate = await getAuddPriceInUsdt();
+        const auddNeeded = usdtNeeded / auddRate;
+        if (auddBalance < auddNeeded) {
+          throw new Error(`Not enough AUDD. You have ${auddBalance.toFixed(2)} AUDD but need ${auddNeeded.toFixed(2)} AUDD (rate: 1 AUDD = ${auddRate.toFixed(4)} USDT).`);
+        }
+        if (!DEV_WALLET_SECRET) {
+          throw new Error('AUDD swap not available: dev wallet not configured.');
+        }
+        const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+        const devUsdtBalance = await walletService.getTokenBalance(devKeypair.publicKey.toBase58(), SOLANA_TOKENS.USDT.mint);
+        if (devUsdtBalance < usdtNeeded) {
+          throw new Error('AUDD swap not available: liquidity pool is low. Please try again later or contact support.');
+        }
+        const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
+        const keypair = Keypair.fromSecretKey(secretKey);
+        const swapTxHash = await walletService.executeLocalSwap(
+          keypair,
+          devKeypair,
+          SOLANA_TOKENS.AUDD.mint,
+          SOLANA_TOKENS.USDT.mint,
+          auddNeeded,
+          usdtNeeded,
+          SOLANA_TOKENS.AUDD.decimals,
+          SOLANA_TOKENS.USDT.decimals,
+          user[0].walletAddress // dev sends USDT back to user wallet
+        );
+        console.log('[LocalSwap] AUDD→USDT:', swapTxHash);
+        const swapTxId = generateTxId();
+        await db.insert(transactions).values({
+          id: swapTxId, userId, type: 'swap', status: 'completed',
+          fromMint: SOLANA_TOKENS.AUDD.mint, fromAmount: auddNeeded.toString(),
+          toMint: SOLANA_TOKENS.USDT.mint, toAmount: usdtNeeded.toString(),
+          solanaTxHash: swapTxHash,
+        });
+        tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
+      }
 
       // Auto-swap USDC → USDT if needed
-      if (fromMint === SOLANA_TOKENS.USDT.mint && tokenBalance < order.amount) {
+      if (tokenBalance < order.amount) {
         const usdcBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDC.mint);
         if (usdcBalance >= order.amount) {
           const swapAmountUsdc = Math.min(usdcBalance, order.amount * 1.03);
@@ -2848,62 +5572,53 @@ async function executeSendCore(
         }
       }
 
-      // Gas sponsorship: fund SOL if user has none
-      const gasSponsored = await fundSolIfNeeded(user[0].walletAddress);
-      if (!gasSponsored) {
-        const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, MIN_SOL_FOR_GAS);
-        if (!hasGas) {
-          throw new Error(`You need a small network fee to send. We can cover it for you (+0.5% extra).`);
-        }
+      // Gas sponsorship: top up exact shortfall (including ATA rent if needed)
+      const { funded, gasSponsored, shortfall, error: fundError } = await fundSolIfNeeded(
+        user[0].walletAddress,
+        txData.feeSol || 0,
+        order.address,
+        pajMint
+      );
+      if (shortfall && !funded) {
+        throw new Error(
+          `Your wallet needs ~${shortfall.toFixed(6)} more SOL for network fees. ` +
+          (fundError ? `Auto-funding failed: ${fundError}. ` : '') +
+          `Please deposit a small amount of SOL to your Zend wallet, or contact support.`
+        );
       }
 
-      // Calculate total fee (Zend fee + gas sponsorship if applicable)
+      // Calculate total fee in SOL
       const feeWallet = process.env.ZEND_FEE_WALLET;
-      let totalFeeUsdt = feeUsdt;
-      if (gasSponsored) {
-        const sponsorshipFee = txData.amountUsdt * (GAS_SPONSORSHIP_FEE_BPS / 10000); // 0.5% of amount
-        totalFeeUsdt += sponsorshipFee;
-        console.log('[Gas] Sponsorship fee added:', sponsorshipFee.toFixed(6), 'USDT. Total fee:', totalFeeUsdt.toFixed(6));
+      const totalFeeSol = txData.feeSol || 0;
+
+      // Check token balance covers transfer
+      if (tokenBalance < order.amount) {
+        throw new Error(`Insufficient ${userFromSymbol} balance. You have: ${tokenBalance.toFixed(2)}, need: ${order.amount.toFixed(2)} for the transfer.`);
       }
 
-      const totalRequired = order.amount + totalFeeUsdt;
-      if (tokenBalance < totalRequired) {
-        throw new Error(`Insufficient ${fromSymbol} balance. You have: ${tokenBalance.toFixed(2)}, need: ${totalRequired.toFixed(2)} (includes ${order.amount.toFixed(2)} transfer + ${totalFeeUsdt.toFixed(2)} fee).`);
-      }
-
-      // Build fee transfer instructions to bundle with main send
+      // Build SOL fee transfer instruction to bundle with main send
       const feeInstructions: any[] = [];
-      if (feeWallet && totalFeeUsdt > 0) {
-        const mintPubkey = new PublicKey(fromMint);
+      if (feeWallet && totalFeeSol > 0) {
         const feeWalletPubkey = new PublicKey(feeWallet);
-        const senderTokenAccount = await getAssociatedTokenAddress(mintPubkey, new PublicKey(user[0].walletAddress));
-        const feeTokenAccount = await getAssociatedTokenAddress(mintPubkey, feeWalletPubkey);
-        const rawFeeAmount = BigInt(Math.round(totalFeeUsdt * Math.pow(10, fromToken.decimals)));
+        const rawFeeLamports = BigInt(Math.round(totalFeeSol * LAMPORTS_PER_SOL));
 
         feeInstructions.push(
-          createAssociatedTokenAccountIdempotentInstruction(
-            new PublicKey(user[0].walletAddress),
-            feeTokenAccount,
-            feeWalletPubkey,
-            mintPubkey
-          ),
-          createTransferInstruction(
-            senderTokenAccount,
-            feeTokenAccount,
-            new PublicKey(user[0].walletAddress),
-            rawFeeAmount
-          )
+          SystemProgram.transfer({
+            fromPubkey: new PublicKey(user[0].walletAddress),
+            toPubkey: feeWalletPubkey,
+            lamports: rawFeeLamports,
+          })
         );
       }
 
       const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
       const keypair = Keypair.fromSecretKey(secretKey);
       solanaTxHash = await walletService.sendSplToken(
-        keypair, order.address, fromMint, order.amount, fromToken.decimals,
+        keypair, order.address, pajMint, order.amount, pajToken.decimals,
         feeInstructions.length > 0 ? feeInstructions : undefined,
-        totalRequired
+        order.amount
       );
-      console.log(`[Solana] ${fromSymbol} sent to PAJ (+ fee bundled):`, solanaTxHash);
+      console.log(`[Solana] ${userFromSymbol} sent to PAJ via USDT (+ fee bundled):`, solanaTxHash);
 
       await db.update(transactions)
         .set({ solanaTxHash, pajReference: offRampRef })
@@ -2923,6 +5638,10 @@ async function executeSendCore(
     return { success: true, txId, solanaTxHash, offRampRef };
   } catch (err: any) {
     console.error('Off-ramp failed:', err);
+    if (isPajSessionError(err)) {
+      await clearPajSession(userId);
+      return { success: false, txId, error: 'Your PAJ session expired. Please re-link in Settings.' };
+    }
     await db.update(transactions)
       .set({ status: 'failed' })
       .where(eq(transactions.id, txId));
@@ -2945,12 +5664,14 @@ async function executeSend(
     recipientAccountNumber?: string;
     recipientAccountName?: string;
     recipientName?: string;
+    feeSol?: number;
   }
 ) {
   const fromToken = Object.values(SOLANA_TOKENS).find(t => t.mint === (txData.fromMint || SOLANA_TOKENS.USDT.mint)) || SOLANA_TOKENS.USDT;
   const processingText =
     `⏳ *Processing...*\n\n` +
     `Sending ${txData.amountUsdt.toFixed(2)} ${fromToken.symbol}\n` +
+    `Fee: ${(txData.feeSol || 0).toFixed(6)} SOL\n` +
     `Estimated: 1-5 minutes`;
 
   if (ctx.callbackQuery) {
@@ -3035,42 +5756,78 @@ async function executeSwap(
     }
 
     // Gas sponsorship for swaps
-    const gasSponsored = await fundSolIfNeeded(user[0].walletAddress);
-    if (!gasSponsored) {
-      const hasGas = await walletService.hasEnoughSolForGas(user[0].walletAddress, MIN_SOL_FOR_GAS);
-      if (!hasGas) {
-        throw new Error(
-          `You need a small network fee to convert. We can cover it for you (+0.5% extra).`
-        );
-      }
+    const { funded, gasSponsored, shortfall, error: fundError } = await fundSolIfNeeded(user[0].walletAddress, 0);
+    if (shortfall && !funded) {
+      throw new Error(
+        `Your wallet needs ~${shortfall.toFixed(6)} more SOL for swap fees. ` +
+        (fundError ? `Auto-funding failed: ${fundError}. ` : '') +
+        `Please deposit a small amount of SOL to your Zend wallet, or contact support.`
+      );
     }
 
-    // Build swap transaction
-    const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
-    if (!serializedTx) {
-      throw new Error('Failed to build swap transaction');
-    }
-
-    // Sign and send
+    let txHash: string;
     const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
     const keypair = Keypair.fromSecretKey(secretKey);
 
-    await ctx.replyWithChatAction('typing');
-    const txHash = await walletService.signAndSendSerialized(keypair, serializedTx);
-    console.log('[Jupiter] Swap executed:', txHash);
+    // ─── Local swap (AUDD pairs via dev wallet) ───
+    if ((pt as any).isLocalSwap) {
+      if (!DEV_WALLET_SECRET) throw new Error('Dev wallet not configured for local swap.');
+      const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+      const fromDecimals = getTokenBySymbol(fromSymbol)!.decimals;
+      const toDecimals = getTokenBySymbol(toSymbol)!.decimals;
+      const fromAmount = Number(quote.inAmount) / Math.pow(10, fromDecimals);
 
-    // Collect gas sponsorship fee for swaps (0.5% of output value)
-    if (gasSponsored) {
-      const feeWallet = process.env.ZEND_FEE_WALLET;
-      if (feeWallet) {
-        try {
-          const sponsorshipFee = outAmount * (GAS_SPONSORSHIP_FEE_BPS / 10000);
-          const feeTokenMint = pt.toMint as string;
-          const feeTokenDecimals = getTokenBySymbol(toSymbol)?.decimals || 6;
-          await walletService.sendSplToken(keypair, feeWallet, feeTokenMint, sponsorshipFee, feeTokenDecimals);
-          console.log('[Gas] Swap sponsorship fee collected:', sponsorshipFee.toFixed(6), toSymbol);
-        } catch (feeErr: any) {
-          console.error('[Gas] Swap fee collection failed (non-critical):', feeErr.message);
+      await ctx.replyWithChatAction('typing');
+      txHash = await walletService.executeLocalSwap(
+        keypair,
+        devKeypair,
+        pt.fromMint!,
+        pt.toMint!,
+        fromAmount,
+        outAmount,
+        fromDecimals,
+        toDecimals,
+        user[0].walletAddress
+      );
+      console.log('[LocalSwap] Executed:', txHash);
+
+      // Collect gas sponsorship fee for local swaps (0.5% of output value, paid in SOL)
+      if (gasSponsored) {
+        const feeWallet = process.env.ZEND_FEE_WALLET;
+        if (feeWallet) {
+          try {
+            const solPrice = await getSolPriceInUsdt();
+            const sponsorshipFeeSol = (outAmount * 0.0005) / solPrice;
+            await walletService.sendSol(keypair, feeWallet, sponsorshipFeeSol);
+            console.log('[Gas] Local swap sponsorship fee collected:', sponsorshipFeeSol.toFixed(6), 'SOL');
+          } catch (feeErr: any) {
+            console.error('[Gas] Local swap fee collection failed (non-critical):', feeErr.message);
+          }
+        }
+      }
+    } else {
+      // ─── Jupiter swap (non-AUDD pairs) ───
+      const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
+      if (!serializedTx) {
+        throw new Error('Failed to build swap transaction');
+      }
+
+      await ctx.replyWithChatAction('typing');
+      txHash = await walletService.signAndSendSerialized(keypair, serializedTx);
+      console.log('[Jupiter] Swap executed:', txHash);
+
+      // Collect gas sponsorship fee for swaps (0.5% of output value, paid in SOL)
+      if (gasSponsored) {
+        const feeWallet = process.env.ZEND_FEE_WALLET;
+        if (feeWallet) {
+          try {
+            const solPrice = await getSolPriceInUsdt();
+            const sponsorshipFeeSol = (outAmount * 0.0005) / solPrice;
+            await walletService.sendSol(keypair, feeWallet, sponsorshipFeeSol);
+            console.log('[Gas] Swap sponsorship fee collected:', sponsorshipFeeSol.toFixed(6), 'SOL');
+          } catch (feeErr: any) {
+            console.error('[Gas] Swap fee collection failed (non-critical):', feeErr.message);
+          }
         }
       }
     }
@@ -3148,7 +5905,8 @@ bot.action('confirm_send', async (ctx) => {
       `Enter your 4-digit PIN to confirm this transfer:`,
       { parse_mode: 'Markdown' }
     );
-    await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    const waitMsg = await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    getSession(userId).lastBotMessageId = waitMsg.message_id;
     return;
   }
 
@@ -3160,6 +5918,7 @@ bot.action('confirm_send', async (ctx) => {
     amountUsdt: amountUsdt!,
     ngnRate,
     zendFeeUsdt,
+    feeSol: session.pendingTransaction?.feeSol,
     fromMint,
     recipientBankCode,
     recipientBankName,
@@ -3205,17 +5964,65 @@ async function prepareSendConfirmation(
     console.log('Using fallback rate for send confirmation');
   }
 
-  const zendFeeBps = parseInt(process.env.ZEND_FEE_BPS || '100', 10);
-  const zendFeeUsdt = (amountNgn / rate) * (zendFeeBps / 10000);
-  const usdtNeeded = (amountNgn / rate) + zendFeeUsdt;
+  const transferUsdt = amountNgn / rate;
+
+  // ─── Calculate fee based on SOL balance ───
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  let feeInfo = { zendFeeUsdt: 0, feeSol: 0, feeBps: 100, willFundSol: false };
+  if (user[0]?.walletAddress) {
+    feeInfo = await calculateSendFee(transferUsdt, user[0].walletAddress);
+  }
+  const { zendFeeUsdt, feeSol, feeBps, willFundSol } = feeInfo;
+  const usdtNeeded = transferUsdt + zendFeeUsdt;
+
+  // ─── Check wallet balance before showing confirmation ───
+  if (user[0]?.walletAddress) {
+    const tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, selectedMint);
+    const solBalance = await walletService.getSolBalance(user[0].walletAddress);
+    if (selectedMint === SOLANA_TOKENS.AUDD.mint) {
+      // For AUDD, just check they have some — actual swap check happens in executeSendCore
+      if (tokenBalance <= 0) {
+        await ctx.reply(
+          `❌ *No AUDD Balance*\n\n` +
+          `You don't have any AUDD to send.\n\n` +
+          `Add AUDD to your wallet first.`,
+          { parse_mode: 'Markdown', ...mainMenu }
+        );
+        return;
+      }
+    } else if (tokenBalance < transferUsdt) {
+      const shortfall = transferUsdt - tokenBalance;
+      await ctx.reply(
+        `❌ *Insufficient Balance*\n\n` +
+        `You want to send ${formatNgn(amountNgn)}\n` +
+        `You need: *${transferUsdt.toFixed(2)} ${selectedSymbol}*\n` +
+        `You have: *${tokenBalance.toFixed(2)} ${selectedSymbol}*\n` +
+        `Short by: *${shortfall.toFixed(2)} ${selectedSymbol}*\n\n` +
+        `Add more Dollars to your wallet or send a smaller amount.`,
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
+      return;
+    }
+    if (!willFundSol && solBalance < feeSol + MIN_SOL_FOR_GAS) {
+      // This shouldn't happen if calculateSendFee is correct, but guard anyway
+      await ctx.reply(
+        `❌ *Insufficient SOL for fee*\n\n` +
+        `Fee: ${feeSol.toFixed(6)} SOL\n` +
+        `Gas: ~${MIN_SOL_FOR_GAS} SOL\n` +
+        `You have: ${solBalance.toFixed(6)} SOL\n\n` +
+        `Top up your SOL balance first.`,
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
+      return;
+    }
+  }
 
   // ─── Verify bank account with PAJ ───
-  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
   let verifiedName = recipientName;
   let verifiedStatus: 'verified' | 'unverified' | 'no_paj' = 'unverified';
 
   if (user[0]?.pajSessionToken) {
-    const verification = await verifyBankAccount(user[0].pajSessionToken, bankCode, recipientAccountNumber);
+    const verification = await verifyBankAccount(user[0].pajSessionToken, bankCode, recipientAccountNumber, userId);
     if (verification.verified && verification.accountName) {
       verifiedName = verification.accountName;
       verifiedStatus = 'verified';
@@ -3231,6 +6038,7 @@ async function prepareSendConfirmation(
     amountNgn,
     amountUsdt: usdtNeeded,
     zendFeeUsdt,
+    feeSol,
     ngnRate: rate,
     fromMint: selectedMint,
     recipientName: verifiedName,
@@ -3253,11 +6061,11 @@ async function prepareSendConfirmation(
   }
 
   msg += `\n` +
-    `To: *${verifiedName || 'Recipient'}*\n` +
-    `Bank: ${bankName}\n` +
+    `To: *${md(verifiedName || 'Recipient')}*\n` +
+    `Bank: ${md(bankName)}\n` +
     `Account: \`${recipientAccountNumber}\`\n` +
     `Amount: ${formatNgn(amountNgn)}\n` +
-    `Zend fee (${(zendFeeBps / 100).toFixed(2)}%): ${zendFeeUsdt.toFixed(4)} USDT\n` +
+    `Zend fee (${(feeBps / 100).toFixed(2)}%${willFundSol ? ' includes gas' : ''}): ${feeSol.toFixed(6)} SOL (~${zendFeeUsdt.toFixed(2)} USDT)\n` +
     `You pay: *${usdtNeeded.toFixed(2)} ${selectedSymbol}*\n` +
     `Rate: ${formatNgn(rate)} per Dollar\n\n` +
     `Confirm?`;
@@ -3305,7 +6113,6 @@ bot.hears('💴 Cash Out', async (ctx) => {
     await promptPrivateChat(ctx, 'cash out');
     return;
   }
-  await ctx.reply('💴 Cash Out uses the same flow as Send. Redirecting...');
   const userId = ctx.from.id.toString();
   setSession(userId, {
     state: ConversationState.AWAITING_SEND_AMOUNT,
@@ -3339,7 +6146,7 @@ async function showReceive(ctx: ZendContext, userId: string) {
   msg += `Choose how you want to get paid:\n\n`;
 
   msg += `*🪙 Crypto*\n`;
-  msg += `Send Dollars (USDT/USDC) or SOL to:\n`;
+  msg += `Send Dollars (USDT/USDC), AUDD or SOL to:\n`;
   msg += `${walletAddress}\n\n`;
 
   if (hasVA) {
@@ -3351,7 +6158,7 @@ async function showReceive(ctx: ZendContext, userId: string) {
   } else {
     msg += `*🇳🇬 Naira (Bank Transfer)*\n`;
     msg += `You don't have a virtual account yet.\n`;
-    msg += `Tap 💵 *Add Naira* to create one.\n\n`;
+    msg += `Tap *💵 Add Naira* below to create one.\n\n`;
   }
 
   msg += `\n*🌉 From Other Apps*\n`;
@@ -3360,11 +6167,19 @@ async function showReceive(ctx: ZendContext, userId: string) {
   msg += `💡 *Crypto arrives instantly*\n`;
   msg += `⏱️ *Naira takes 2–5 minutes* after bank transfer`;
 
+  const kbRows: any[] = [];
+  kbRows.push([{ text: '📋 Copy Crypto Address', copy_text: { text: walletAddress } } as any]);
+  if (hasVA) {
+    kbRows.push([{ text: '📋 Copy Account Number', copy_text: { text: virtualAccount.accountNumber } } as any]);
+  } else {
+    kbRows.push([Markup.button.callback('💵 Add Naira', 'add_naira_start')]);
+  }
+  kbRows.push([Markup.button.callback('🇦🇺 Add AUDD', 'add_aud_start')]);
+  kbRows.push([Markup.button.callback('🌉 Receive from Other Apps', 'bridge_start')]);
+
   await ctx.reply(msg, {
     parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([
-      [Markup.button.callback('🌉 Receive from Other Apps', 'bridge_start')],
-    ]),
+    ...Markup.inlineKeyboard(kbRows),
   });
 }
 
@@ -3395,6 +6210,10 @@ async function showSwapMenu(ctx: ZendContext, userId: string) {
         [Markup.button.callback('SOL → USDT', 'swap:SOL:USDT')],
         [Markup.button.callback('USDC → USDT', 'swap:USDC:USDT')],
         [Markup.button.callback('USDT → SOL', 'swap:USDT:SOL')],
+        [Markup.button.callback('SOL → AUDD', 'swap:SOL:AUDD')],
+        [Markup.button.callback('AUDD → SOL', 'swap:AUDD:SOL')],
+        [Markup.button.callback('USDT → AUDD', 'swap:USDT:AUDD')],
+        [Markup.button.callback('AUDD → USDT', 'swap:AUDD:USDT')],
         [Markup.button.callback('❌ Cancel', 'cancel_swap')],
       ]),
     }
@@ -3459,8 +6278,7 @@ bot.action('cancel_swap', async (ctx) => {
 // 📅 SCHEDULED TRANSFERS
 // ═════════════════════════════════════════════════════════════════════════════
 
-bot.hears('📅 Schedule', async (ctx) => {
-  const userId = ctx.from.id.toString();
+async function showScheduleMenu(ctx: ZendContext, userId: string) {
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
 
   if (user.length === 0) {
@@ -3490,6 +6308,15 @@ bot.hears('📅 Schedule', async (ctx) => {
       : `You don't have any saved recipients yet.\n\nTap *➕ Add New Recipient* to add one.`),
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }
   );
+}
+
+bot.hears('📅 Schedule', async (ctx) => {
+  await showScheduleMenu(ctx, ctx.from.id.toString());
+});
+
+bot.action('schedule_start', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showScheduleMenu(ctx, ctx.from!.id.toString());
 });
 
 bot.action('schedule_add_recipient', async (ctx) => {
@@ -3567,8 +6394,8 @@ bot.action(/schedule_bank:([A-Z]+)/, async (ctx) => {
 
   await ctx.editMessageText(
     `✅ *Recipient Saved*\n\n` +
-    `Name: ${accountName}\n` +
-    `Bank: ${bank.name}\n` +
+    `Name: ${md(accountName)}\n` +
+    `Bank: ${md(bank.name)}\n` +
     `Account: \`${accountNumber}\`\n\n` +
     `How much NGN do you want to send each time?\n` +
     `Example: 50000`,
@@ -3604,8 +6431,8 @@ bot.action(/schedule_recipient:(\d+)/, async (ctx) => {
 
   await ctx.editMessageText(
     `📅 *Schedule Transfer*\n\n` +
-    `Recipient: ${acc.accountName}\n` +
-    `Bank: ${acc.bankName}\n` +
+    `Recipient: ${md(acc.accountName)}\n` +
+    `Bank: ${md(acc.bankName)}\n` +
     `Account: \`${acc.accountNumber}\`\n\n` +
     `How much NGN do you want to send each time?\n` +
     `Example: 50000`,
@@ -3739,9 +6566,106 @@ async function handleSwapAmount(ctx: ZendContext, userId: string, text: string) 
     return;
   }
 
-  // Convert to base units
+  const fromToken = getTokenBySymbol(pt.fromSymbol as string)!;
+  const toToken = getTokenBySymbol(pt.toSymbol as string)!;
   const amountBase = Math.round(amount * Math.pow(10, pt.fromDecimals as number));
 
+  // ─── Local swap via dev wallet (AUDD pairs) ───
+  const isAuddPair = pt.fromMint === SOLANA_TOKENS.AUDD.mint || pt.toMint === SOLANA_TOKENS.AUDD.mint;
+  if (isAuddPair) {
+    await ctx.replyWithChatAction('typing');
+    try {
+      const solPrice = await getSolPriceInUsdt();
+      const auddPrice = await getAuddPriceInUsdt();
+
+      let outAmount = 0;
+      if (pt.fromMint === SOLANA_TOKENS.SOL.mint && pt.toMint === SOLANA_TOKENS.AUDD.mint) {
+        outAmount = amount * solPrice / auddPrice;
+      } else if (pt.fromMint === SOLANA_TOKENS.AUDD.mint && pt.toMint === SOLANA_TOKENS.SOL.mint) {
+        outAmount = amount * auddPrice / solPrice;
+      } else if (pt.fromMint === SOLANA_TOKENS.USDT.mint && pt.toMint === SOLANA_TOKENS.AUDD.mint) {
+        outAmount = amount / auddPrice;
+      } else if (pt.fromMint === SOLANA_TOKENS.AUDD.mint && pt.toMint === SOLANA_TOKENS.USDT.mint) {
+        outAmount = amount * auddPrice;
+      } else if (pt.fromMint === SOLANA_TOKENS.USDC.mint && pt.toMint === SOLANA_TOKENS.AUDD.mint) {
+        outAmount = amount / auddPrice;
+      } else if (pt.fromMint === SOLANA_TOKENS.AUDD.mint && pt.toMint === SOLANA_TOKENS.USDC.mint) {
+        outAmount = amount * auddPrice;
+      }
+
+      if (!DEV_WALLET_SECRET) {
+        await ctx.reply('❌ AUDD swap not available: dev wallet not configured.', mainMenu);
+        setSession(userId, { state: ConversationState.IDLE });
+        return;
+      }
+      const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+
+      // Check dev wallet has enough output token
+      if (pt.toMint === SOLANA_TOKENS.AUDD.mint) {
+        const devBal = await walletService.getTokenBalance(devKeypair.publicKey.toBase58(), SOLANA_TOKENS.AUDD.mint);
+        if (devBal < outAmount) {
+          await ctx.reply(`❌ AUDD liquidity is low. Only ${devBal.toFixed(2)} AUDD available in pool.`, mainMenu);
+          setSession(userId, { state: ConversationState.IDLE });
+          return;
+        }
+      } else if (pt.toMint === SOLANA_TOKENS.USDT.mint) {
+        const devBal = await walletService.getTokenBalance(devKeypair.publicKey.toBase58(), SOLANA_TOKENS.USDT.mint);
+        if (devBal < outAmount) {
+          await ctx.reply(`❌ USDT liquidity is low. Only ${devBal.toFixed(2)} USDT available in pool.`, mainMenu);
+          setSession(userId, { state: ConversationState.IDLE });
+          return;
+        }
+      } else if (pt.toMint === SOLANA_TOKENS.USDC.mint) {
+        const devBal = await walletService.getTokenBalance(devKeypair.publicKey.toBase58(), SOLANA_TOKENS.USDC.mint);
+        if (devBal < outAmount) {
+          await ctx.reply(`❌ USDC liquidity is low. Only ${devBal.toFixed(2)} USDC available in pool.`, mainMenu);
+          setSession(userId, { state: ConversationState.IDLE });
+          return;
+        }
+      } else if (pt.toMint === SOLANA_TOKENS.SOL.mint) {
+        const devBal = await walletService.getSolBalance(devKeypair.publicKey.toBase58());
+        if (devBal < outAmount) {
+          await ctx.reply(`❌ SOL liquidity is low. Only ${devBal.toFixed(4)} SOL available in pool.`, mainMenu);
+          setSession(userId, { state: ConversationState.IDLE });
+          return;
+        }
+      }
+
+      const outAmountBase = Math.round(outAmount * Math.pow(10, toToken.decimals));
+      session.pendingTransaction = {
+        ...pt,
+        swapAmountBase: amountBase,
+        swapQuote: { outAmount: String(outAmountBase), inAmount: String(amountBase), otherAmountThreshold: String(outAmountBase), priceImpactPct: '0' },
+        swapOutAmount: outAmount,
+        swapMinOut: outAmount,
+        swapPriceImpact: 0,
+        isLocalSwap: true,
+      };
+      session.state = ConversationState.AWAITING_CONFIRMATION;
+      setSession(userId, session);
+
+      let msg = `🔄 *Exchange Rate (Local Swap)*\n\n`;
+      msg += `${amount.toFixed(fromToken.decimals === 9 ? 4 : 2)} ${fromToken.symbol} → ${outAmount.toFixed(toToken.decimals === 9 ? 4 : 2)} ${toToken.symbol}\n`;
+      msg += `Rate: 1 ${fromToken.symbol} ≈ ${(outAmount / amount).toFixed(6)} ${toToken.symbol}\n`;
+      msg += `Price impact: 0%\n\n`;
+      msg += `Confirm?`;
+
+      await ctx.reply(msg, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('✅ Confirm Swap', 'confirm_swap')],
+          [Markup.button.callback('❌ Cancel', 'cancel_swap')],
+        ]),
+      });
+      return;
+    } catch (err: any) {
+      await ctx.reply(`❌ Could not calculate local swap rate: ${err.message}`, mainMenu);
+      setSession(userId, { state: ConversationState.IDLE });
+      return;
+    }
+  }
+
+  // ─── Jupiter swap (non-AUDD pairs) ───
   await ctx.replyWithChatAction('typing');
   const quote = await getSwapQuote(pt.fromMint, pt.toMint, amountBase, 50);
 
@@ -3750,9 +6674,6 @@ async function handleSwapAmount(ctx: ZendContext, userId: string, text: string) 
     setSession(userId, { state: ConversationState.IDLE });
     return;
   }
-
-  const fromToken = getTokenBySymbol(pt.fromSymbol as string)!;
-  const toToken = getTokenBySymbol(pt.toSymbol as string)!;
 
   const outAmount = Number(quote.outAmount) / Math.pow(10, toToken.decimals);
   const minOut = Number(quote.otherAmountThreshold) / Math.pow(10, toToken.decimals);
@@ -3816,7 +6737,8 @@ bot.action('confirm_swap', async (ctx) => {
       `Enter your 4-digit PIN to confirm this swap:`,
       { parse_mode: 'Markdown' }
     );
-    await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    const waitMsg = await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    getSession(userId).lastBotMessageId = waitMsg.message_id;
     return;
   }
 
@@ -4065,7 +6987,7 @@ async function showSettings(ctx: ZendContext, userId: string) {
     const msg =
       `⚙️ *Settings*\n\n` +
       `👤 *Profile*\n` +
-      `Name: ${u.firstName} ${u.lastName || ''}\n\n` +
+      `Name: ${md(u.firstName)} ${md(u.lastName || '')}\n\n` +
       `*Your Address:*\n` +
       `\`\`\`\n${u.walletAddress}\n\`\`\`\n\n` +
       `🔐 *Security*\n` +
@@ -4077,6 +6999,7 @@ async function showSettings(ctx: ZendContext, userId: string) {
 
     // Build dynamic settings menu — hide items already done
     const buttons: any[] = [];
+    buttons.push([{ text: '📋 Copy Address', copy_text: { text: u.walletAddress } } as any]);
     if (!u.email) {
       buttons.push([Markup.button.callback('📧 Add Email', 'settings_email')]);
     }
@@ -4089,6 +7012,7 @@ async function showSettings(ctx: ZendContext, userId: string) {
       buttons.push([Markup.button.callback('🔢 Change PIN', 'settings_pin')]);
     }
     buttons.push([Markup.button.callback('🔑 Show Secret Code', 'export_key')]);
+    buttons.push([Markup.button.callback('📅 Schedule Transfer', 'schedule_start')]);
 
     await finishLoading(ctx, loading.message_id, msg, 'Markdown');
     await ctx.reply('Menu:', {
@@ -4152,7 +7076,8 @@ bot.action('settings_pin', async (ctx) => {
     `Example: 1234`
   );
 
-  await ctx.reply('Waiting for your input...', cancelKeyboard);
+  const waitMsg = await ctx.reply('Waiting for your input...', cancelKeyboard);
+  getSession(userId).lastBotMessageId = waitMsg.message_id;
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -4654,6 +7579,80 @@ bot.catch((err, ctx) => {
 // ═════════════════════════════════════════════════════════════════════════════
 
 // ═════════════════════════════════════════════════════════════════════════════
+// BALANCE CHANGE DETECTOR — notifies users of direct Solana deposits
+// ═════════════════════════════════════════════════════════════════════════════
+
+const balanceSnapshots = new Map<string, { sol: number; usdt: number; usdc: number; audd: number }>();
+
+async function checkBalanceChanges(botInstance: Telegraf<any>) {
+  try {
+    const allUsers = await db.select({ id: users.id, walletAddress: users.walletAddress }).from(users);
+    for (const user of allUsers) {
+      try {
+        const balances = await walletService.getAllBalances(user.walletAddress);
+        const current = {
+          sol: balances.find((b: any) => b.symbol === 'SOL')?.amount || 0,
+          usdt: balances.find((b: any) => b.symbol === 'USDT')?.amount || 0,
+          usdc: balances.find((b: any) => b.symbol === 'USDC')?.amount || 0,
+          audd: balances.find((b: any) => b.symbol === 'AUDD')?.amount || 0,
+        };
+
+        const prev = balanceSnapshots.get(user.id);
+        if (prev) {
+          const solDiff = current.sol - prev.sol;
+          const usdtDiff = current.usdt - prev.usdt;
+          const usdcDiff = current.usdc - prev.usdc;
+
+          if (solDiff > 0.000001) {
+            await botInstance.telegram.sendMessage(
+              user.id,
+              `🎉 *Funds Received!*\n\n` +
+              `*+${solDiff.toFixed(6)} SOL* has arrived in your Zend wallet.\n\n` +
+              `New balance: *${current.sol.toFixed(6)} SOL*`,
+              { parse_mode: 'Markdown' }
+            );
+          }
+          if (usdtDiff > 0.000001) {
+            await botInstance.telegram.sendMessage(
+              user.id,
+              `🎉 *Funds Received!*\n\n` +
+              `*+${usdtDiff.toFixed(2)} USDT* has arrived in your Zend wallet.\n\n` +
+              `New balance: *${current.usdt.toFixed(2)} USDT*`,
+              { parse_mode: 'Markdown' }
+            );
+          }
+          if (usdcDiff > 0.000001) {
+            await botInstance.telegram.sendMessage(
+              user.id,
+              `🎉 *Funds Received!*\n\n` +
+              `*+${usdcDiff.toFixed(2)} USDC* has arrived in your Zend wallet.\n\n` +
+              `New balance: *${current.usdc.toFixed(2)} USDC*`,
+              { parse_mode: 'Markdown' }
+            );
+          }
+          if (current.audd - (prev?.audd || 0) > 0.000001) {
+            const auddDiff = current.audd - (prev?.audd || 0);
+            await botInstance.telegram.sendMessage(
+              user.id,
+              `🎉 *Funds Received!*\n\n` +
+              `*+${auddDiff.toFixed(2)} AUDD* has arrived in your Zend wallet.\n\n` +
+              `New balance: *${current.audd.toFixed(2)} AUDD*`,
+              { parse_mode: 'Markdown' }
+            );
+          }
+        }
+
+        balanceSnapshots.set(user.id, current);
+      } catch (err) {
+        console.error(`[BalancePoll] Error checking user ${user.id}:`, err);
+      }
+    }
+  } catch (err) {
+    console.error('[BalancePoll] Error fetching users:', err);
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // WEBHOOK SERVER (runs alongside bot for PAJ callbacks)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -4691,23 +7690,159 @@ function startWebhookServer(botInstance: Telegraf<any>) {
           const event = JSON.parse(body);
           console.log('📩 PAJ Webhook:', event.type, event.reference);
 
+          // Guard against malformed/health-check webhooks
+          if (!event.type) {
+            console.log('[PAJ Webhook] No event type — likely ping/health-check. Body:', body.slice(0, 200));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ received: true, note: 'No event type' }));
+            return;
+          }
+
           switch (event.type) {
             case 'onramp.deposit.confirmed': {
-              await db.update(transactions)
-                .set({ status: 'completed', completedAt: new Date() })
-                .where(eq(transactions.pajReference, event.reference));
+              // Find or create transaction
+              let txRows = await db.select().from(transactions)
+                .where(eq(transactions.pajReference, event.reference))
+                .limit(1);
+
+              if (txRows.length === 0) {
+                // Try to find user by virtual account orderId
+                const userRows = await db.select().from(users)
+                  .where(sql`virtual_account->>'orderId' = ${event.reference}`)
+                  .limit(1);
+                if (userRows.length > 0) {
+                  const fallbackTxId = generateTxId();
+                  await db.insert(transactions).values({
+                    id: fallbackTxId,
+                    userId: userRows[0].id,
+                    type: 'ngn_receive',
+                    status: 'completed',
+                    pajReference: event.reference,
+                    pajPoolAddress: userRows[0].walletAddress,
+                    recipientWalletAddress: userRows[0].walletAddress,
+                    completedAt: new Date(),
+                  });
+                  txRows = [{ id: fallbackTxId, userId: userRows[0].id } as any];
+                } else {
+                  console.warn('[PAJ Webhook] No transaction or user found for reference:', event.reference);
+                }
+              } else {
+                await db.update(transactions)
+                  .set({ status: 'completed', completedAt: new Date() })
+                  .where(eq(transactions.pajReference, event.reference));
+              }
+
+              // Check if this on-ramp should be converted to AUDD (hidden swap)
+              let notified = false;
+              try {
+                if (txRows.length > 0) {
+                  const targetToken = (txRows[0].metadata as any)?.targetToken;
+                  if (targetToken === 'AUDD') {
+                    const userId = txRows[0].userId;
+                    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+                    if (user.length > 0 && user[0].walletEncryptedKey) {
+                      const usdtAmount = Number(txRows[0].fromAmount || 0);
+                      if (usdtAmount > 0) {
+                        const auddRate = await getAuddPriceInUsdt();
+                        const auddOut = usdtAmount / auddRate;
+                        if (DEV_WALLET_SECRET) {
+                          const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+                          const devAuddBalance = await walletService.getTokenBalance(devKeypair.publicKey.toBase58(), SOLANA_TOKENS.AUDD.mint);
+                          if (devAuddBalance >= auddOut) {
+                            const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
+                            const keypair = Keypair.fromSecretKey(secretKey);
+                            const swapTxHash = await walletService.executeLocalSwap(
+                              keypair,
+                              devKeypair,
+                              SOLANA_TOKENS.USDT.mint,
+                              SOLANA_TOKENS.AUDD.mint,
+                              usdtAmount,
+                              auddOut,
+                              SOLANA_TOKENS.USDT.decimals,
+                              SOLANA_TOKENS.AUDD.decimals,
+                              user[0].walletAddress
+                            );
+                            const swapTxId = generateTxId();
+                            await db.insert(transactions).values({
+                              id: swapTxId, userId, type: 'swap', status: 'completed',
+                              fromMint: SOLANA_TOKENS.USDT.mint, fromAmount: usdtAmount.toString(),
+                              toMint: SOLANA_TOKENS.AUDD.mint, toAmount: auddOut.toString(),
+                              solanaTxHash: swapTxHash,
+                            });
+                            await botInstance.telegram.sendMessage(
+                              userId,
+                              `🎉 *AUDD Deposit Complete!*\n\n` +
+                              `Your Naira bank transfer has been confirmed and AUDD has been credited to your Zend account.\n\n` +
+                              `Received: ~${auddOut.toFixed(2)} AUDD\n` +
+                              `Reference: \`${event.reference}\``,
+                              { parse_mode: 'Markdown' }
+                            );
+                            notified = true;
+                          } else {
+                            console.error('[AUDD On-ramp] Dev wallet AUDD balance too low:', devAuddBalance, 'needed:', auddOut);
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              } catch (swapErr) {
+                console.error('[AUDD On-ramp] Hidden swap failed:', swapErr);
+              }
+
+              // Notify user (default USDT notification)
+              try {
+                if (!notified && txRows.length > 0) {
+                  const userId = txRows[0].userId;
+                  await botInstance.telegram.sendMessage(
+                    userId,
+                    `🎉 *Naira Deposit Received!*\n\n` +
+                    `Your bank transfer has been confirmed and Dollars (USDT) have been credited to your Zend account.\n\n` +
+                    `Reference: \`${event.reference}\``,
+                    { parse_mode: 'Markdown' }
+                  );
+                }
+              } catch (notifyErr) {
+                console.log('[PAJ Webhook] Could not notify user:', notifyErr);
+              }
               break;
             }
             case 'onramp.deposit.failed': {
-              await db.update(transactions)
-                .set({ status: 'failed' })
-                .where(eq(transactions.pajReference, event.reference));
+              const txRows = await db.select().from(transactions)
+                .where(eq(transactions.pajReference, event.reference))
+                .limit(1);
+              if (txRows.length > 0) {
+                await db.update(transactions)
+                  .set({ status: 'failed' })
+                  .where(eq(transactions.pajReference, event.reference));
+              } else {
+                console.warn('[PAJ Webhook] No transaction found for failed deposit:', event.reference);
+              }
               break;
             }
             case 'offramp.settlement.confirmed': {
               await db.update(transactions)
                 .set({ status: 'completed', completedAt: new Date() })
                 .where(eq(transactions.pajReference, event.reference));
+
+              // Notify user
+              try {
+                const txRows = await db.select().from(transactions)
+                  .where(eq(transactions.pajReference, event.reference))
+                  .limit(1);
+                if (txRows.length > 0) {
+                  const userId = txRows[0].userId;
+                  await botInstance.telegram.sendMessage(
+                    userId,
+                    `✅ *Cash Out Complete!*\n\n` +
+                    `Your Naira has been settled to your bank account.\n\n` +
+                    `Reference: \`${event.reference}\``,
+                    { parse_mode: 'Markdown' }
+                  );
+                }
+              } catch (notifyErr) {
+                console.log('[PAJ Webhook] Could not notify user:', notifyErr);
+              }
               break;
             }
             case 'offramp.settlement.failed': {
@@ -4818,6 +7953,83 @@ function startWebhookServer(botInstance: Telegraf<any>) {
       return;
     }
 
+    // BitRefill Webhooks
+    if (url === '/webhooks/bitrefill' && method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', async () => {
+        try {
+          const event = JSON.parse(body);
+          console.log('📩 BitRefill Webhook:', event.event, event.invoice_id);
+
+          // Find our order record
+          const orders = await db.select().from(bitrefillOrders)
+            .where(eq(bitrefillOrders.bitrefillInvoiceId, event.invoice_id))
+            .limit(1);
+
+          if (!orders.length) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ received: true }));
+            return;
+          }
+
+          const order = orders[0];
+          const userId = order.userId;
+
+          if (event.event === 'invoice.complete' || event.status === 'complete') {
+            await db.update(bitrefillOrders)
+              .set({
+                status: 'complete',
+                codes: event.codes || event.redemption_codes || [],
+                completedAt: new Date(),
+              })
+              .where(eq(bitrefillOrders.id, order.id));
+
+            const codes = event.codes || event.redemption_codes || [];
+            let codesText = '';
+            if (codes.length) {
+              codesText = '\n\n' + codes.map((c: any) =>
+                c.pin
+                  ? `Code: \`${c.code}\`\nPin: \`${c.pin}\``
+                  : `Code: \`${c.code}\``
+              ).join('\n\n');
+            }
+
+            await botInstance.telegram.sendMessage(
+              userId,
+              `🎉 *Order Complete!*\n\n` +
+              `${order.productName}\n` +
+              `${order.currencyFiat} ${order.amountFiat}` +
+              `${codesText}\n\n` +
+              `Reference: \`${order.id}\``,
+              { parse_mode: 'Markdown' }
+            );
+          } else if (event.event === 'invoice.failed' || event.status === 'failed') {
+            await db.update(bitrefillOrders)
+              .set({ status: 'failed', metadata: event })
+              .where(eq(bitrefillOrders.id, order.id));
+
+            await botInstance.telegram.sendMessage(
+              userId,
+              `❌ *Order Failed*\n\n` +
+              `${order.productName} could not be fulfilled.\n\n` +
+              `If you paid, a refund will be processed to your wallet.\n` +
+              `Reference: \`${order.id}\``,
+              { parse_mode: 'Markdown' }
+            );
+          }
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ received: true }));
+        } catch (err: any) {
+          console.error('[BitRefill Webhook] Error:', err);
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: err.message }));
+        }
+      });
+      return;
+    }
+
     // Telegram Bot Webhooks
     if (url === '/webhook/telegram' && method === 'POST') {
       let body = '';
@@ -4837,6 +8049,71 @@ function startWebhookServer(botInstance: Telegraf<any>) {
       return;
     }
 
+    // ─── Landing page forms ───
+    if (url === '/api/ambassador' && method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', async () => {
+        try {
+          const data = JSON.parse(body);
+          const { name, tgHandle, isStudent, focus } = data;
+          if (!name || !tgHandle || !isStudent || !focus) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'All fields are required' }));
+            return;
+          }
+          await db.insert(ambassadorApplications).values({
+            name: String(name).trim(),
+            tgHandle: String(tgHandle).trim(),
+            isStudent: String(isStudent).trim(),
+            focus: String(focus).trim(),
+          });
+          console.log('📩 Ambassador application received:', name, tgHandle);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true }));
+        } catch (err: any) {
+          console.error('[Webhook] Ambassador error:', err);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Failed to save application' }));
+        }
+      });
+      return;
+    }
+
+    if (url === '/api/device-suspend' && method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', async () => {
+        try {
+          const data = JSON.parse(body);
+          const { fullName, email, phone, handle, deviceLost, lastUsed, reason, details } = data;
+          if (!fullName || !email || !phone || !handle || !deviceLost || !lastUsed || !reason) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Required fields missing' }));
+            return;
+          }
+          await db.insert(deviceSuspensionRequests).values({
+            fullName: String(fullName).trim(),
+            email: String(email).trim(),
+            phone: String(phone).trim(),
+            handle: String(handle).trim(),
+            deviceLost: String(deviceLost).trim(),
+            lastUsed: String(lastUsed).trim(),
+            reason: String(reason).trim(),
+            details: details ? String(details).trim() : null,
+          });
+          console.log('📩 Device suspension request received:', fullName, email);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true }));
+        } catch (err: any) {
+          console.error('[Webhook] Device suspension error:', err);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Failed to save request' }));
+        }
+      });
+      return;
+    }
+
     // 404
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));
@@ -4847,7 +8124,10 @@ function startWebhookServer(botInstance: Telegraf<any>) {
     console.log(`🌐 Webhook server running on http://${host}`);
     console.log(`   PAJ webhook URL: https://${host}/webhooks/paj`);
     console.log(`   ChainRails webhook URL: https://${host}/webhooks/chain-rails`);
+    console.log(`   BitRefill webhook URL: https://${host}/webhooks/bitrefill`);
     console.log(`   Telegram webhook URL: https://${host}/webhook/telegram`);
+    console.log(`   Ambassador API: https://${host}/api/ambassador`);
+    console.log(`   Device Suspend API: https://${host}/api/device-suspend`);
   });
 
   return server;
@@ -4891,13 +8171,22 @@ async function runScheduledTransfers() {
           rate = rates.offRampRate;
         } catch (e) { /* use fallback */ }
 
-        const amountUsdt = Number(s.amountNgn) / rate;
+        const transferUsdt = Number(s.amountNgn) / rate;
+
+        // Calculate fee for scheduled transfer
+        const userRow = await db.select().from(users).where(eq(users.id, s.userId)).limit(1);
+        const feeInfo = userRow[0]?.walletAddress
+          ? await calculateSendFee(transferUsdt, userRow[0].walletAddress)
+          : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
+        const amountUsdt = transferUsdt + feeInfo.zendFeeUsdt;
 
         // Auto-execute the transfer
         const result = await executeSendCore(s.userId, {
           amountNgn: Number(s.amountNgn),
           amountUsdt,
           ngnRate: rate,
+          zendFeeUsdt: feeInfo.zendFeeUsdt,
+          feeSol: feeInfo.feeSol,
           recipientBankCode: acc.bankCode,
           recipientBankName: acc.bankName,
           recipientAccountNumber: acc.accountNumber,
@@ -4911,8 +8200,8 @@ async function runScheduledTransfers() {
               s.userId,
               `✅ *Scheduled Transfer Executed*\n\n` +
               `Amount: ${formatNgn(Number(s.amountNgn))}\n` +
-              `To: ${acc.accountName}\n` +
-              `Bank: ${acc.bankName} • \`${acc.accountNumber}\`\n\n` +
+              `To: ${md(acc.accountName)}\n` +
+              `Bank: ${md(acc.bankName)} • \`${acc.accountNumber}\`\n\n` +
               `Reference: \`${result.txId}\`\n` +
               (result.solanaTxHash ? `Tx: \`https://solscan.io/tx/${result.solanaTxHash}\`\n` : '') +
               `Time: ~2 minutes`,
@@ -4925,8 +8214,8 @@ async function runScheduledTransfers() {
               s.userId,
               `❌ *Scheduled Transfer Failed*\n\n` +
               `Amount: ${formatNgn(Number(s.amountNgn))}\n` +
-              `To: ${acc.accountName}\n` +
-              `Bank: ${acc.bankName} • \`${acc.accountNumber}\`\n\n` +
+              `To: ${md(acc.accountName)}\n` +
+              `Bank: ${md(acc.bankName)} • \`${acc.accountNumber}\`\n\n` +
               `Error: ${result.error || 'Unknown error'}\n` +
               `No funds were deducted.`,
               { parse_mode: 'Markdown', ...mainMenu }
@@ -5016,12 +8305,31 @@ async function main() {
     console.warn('⚠️  ChainRails not configured');
   }
 
+  // Seed bot features table for AI awareness
+  await seedBotFeatures();
+
   // Start webhook server (runs alongside bot)
   startWebhookServer(bot);
 
-  // Launch bot — prefer webhooks on Railway, fallback to polling locally
+  // Launch bot — webhooks in production, polling for local dev only
   const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || process.env.RAILWAY_PUBLIC_DOMAIN;
+  const isRailway = !!process.env.RAILWAY_PUBLIC_DOMAIN;
   let isWebhookMode = false;
+
+  // Always clear any existing webhook first to prevent 429 conflicts
+  async function clearWebhook(retries = 3): Promise<boolean> {
+    for (let i = 0; i < retries; i++) {
+      try {
+        await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+        console.log('[Bot] Webhook cleared successfully');
+        return true;
+      } catch (err: any) {
+        console.warn(`[Bot] Failed to clear webhook (attempt ${i + 1}/${retries}):`, err.message);
+        if (i < retries - 1) await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+    return false;
+  }
 
   if (webhookBaseUrl) {
     const telegramWebhookUrl = `${webhookBaseUrl.replace(/\/$/, '')}/webhook/telegram`;
@@ -5033,16 +8341,24 @@ async function main() {
     } catch (webhookErr: any) {
       console.error('[Bot] Failed to set webhook:', webhookErr.message);
       console.log('🤖 Falling back to polling mode...');
+      await clearWebhook();
       bot.launch({ dropPendingUpdates: true });
     }
   } else {
+    console.log('🤖 Bot running in polling mode (local dev)...');
+    await clearWebhook();
     bot.launch({ dropPendingUpdates: true });
-    console.log('🤖 Zend bot running in polling mode...');
   }
 
   // Start scheduled transfer executor (every 60 seconds)
   setInterval(runScheduledTransfers, 60000);
   console.log('📅 Scheduled transfer executor started (every 60s)');
+
+  // Balance change detector disabled — was hitting Solana RPC rate limits.
+  // Re-enable later with batching + retry logic if needed.
+  // setInterval(() => checkBalanceChanges(bot), 120000);
+  // checkBalanceChanges(bot).catch(console.error);
+  console.log('🔔 Balance change detector: DISABLED (RPC rate limit protection)');
 
   // Handle 409 conflict from polling loop (Railway deploy overlap)
   // Only relevant in polling mode; webhooks don't have 409s
@@ -5095,3 +8411,4 @@ async function main() {
 }
 
 main();
+// Railway deploy trigger Wed May 20 10:32:40 WAT 2026

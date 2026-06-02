@@ -64,7 +64,7 @@ export async function transcribeWithQVAC(audioBuffer: Buffer): Promise<string> {
     console.log(`[QVAC Transcribe] WAV conversion took ${Date.now() - t0}ms`);
 
     const t1 = Date.now();
-    const text = await withTimeout(
+    const textResult = await withTimeout(
       transcribe({
         modelId,
         audioChunk: wavPath,
@@ -72,7 +72,8 @@ export async function transcribeWithQVAC(audioBuffer: Buffer): Promise<string> {
       }),
       30000,
       'Whisper transcription'
-    ) as string;
+    );
+    const text = typeof textResult === 'string' ? textResult : textResult.text;
     console.log(`[QVAC Transcribe] Inference took ${Date.now() - t1}ms`);
 
     return text.trim();
