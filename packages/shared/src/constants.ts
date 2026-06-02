@@ -82,6 +82,10 @@ export enum ConversationState {
   AWAITING_OTP = 'awaiting_otp',
   AWAITING_PIN = 'awaiting_pin',
   AWAITING_PIN_VERIFY = 'awaiting_pin_verify',
+  // Onboarding
+  ONBOARDING_AWAITING_EMAIL = 'onboarding_awaiting_email',
+  ONBOARDING_AWAITING_OTP = 'onboarding_awaiting_otp',
+  ONBOARDING_AWAITING_PIN = 'onboarding_awaiting_pin',
   AWAITING_BANK_ACCOUNT_NUMBER = 'awaiting_bank_account_number',
   AWAITING_BANK_ACCOUNT_NAME = 'awaiting_bank_account_name',
   AWAITING_ONRAMP_AMOUNT = 'awaiting_onramp_amount',

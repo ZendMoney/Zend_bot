@@ -11,6 +11,7 @@
     "@zend/shared": "workspace:*",
     "@zend/solana": "workspace:*",
     "bare-runtime-linux-x64": "^1.28.5",
+    "@zend/airbills-client": "workspace:*",
     "@zend/bitrefill-client": "workspace:*",
     "bs58": "^6.0.0",
     "dotenv": "^16.4.7",

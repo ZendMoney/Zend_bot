@@ -20,6 +20,7 @@ import { users, transactions, savedBankAccounts, scheduledTransfers, bitrefillOr
 import { eq, sql, and, desc } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
 import { BitRefillClient } from '@zend/bitrefill-client';
+import { AirbillsClient } from '@zend/airbills-client';
 import {
   parseCommand, transcribeVoice, chatWithAI, chatWithKimi,
   analyzeVoiceWithAI, analyzeVoiceWithKimi, parseMenuInputWithAI,
@@ -240,15 +241,20 @@ setInterval(async () => {
 
 // ─── Services ───
 const walletService = new WalletService(SOLANA_RPC);
+// BitRefill — hidden from menu; code kept for future re-enable
 const bitrefillClient = process.env.BITREFILL_API_KEY
   ? new BitRefillClient(process.env.BITREFILL_API_KEY)
   : null;
-
 const bitrefillBusinessClient = (process.env.BITREFILL_BUSINESS_API_ID && process.env.BITREFILL_BUSINESS_API_SECRET)
   ? new BitRefillClient(process.env.BITREFILL_BUSINESS_API_ID, process.env.BITREFILL_BUSINESS_API_SECRET)
   : null;
-
 const BITREFILL_MARKUP_BPS = parseInt(process.env.BITREFILL_MARKUP_BPS || '150');
+
+// AirBills — Nigerian bill payments via Solana
+const airbillsClient = process.env.AIRBILLS_API_KEY
+  ? new AirbillsClient(process.env.AIRBILLS_API_KEY, process.env.AIRBILLS_BASE_URL)
+  : null;
+
 const ZEND_TREASURY_WALLET = process.env.ZEND_TREASURY_WALLET || ''; // receives shop USDT payments
 
 // Dev wallet for gas sponsorship (supports ZEND_DEV_WALLET_SECRET or PV_KEY)
@@ -831,7 +837,7 @@ async function verifyBankAccount(
 // ─── Keyboards ───
 const mainMenu = Markup.keyboard([
   ['💰 Balance', '📤 Send', '🔄 Swap'],
-  ['📥 Receive', '🎁 Shop', '📋 History'],
+  ['📥 Receive', '💳 Bills', '📋 History'],
   ['💳 Bills', '⚙️ Settings', '🌐 Community'],
 ]).resize();
 
@@ -1288,6 +1294,11 @@ bot.command('start', async (ctx) => {
   const existing = await db.select().from(users).where(eq(users.id, userId)).limit(1);
 
   if (existing.length > 0) {
+    if (!existing[0].onboardingComplete) {
+      await ctx.reply(`👋 Welcome back, ${firstName}!\n\nLet's finish setting up your account.`);
+      await startOnboarding(ctx, userId);
+      return;
+    }
     await ctx.reply(`👋 Welcome back, ${firstName}!\n\nYour Zend account is ready.`, mainMenu);
     return;
   }
@@ -1330,6 +1341,7 @@ bot.command('start', async (ctx) => {
     referralCode,
     referredBy: referredByUserId,
     ambassadorReferralCode: ambassadorRefCode,
+    onboardingComplete: false,
   });
 
   await ctx.reply(
@@ -1342,18 +1354,20 @@ bot.command('start', async (ctx) => {
     { parse_mode: 'Markdown' }
   );
 
-  await ctx.reply(
-    `✅ *Account Created!*\n\n` +
-    `Your Zend address:\n\n` +
-    `${wallet.publicKey}\n\n` +
-    `💡 Tap *💵 Add Naira* to get your virtual bank account.`,
-    { parse_mode: 'Markdown', ...mainMenu }
-  );
-  await ctx.reply('📋 Tap to copy your address:', Markup.inlineKeyboard([
-    [{ text: '📋 Copy Address', copy_text: { text: wallet.publicKey } } as any]
-  ]));
+  // Start onboarding: verify identity + set PIN
+  await startOnboarding(ctx, userId);
 });
 
+async function startOnboarding(ctx: ZendContext, userId: string) {
+  setSession(userId, { state: ConversationState.ONBOARDING_AWAITING_EMAIL });
+  await ctx.reply(
+    `🔐 *Let's Secure Your Account*\n\n` +
+    `Before you start, we need to verify your identity and set a transaction PIN.\n\n` +
+    `Step 1 of 3: Enter your email address\n` +
+    `We'll send a verification code via PAJ.`,
+    { parse_mode: 'Markdown', ...cancelKeyboard }
+  );
+}
 // ═════════════════════════════════════════════════════════════════════════════
 // /ADMIN — Admin Dashboard
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2195,13 +2209,13 @@ async function getCachedProducts(country: string, category?: string): Promise<an
 }
 
 // ─── Shop entry ───
-bot.command('shop', async (ctx) => {
-  await showShop(ctx);
-});
-
-bot.hears('🎁 Shop', async (ctx) => {
-  await showShop(ctx);
-});
+// BitRefill Shop — commented out in favour of AirBills
+// bot.command('shop', async (ctx) => {
+//   await showShop(ctx);
+// });
+// bot.hears('🎁 Shop', async (ctx) => {
+//   await showShop(ctx);
+// });
 
 async function showShop(ctx: ZendContext) {
   if (!bitrefillClient && !bitrefillBusinessClient) {
@@ -3250,9 +3264,24 @@ bot.on(message('text'), async (ctx, next) => {
   const session = getSession(userId);
 
   // ─── Pass menu buttons to bot.hears() handlers ───
-  const menuButtons = ['💰 Balance', '📤 Send', '📥 Receive', '🔄 Swap', '🎁 Shop', '📋 History', '⚙️ Settings', '🌐 Community'];
+  const menuButtons = ['💰 Balance', '📤 Send', '📥 Receive', '🔄 Swap', '💳 Bills', '📋 History', '⚙️ Settings', '🌐 Community'];
   if (menuButtons.includes(text)) {
     return next();
+  }
+
+  // ─── Onboarding gate ───
+  const isOnboardingState = session.state.startsWith('onboarding_');
+  if (!isOnboardingState) {
+    const userRow = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    if (userRow.length > 0 && !userRow[0].onboardingComplete) {
+      await ctx.reply(
+        `🔐 *Account Setup Required*\n\n` +
+        `Please complete identity verification and PIN setup before using Zend.`,
+        { parse_mode: 'Markdown' }
+      );
+      await startOnboarding(ctx, userId);
+      return;
+    }
   }
 
   // ─── Ignore stateful flows in groups ───
@@ -3691,6 +3720,145 @@ bot.on(message('text'), async (ctx, next) => {
     }
 
     setSession(userId, { state: ConversationState.IDLE });
+    return;
+  }
+
+  // ─── ONBOARDING: AWAITING_EMAIL ───
+  if (session.state === ConversationState.ONBOARDING_AWAITING_EMAIL) {
+    const contact = text.trim();
+    const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contact);
+    const isPhone = /^\+\d{10,15}$/.test(contact);
+
+    if (!isEmail && !isPhone) {
+      await ctx.reply(
+        '❌ Please enter a valid email or phone number with country code.\n' +
+        'Examples: user@email.com or +2348012345678',
+        cancelKeyboard
+      );
+      return;
+    }
+
+    const pajClient = await getPAJClient();
+    if (!pajClient) {
+      await ctx.reply('❌ PAJ service unavailable.', cancelKeyboard);
+      return;
+    }
+
+    try {
+      const pajContact = isPhone && contact.startsWith('+') ? contact.slice(1) : contact;
+      const initiated = await pajClient.initiateSession(pajContact);
+      console.log('[PAJ] OTP sent to:', initiated.email || initiated.phone);
+
+      session.pajContact = contact;
+      session.state = ConversationState.ONBOARDING_AWAITING_OTP;
+      setSession(userId, session);
+
+      await ctx.reply(
+        `📧 *OTP Sent!*\n\n` +
+        `Check your ${isEmail ? 'email' : 'SMS'} for a verification code from PAJ.\n\n` +
+        `Enter the OTP:`,
+        { parse_mode: 'Markdown', ...cancelKeyboard }
+      );
+    } catch (err: any) {
+      console.error('[PAJ] Initiate failed:', err);
+      await ctx.reply(
+        `❌ Could not send OTP.\n` +
+        `Error: ${err.message || 'Unknown error'}\n\n` +
+        `Please try again.`,
+        cancelKeyboard
+      );
+    }
+    return;
+  }
+
+  // ─── ONBOARDING: AWAITING_OTP ───
+  if (session.state === ConversationState.ONBOARDING_AWAITING_OTP) {
+    const otp = text.trim();
+    const contact = session.pajContact;
+
+    const pajClient = await getPAJClient();
+    if (!contact || !pajClient) {
+      await ctx.reply('❌ Session expired. Please start over.', cancelKeyboard);
+      setSession(userId, { state: ConversationState.ONBOARDING_AWAITING_EMAIL });
+      return;
+    }
+
+    if (!/^\d{4,8}$/.test(otp)) {
+      await ctx.reply('❌ Please enter a valid OTP (4-8 digits).', cancelKeyboard);
+      return;
+    }
+
+    try {
+      const pajContact = contact.startsWith('+') ? contact.slice(1) : contact;
+      const verified = await pajClient.verifySession(pajContact, otp, {
+        uuid: `zend-${userId}`,
+        device: 'Telegram',
+        os: 'Telegram Bot',
+        browser: 'Telegram',
+      });
+
+      console.log('[PAJ] Session verified for:', verified.recipient);
+
+      await db.update(users)
+        .set({
+          pajSessionToken: verified.token,
+          pajSessionExpiresAt: new Date(verified.expiresAt),
+          pajContact: contact,
+        })
+        .where(eq(users.id, userId));
+
+      // Move to PIN setup
+      session.state = ConversationState.ONBOARDING_AWAITING_PIN;
+      setSession(userId, session);
+
+      await ctx.reply(
+        `✅ *Identity Verified!*\n\n` +
+        `Step 3 of 3: Set a 4-digit transaction PIN\n` +
+        `This PIN will be required for all transfers.`,
+        { parse_mode: 'Markdown', ...cancelKeyboard }
+      );
+    } catch (err: any) {
+      console.error('[PAJ] Verify failed:', err);
+      const errorMsg = err.message || '';
+      if (errorMsg.includes('Invalid') || errorMsg.includes('invalid')) {
+        await ctx.reply(
+          `❌ *Invalid OTP*\n\n` +
+          `The code you entered is incorrect or has expired.\n` +
+          `Please check your ${contact.includes('@') ? 'email' : 'SMS'} and try again.`,
+          cancelKeyboard
+        );
+      } else {
+        await ctx.reply(
+          `❌ Verification failed.\n` +
+          `Error: ${errorMsg || 'Unknown error'}\n\n` +
+          `Please try again.`,
+          cancelKeyboard
+        );
+      }
+    }
+    return;
+  }
+
+  // ─── ONBOARDING: AWAITING_PIN ───
+  if (session.state === ConversationState.ONBOARDING_AWAITING_PIN) {
+    const pin = text.trim();
+    if (!/^\d{4}$/.test(pin)) {
+      await ctx.reply('❌ Please enter a valid 4-digit PIN.', cancelKeyboard);
+      return;
+    }
+
+    const hashed = await hashPin(pin);
+    await db.update(users)
+      .set({ transactionPin: hashed, onboardingComplete: true })
+      .where(eq(users.id, userId));
+
+    setSession(userId, { state: ConversationState.IDLE });
+    await ctx.reply(
+      `✅ *Setup Complete!*\n\n` +
+      `Your account is secured and ready to use.\n\n` +
+      `💰 Check your balance | 📤 Send money | 💵 Add Naira`,
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
     return;
   }
 

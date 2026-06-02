@@ -37,6 +37,9 @@ export const users = pgTable('users', {
   // Admin
   isAdmin: boolean('is_admin').default(false).notNull(),
 
+  // Onboarding
+  onboardingComplete: boolean('onboarding_complete').default(false).notNull(),
+
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });

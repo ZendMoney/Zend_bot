@@ -72,6 +72,9 @@ importers:
       '@qvac/sdk':
         specifier: workspace:*
         version: link:../../packages/qvac-sdk
+      '@zend/airbills-client':
+        specifier: workspace:*
+        version: link:../../packages/airbills-client
       '@zend/bitrefill-client':
         specifier: workspace:*
         version: link:../../packages/bitrefill-client
@@ -102,6 +105,8 @@ importers:
       telegraf:
         specifier: ^4.16.3
         version: 4.16.3
+
+  packages/airbills-client: {}
 
   packages/bitrefill-client: {}
 
