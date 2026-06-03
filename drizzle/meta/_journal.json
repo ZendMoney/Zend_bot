@@ -71,6 +71,13 @@
       "when": 1779540000000,
       "tag": "0009_onboarding_and_bills",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1779910000000,
+      "tag": "0010_fix_onboarding",
+      "breakpoints": true
     }
   ]
 }
