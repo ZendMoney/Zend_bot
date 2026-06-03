@@ -64,6 +64,13 @@
       "when": 1779830000000,
       "tag": "0008_ambassador_program",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1779540000000,
+      "tag": "0009_onboarding_and_bills",
+      "breakpoints": true
     }
   ]
 }
