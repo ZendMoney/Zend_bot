@@ -16,7 +16,7 @@ import {
 import bs58 from 'bs58';
 import { message } from 'telegraf/filters';
 import { db, checkConnection } from '@zend/db';
-import { users, transactions, savedBankAccounts, scheduledTransfers, bitrefillOrders, ambassadorApplications, deviceSuspensionRequests, botFeatures } from '@zend/db';
+import { users, transactions, savedBankAccounts, scheduledTransfers, bitrefillOrders, ambassadorApplications, deviceSuspensionRequests, botFeatures, billPayments } from '@zend/db';
 import { eq, sql, and, desc } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
 import { BitRefillClient } from '@zend/bitrefill-client';
@@ -45,6 +45,12 @@ import {
   NETWORKS, DISCOS, CABLE_PROVIDERS, getDataPlans, validateMeter, validateSmartCard,
   isDemoMode, type DataPlan,
 } from './services/bills/index.js';
+import {
+  purchaseAirtime as airbillsBuyAirtime,
+  purchaseData as airbillsBuyData,
+  purchaseElectricity as airbillsBuyElectricity,
+  purchaseCable as airbillsBuyCable,
+} from './services/airbills/index.js';
 
 const BOT_TOKEN = process.env.BOT_TOKEN!;
 const SOLANA_RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
@@ -408,35 +414,7 @@ function generateReferralCode(): string {
   return 'ZND' + Math.random().toString(36).substring(2, 6).toUpperCase();
 }
 
-async function encryptPrivateKey(secretKey: Uint8Array): Promise<string> {
-  const key = await new Promise<Buffer>((resolve, reject) => {
-    crypto.scrypt(process.env.ENCRYPTION_KEY || 'zend-dev-key', 'salt', 32, (err, derived) => {
-      if (err) reject(err); else resolve(derived);
-    });
-  });
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const encrypted = Buffer.concat([cipher.update(Buffer.from(secretKey)), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-  return iv.toString('hex') + ':' + authTag.toString('hex') + ':' + encrypted.toString('hex');
-}
-
-async function decryptPrivateKey(encryptedKey: string): Promise<Uint8Array> {
-  const key = await new Promise<Buffer>((resolve, reject) => {
-    crypto.scrypt(process.env.ENCRYPTION_KEY || 'zend-dev-key', 'salt', 32, (err, derived) => {
-      if (err) reject(err); else resolve(derived);
-    });
-  });
-  const parts = encryptedKey.split(':');
-  if (parts.length !== 3) throw new Error('Invalid encrypted key format');
-  const iv = Buffer.from(parts[0], 'hex');
-  const authTag = Buffer.from(parts[1], 'hex');
-  const encrypted = Buffer.from(parts[2], 'hex');
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-  decipher.setAuthTag(authTag);
-  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-  return new Uint8Array(decrypted);
-}
+import { encryptPrivateKey, decryptPrivateKey } from './utils/wallet.js';
 
 // ─── PIN hashing ───
 async function hashPin(pin: string): Promise<string> {
@@ -7515,16 +7493,33 @@ bot.action('bill_confirm', async (ctx) => {
 
   try {
     let result;
-    if (bill.type === 'airtime' && bill.phone && bill.amount && bill.network) {
-      result = await buyAirtime(userId, { phone: bill.phone, amount: bill.amount, network: bill.network });
-    } else if (bill.type === 'data' && bill.phone && bill.planCode && bill.network && bill.planAmount) {
-      result = await buyData(userId, { phone: bill.phone, planCode: bill.planCode, network: bill.network }, bill.planAmount);
-    } else if (bill.type === 'electricity' && bill.meterNumber && bill.amount && bill.disco) {
-      result = await buyElectricity(userId, { meterNumber: bill.meterNumber, amount: bill.amount, disco: bill.disco, meterType: bill.meterType || 'prepaid' });
-    } else if (bill.type === 'cable' && bill.smartCardNumber && bill.amount && bill.provider) {
-      result = await buyCable(userId, { smartCardNumber: bill.smartCardNumber, bouquetCode: bill.bouquetCode || 'basic', provider: bill.provider }, bill.amount);
+
+    // Use AirBills when configured, otherwise fall back to VTpass
+    if (airbillsClient) {
+      if (bill.type === 'airtime' && bill.phone && bill.amount && bill.network) {
+        result = await airbillsBuyAirtime(airbillsClient, userId, bill.phone, bill.amount, bill.network);
+      } else if (bill.type === 'data' && bill.phone && bill.planAmount && bill.network) {
+        result = await airbillsBuyData(airbillsClient, userId, bill.phone, bill.planAmount, bill.network);
+      } else if (bill.type === 'electricity' && bill.meterNumber && bill.amount && bill.disco) {
+        result = await airbillsBuyElectricity(airbillsClient, userId, bill.meterNumber, bill.amount, bill.disco);
+      } else if (bill.type === 'cable' && bill.smartCardNumber && bill.amount && bill.provider) {
+        result = await airbillsBuyCable(airbillsClient, userId, bill.smartCardNumber, bill.amount, bill.provider);
+      } else {
+        throw new Error('Invalid bill data');
+      }
     } else {
-      throw new Error('Invalid bill data');
+      // Fallback to VTpass
+      if (bill.type === 'airtime' && bill.phone && bill.amount && bill.network) {
+        result = await buyAirtime(userId, { phone: bill.phone, amount: bill.amount, network: bill.network });
+      } else if (bill.type === 'data' && bill.phone && bill.planCode && bill.network && bill.planAmount) {
+        result = await buyData(userId, { phone: bill.phone, planCode: bill.planCode, network: bill.network }, bill.planAmount);
+      } else if (bill.type === 'electricity' && bill.meterNumber && bill.amount && bill.disco) {
+        result = await buyElectricity(userId, { meterNumber: bill.meterNumber, amount: bill.amount, disco: bill.disco, meterType: bill.meterType || 'prepaid' });
+      } else if (bill.type === 'cable' && bill.smartCardNumber && bill.amount && bill.provider) {
+        result = await buyCable(userId, { smartCardNumber: bill.smartCardNumber, bouquetCode: bill.bouquetCode || 'basic', provider: bill.provider }, bill.amount);
+      } else {
+        throw new Error('Invalid bill data');
+      }
     }
 
     if (result.success) {
@@ -8207,6 +8202,67 @@ function startWebhookServer(botInstance: Telegraf<any>) {
       return;
     }
 
+    // AirBills Webhooks
+    if (url === '/webhooks/airbills' && method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', async () => {
+        try {
+          const event = JSON.parse(body);
+          console.log('📩 AirBills Webhook:', event.event, event.orderId);
+
+          const orders = await db.select().from(billPayments)
+            .where(eq(billPayments.externalReference, event.orderId))
+            .limit(1);
+
+          if (!orders.length) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ received: true }));
+            return;
+          }
+
+          const order = orders[0];
+
+          if (event.status === 'completed') {
+            await db.update(billPayments)
+              .set({ status: 'success', token: event.token, completedAt: new Date() })
+              .where(eq(billPayments.id, order.id));
+
+            await botInstance.telegram.sendMessage(
+              order.userId,
+              `🎉 *Bill Payment Complete!*\n\n` +
+              `${order.type?.toUpperCase()} — ₦${Number(order.amountNgn).toLocaleString()}\n` +
+              `Recipient: ${order.recipient}` +
+              (event.token ? `\n\n🔑 *Token:* \`${event.token}\`` : '') +
+              `\n\nReference: \`${order.reference}\``,
+              { parse_mode: 'Markdown' }
+            );
+          } else if (event.status === 'failed') {
+            await db.update(billPayments)
+              .set({ status: 'failed', metadata: event })
+              .where(eq(billPayments.id, order.id));
+
+            await botInstance.telegram.sendMessage(
+              order.userId,
+              `❌ *Bill Payment Failed*\n\n` +
+              `${order.type?.toUpperCase()} — ₦${Number(order.amountNgn).toLocaleString()}\n` +
+              `Recipient: ${order.recipient}\n\n` +
+              `If USDT was deducted, it will be refunded.`,
+              { parse_mode: 'Markdown' }
+            );
+          }
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ received: true }));
+        } catch (err: any) {
+          console.error('[AirBills Webhook] Error:', err);
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: err.message }));
+        }
+      });
+      return;
+    }
+
     // Telegram Bot Webhooks
     if (url === '/webhook/telegram' && method === 'POST') {
       let body = '';
@@ -8302,6 +8358,7 @@ function startWebhookServer(botInstance: Telegraf<any>) {
     console.log(`   PAJ webhook URL: https://${host}/webhooks/paj`);
     console.log(`   ChainRails webhook URL: https://${host}/webhooks/chain-rails`);
     console.log(`   BitRefill webhook URL: https://${host}/webhooks/bitrefill`);
+    console.log(`   AirBills webhook URL: https://${host}/webhooks/airbills`);
     console.log(`   Telegram webhook URL: https://${host}/webhook/telegram`);
     console.log(`   Ambassador API: https://${host}/api/ambassador`);
     console.log(`   Device Suspend API: https://${host}/api/device-suspend`);
