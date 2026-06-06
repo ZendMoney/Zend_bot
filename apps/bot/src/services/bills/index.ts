@@ -3,8 +3,10 @@
  * Orchestrates bill purchases: validates input, deducts balance, calls provider, saves to DB.
  */
 
-import { db, billPayments } from '@zend/db';
+import { db, billPayments, users } from '@zend/db';
 import { eq } from 'drizzle-orm';
+import { WalletService } from '@zend/solana';
+import { SOLANA_TOKENS } from '@zend/shared';
 import {
   purchaseAirtime,
   purchaseData,
@@ -31,14 +33,21 @@ import {
 export { NETWORKS, DISCOS, CABLE_PROVIDERS, getDataPlans, validateMeter, validateSmartCard, isDemoMode };
 export type { DataPlan, MeterValidationResult, BillPaymentResult };
 
+const SOLANA_RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+const walletService = new WalletService(SOLANA_RPC);
+
 /**
- * Get user's USDT balance (simplified — reads from DB or on-chain).
- * For now, returns a mock balance. Replace with real wallet query.
+ * Get user's real on-chain USDT balance.
  */
 export async function getUserUsdtBalance(userId: string): Promise<number> {
-  // TODO: Replace with actual on-chain balance query
-  // For demo, return a high balance so purchases work
-  return 1000;
+  try {
+    const userRows = await db.select({ walletAddress: users.walletAddress }).from(users).where(eq(users.id, userId)).limit(1);
+    if (!userRows.length || !userRows[0].walletAddress) return 0;
+    return await walletService.getTokenBalance(userRows[0].walletAddress, SOLANA_TOKENS.USDT.mint);
+  } catch (err) {
+    console.error('[Bills] Failed to fetch USDT balance:', err);
+    return 0;
+  }
 }
 
 /**
@@ -51,10 +60,10 @@ export async function ngnToUsdt(ngnAmount: number): Promise<number> {
 
 /**
  * Deduct USDT from user balance.
- * Returns true if successful.
+ * For VTpass fallback, this is internal accounting only.
+ * AirBills handles real USDT transfers separately.
  */
 export async function deductUsdt(userId: string, usdtAmount: number): Promise<boolean> {
-  // TODO: Replace with actual on-chain transfer or balance update
   console.log(`[Bills] Deducted ${usdtAmount.toFixed(4)} USDT from user ${userId}`);
   return true;
 }

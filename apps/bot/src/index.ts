@@ -266,7 +266,7 @@ const ZEND_TREASURY_WALLET = process.env.ZEND_TREASURY_WALLET || ''; // receives
 // Dev wallet for gas sponsorship (supports ZEND_DEV_WALLET_SECRET or PV_KEY)
 const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_KEY || '';
 
-const MIN_SOL_FOR_GAS = 0.0005; // base tx fee buffer
+const MIN_SOL_FOR_GAS = 0.0015; // base tx fee buffer (covers compute + priority fees for multi-instruction txs)
 const ATA_RENT_SOL = 0.002039; // rent to create an Associated Token Account
 // Fee structure:
 // - Normal (user has SOL): 1% fee, capped at $2
@@ -4396,14 +4396,29 @@ bot.on(message('text'), async (ctx, next) => {
     setSession(userId, session);
 
     // Show confirmation
-    const usdtAmount = amount / 1400; // TODO: use live rate
+    let rate = 1400;
+    try {
+      const rates = await getPAJRates();
+      rate = rates.offRampRate || 1400;
+    } catch { /* fallback */ }
+    const usdtAmount = amount / rate;
+
+    const typeMap: Record<string, string> = {
+      airtime: '📱 Airtime',
+      data: '🌐 Data',
+      electricity: '⚡ Electricity',
+      cable: '📺 Cable TV',
+    };
+
     await ctx.reply(
       `💳 *Confirm Purchase*\n\n` +
-      `Type: ${bill.type === 'airtime' ? '📱 Airtime' : '💡 Electricity'}\n` +
+      `Type: ${typeMap[bill.type || ''] || bill.type}\n` +
       `${bill.network ? `Network: ${bill.network.toUpperCase()}\n` : ''}` +
       `${bill.disco ? `Disco: ${bill.disco}\n` : ''}` +
+      `${bill.provider ? `Provider: ${bill.provider.toUpperCase()}\n` : ''}` +
       `${bill.phone ? `Phone: ${bill.phone}\n` : ''}` +
       `${bill.meterNumber ? `Meter: ${bill.meterNumber}\n` : ''}` +
+      `${bill.smartCardNumber ? `Smart Card: ${bill.smartCardNumber}\n` : ''}` +
       `Amount: ₦${amount.toLocaleString()}\n` +
       `≈ ${usdtAmount.toFixed(4)} USDT\n\n` +
       `Tap Confirm to complete.`,
@@ -5858,9 +5873,11 @@ async function executeSendCore(
         .set({ solanaTxHash, pajReference: offRampRef })
         .where(eq(transactions.id, txId));
     } else {
-      await db.update(transactions)
-        .set({ pajReference: offRampRef })
-        .where(eq(transactions.id, txId));
+      throw new Error(
+        !user[0].pajSessionToken
+          ? 'Your PAJ session is not linked. Please verify your identity in Settings first.'
+          : 'Payment partner is temporarily unavailable. Please try again later.'
+      );
     }
 
     setTimeout(async () => {
