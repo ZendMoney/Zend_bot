@@ -59,3 +59,4 @@ dump.rdb
 .solana/
 anchor-target/
 target/
+FEE_WALLET_SECRET.txt
