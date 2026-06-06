@@ -826,7 +826,7 @@ const mainMenu = Markup.keyboard([
   ['💰 Balance', '📤 Send', '🔄 Swap'],
   ['📥 Receive', '💳 Bills', '📋 History'],
   ['🛒 Shop', '⚙️ Settings', '🌐 Community'],
-  ['📦 Bulk Send', '📅 Schedule', '💴 Cash Out'],
+  ['📦 Bulk Send', '📅 Schedule'],
 ]).resize();
 
 const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
@@ -3321,7 +3321,7 @@ bot.on(message('text'), async (ctx, next) => {
   const session = getSession(userId);
 
   // ─── Pass menu buttons to bot.hears() handlers ───
-  const menuButtons = ['💰 Balance', '📤 Send', '📥 Receive', '🔄 Swap', '💳 Bills', '📋 History', '⚙️ Settings', '🌐 Community', '🛒 Shop', '📦 Bulk Send', '📅 Schedule', '💴 Cash Out'];
+  const menuButtons = ['💰 Balance', '📤 Send', '📥 Receive', '🔄 Swap', '💳 Bills', '📋 History', '⚙️ Settings', '🌐 Community', '🛒 Shop', '📦 Bulk Send', '📅 Schedule'];
   if (menuButtons.includes(text)) {
     return next();
   }
