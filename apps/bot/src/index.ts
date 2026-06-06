@@ -276,15 +276,16 @@ const ZEND_FEE_FUNDED_BPS = 150;
 const ZEND_FEE_NORMAL_CAP_USDT = 2;
 const ZEND_FEE_FUNDED_CAP_USDT = 3;
 
-/** Calculate exact SOL a user needs for a send (fees + optional ATA rent). */
-function calcRequiredSol(feeSol: number, needsAta: boolean): number {
-  return feeSol + MIN_SOL_FOR_GAS + (needsAta ? ATA_RENT_SOL : 0);
+/** Calculate exact SOL a user needs for a send (gas + optional ATA rent). */
+function calcRequiredSol(needsAtaCount: number): number {
+  return MIN_SOL_FOR_GAS + (needsAtaCount * ATA_RENT_SOL);
 }
 
 /**
  * Calculate the appropriate Zend fee based on user's SOL balance.
  * Normal (has SOL): 1% capped at $2
  * Funded (no SOL): 1.5% capped at $3 (includes gas sponsorship cost)
+ * Fees are collected in USDT, not SOL.
  */
 async function calculateSendFee(
   transferUsdt: number,
@@ -295,18 +296,16 @@ async function calculateSendFee(
   feeBps: number;
   willFundSol: boolean;
 }> {
-  const solPrice = await getSolPriceInUsdt();
+  const solBalance = await walletService.getSolBalance(userWalletAddress);
+  const normalRequired = calcRequiredSol(1); // assume 1 ATA creation for recipient
   
   // Normal fee: 1%, cap $2
   const normalFeeUsdt = Math.min(transferUsdt * (ZEND_FEE_NORMAL_BPS / 10000), ZEND_FEE_NORMAL_CAP_USDT);
-  const normalFeeSol = normalFeeUsdt / solPrice;
-  const normalRequired = normalFeeSol + MIN_SOL_FOR_GAS;
-  const solBalance = await walletService.getSolBalance(userWalletAddress);
   
   if (solBalance >= normalRequired) {
     return {
       zendFeeUsdt: normalFeeUsdt,
-      feeSol: normalFeeSol,
+      feeSol: 0,
       feeBps: ZEND_FEE_NORMAL_BPS,
       willFundSol: false,
     };
@@ -314,11 +313,10 @@ async function calculateSendFee(
   
   // Funded fee: 1.5%, cap $3
   const fundedFeeUsdt = Math.min(transferUsdt * (ZEND_FEE_FUNDED_BPS / 10000), ZEND_FEE_FUNDED_CAP_USDT);
-  const fundedFeeSol = fundedFeeUsdt / solPrice;
   
   return {
     zendFeeUsdt: fundedFeeUsdt,
-    feeSol: fundedFeeSol,
+    feeSol: 0,
     feeBps: ZEND_FEE_FUNDED_BPS,
     willFundSol: true,
   };
@@ -337,25 +335,36 @@ async function getDevWalletBalance(): Promise<number> {
 
 /**
  * Smart gas funding — tops up the user with exactly the shortfall.
- * If recipient needs an ATA, includes ATA rent in the calculation.
+ * Checks recipient and fee wallet ATA needs.
  * Returns { funded: boolean; gasSponsored: boolean; shortfall?: number; error?: string }
  */
 async function fundSolIfNeeded(
   walletAddress: string,
-  feeSol: number,
   recipientAddress?: string,
-  mintAddress?: string
+  mintAddress?: string,
+  feeWalletAddress?: string
 ): Promise<{ funded: boolean; gasSponsored: boolean; shortfall?: number; error?: string }> {
-  let needsAta = false;
+  let needsAtaCount = 0;
   if (recipientAddress && mintAddress) {
     try {
-      needsAta = !(await walletService.ataExists(recipientAddress, mintAddress));
+      if (!(await walletService.ataExists(recipientAddress, mintAddress))) {
+        needsAtaCount++;
+      }
     } catch {
-      needsAta = true; // assume worst case
+      needsAtaCount++; // assume worst case
+    }
+  }
+  if (feeWalletAddress && mintAddress) {
+    try {
+      if (!(await walletService.ataExists(feeWalletAddress, mintAddress))) {
+        needsAtaCount++;
+      }
+    } catch {
+      needsAtaCount++; // assume worst case
     }
   }
 
-  const required = calcRequiredSol(feeSol, needsAta);
+  const required = calcRequiredSol(needsAtaCount);
   const balance = await walletService.getSolBalance(walletAddress);
 
   if (balance >= required) {
@@ -381,7 +390,7 @@ async function fundSolIfNeeded(
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       await walletService.sendSol(devKeypair, walletAddress, shortfall);
-      console.log('[Gas] Funded exact shortfall:', shortfall.toFixed(6), 'SOL (needsAta:', needsAta, ') to', walletAddress);
+      console.log('[Gas] Funded exact shortfall:', shortfall.toFixed(6), 'SOL (needsAta:', needsAtaCount, ') to', walletAddress);
       return { funded: true, gasSponsored: true, shortfall };
     } catch (err: any) {
       console.error(`[Gas] Attempt ${attempt}/3 failed to fund SOL:`, err.message);
@@ -837,8 +846,19 @@ const adminMenu = Markup.keyboard([
 ]).resize();
 
 // Escape Telegram legacy Markdown special chars in user-generated / AI text
-function escapeTelegramMarkdown(text: string): string {
-  return text.replace(/([_*\[\`])/g, '\\$1');
+// Also strips HTML-like tags to prevent XSS/formatting injection
+function escapeTelegramMarkdown(text: string | undefined | null, maxLength = 200): string {
+  if (!text) return '';
+  let s = String(text);
+  // Strip HTML-like tags entirely
+  s = s.replace(/<[^>]*>/g, '');
+  // Escape Telegram Markdown v1 special chars
+  s = s.replace(/([_*\[\`])/g, '\\$1');
+  // Truncate to prevent MESSAGE_TOO_LONG
+  if (s.length > maxLength) {
+    s = s.slice(0, maxLength - 1) + '…';
+  }
+  return s;
 }
 
 // ─── Bot ───
@@ -1493,7 +1513,7 @@ bot.action(/admin_users_page:(\d+)/, async (ctx) => {
 });
 
 // ─── Ambassadors (paginated) ───
-const AMBS_PER_PAGE = 20;
+const AMBS_PER_PAGE = 10;
 
 bot.action('admin_page:ambassadors', async (ctx) => {
   const userId = ctx.from.id.toString();
@@ -1675,14 +1695,17 @@ bot.action(/admin_toggle_feature:(\d+)/, async (ctx) => {
 
 // ─── Ambassador Referrals ───
 
+const REFS_PER_PAGE = 15;
+
 bot.action('admin_page:ambassador_refs', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
   if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
-  const ambassadors = await db.select().from(ambassadorApplications).orderBy(desc(ambassadorApplications.createdAt));
+  const total = await db.select({ count: sql`count(*)` }).from(ambassadorApplications);
+  const ambassadors = await db.select().from(ambassadorApplications).orderBy(desc(ambassadorApplications.createdAt)).limit(REFS_PER_PAGE);
 
-  // Compute stats per ambassador
+  // Compute stats per page
   const stats: Record<number, { signups: number; active: number; volume: number }> = {};
   for (const a of ambassadors) {
     if (a.customReferralCode) {
@@ -1702,11 +1725,66 @@ bot.action('admin_page:ambassador_refs', async (ctx) => {
     return `${i + 1}. ${tierBadge} ${statusIcon} *${escapeTelegramMarkdown(a.name)}*\n   Active: ${s.active} | Vol: ₦${s.volume.toLocaleString()} | Code: ${a.customReferralCode ? `\`${a.customReferralCode}\`` : '—'}`;
   }).join('\n\n');
 
-  const text = `🎯 *Ambassador Programme* — ${ambassadors.length} total\n\n${list || 'No ambassadors yet.'}\n\nTap an ambassador for details:`;
+  const text = `🎯 *Ambassador Programme* (page 1) — ${total[0]?.count || 0} total\n\n${list || 'No ambassadors yet.'}\n\nTap an ambassador for details:`;
 
   const buttons = ambassadors.map(a => [
     Markup.button.callback(`${escapeTelegramMarkdown(a.name)}`, `admin_ambassador_detail:${a.id}`)
   ]);
+
+  const navButtons = [];
+  if (Number(total[0]?.count || 0) > REFS_PER_PAGE) {
+    navButtons.push(Markup.button.callback('➡️ Next', 'admin_ref_page:1'));
+  }
+  if (navButtons.length) buttons.push(navButtons);
+  buttons.push([Markup.button.callback('🏆 Leaderboard', 'admin_ambassador_leaderboard')]);
+  buttons.push([Markup.button.callback('◀️ Back', 'admin_back')]);
+
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_ref_page:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const page = parseInt(ctx.match[1], 10);
+  const offset = page * REFS_PER_PAGE;
+
+  const total = await db.select({ count: sql`count(*)` }).from(ambassadorApplications);
+  const ambassadors = await db.select().from(ambassadorApplications).orderBy(desc(ambassadorApplications.createdAt)).limit(REFS_PER_PAGE).offset(offset);
+
+  // Compute stats per page
+  const stats: Record<number, { signups: number; active: number; volume: number }> = {};
+  for (const a of ambassadors) {
+    if (a.customReferralCode) {
+      const signups = await db.select({ count: sql`count(*)` }).from(users).where(eq(users.ambassadorReferralCode, a.customReferralCode));
+      const active = await getAmbassadorActiveUserCount(a.customReferralCode);
+      const volume = await getAmbassadorTotalVolume(a.customReferralCode);
+      stats[a.id] = { signups: Number(signups[0]?.count || 0), active, volume };
+    } else {
+      stats[a.id] = { signups: 0, active: 0, volume: 0 };
+    }
+  }
+
+  let list = ambassadors.map((a, i) => {
+    const s = stats[a.id];
+    const tierBadge = a.tier === 'elite' ? '🥇' : a.tier === 'pro' ? '🥈' : '🥉';
+    const statusIcon = a.status === 'confirmed' ? '✅' : a.status === 'removed' ? '❌' : '⏳';
+    return `${offset + i + 1}. ${tierBadge} ${statusIcon} *${escapeTelegramMarkdown(a.name)}*\n   Active: ${s.active} | Vol: ₦${s.volume.toLocaleString()} | Code: ${a.customReferralCode ? `\`${a.customReferralCode}\`` : '—'}`;
+  }).join('\n\n');
+
+  const totalCount = Number(total[0]?.count || 0);
+  const text = `🎯 *Ambassador Programme* (page ${page + 1}) — ${totalCount} total\n\n${list || 'No more ambassadors.'}\n\nTap an ambassador for details:`;
+
+  const buttons = ambassadors.map(a => [
+    Markup.button.callback(`${escapeTelegramMarkdown(a.name)}`, `admin_ambassador_detail:${a.id}`)
+  ]);
+
+  const navButtons = [];
+  if (page > 0) navButtons.push(Markup.button.callback('⬅️ Prev', `admin_ref_page:${page - 1}`));
+  if (totalCount > offset + REFS_PER_PAGE) navButtons.push(Markup.button.callback('➡️ Next', `admin_ref_page:${page + 1}`));
+  if (navButtons.length) buttons.push(navButtons);
   buttons.push([Markup.button.callback('🏆 Leaderboard', 'admin_ambassador_leaderboard')]);
   buttons.push([Markup.button.callback('◀️ Back', 'admin_back')]);
 
@@ -3440,15 +3518,13 @@ bot.on(message('text'), async (ctx, next) => {
     if (walletAddress) {
       const tokenBalance = await walletService.getTokenBalance(walletAddress, SOLANA_TOKENS.USDT.mint);
       const solBalance = await walletService.getSolBalance(walletAddress);
-      const solPrice = await getSolPriceInUsdt();
-      const feeSol = totalFeeUsdt / solPrice;
 
-      if (tokenBalance < totalUsdt) {
+      if (tokenBalance < grandTotalUsdt) {
         balanceOk = false;
-        balanceMsg = `❌ Insufficient USDT. Need ${totalUsdt.toFixed(2)} USDT, have ${tokenBalance.toFixed(2)} USDT.`;
-      } else if (solBalance < feeSol + MIN_SOL_FOR_GAS) {
+        balanceMsg = `❌ Insufficient USDT. Need ${grandTotalUsdt.toFixed(2)} USDT, have ${tokenBalance.toFixed(2)} USDT.`;
+      } else if (solBalance < MIN_SOL_FOR_GAS) {
         balanceOk = false;
-        balanceMsg = `❌ Insufficient SOL for fees. Need ~${(feeSol + MIN_SOL_FOR_GAS).toFixed(4)} SOL.`;
+        balanceMsg = `❌ Insufficient SOL for gas. Need ~${MIN_SOL_FOR_GAS} SOL.`;
       }
     }
 
@@ -4070,7 +4146,7 @@ bot.on(message('text'), async (ctx, next) => {
 
     let msg = `📤 Send ${formatNgn(amount)}\n` +
       `Rate: ${formatNgn(rate)} per Dollar\n` +
-      `Zend fee (${(feeInfo.feeBps / 100).toFixed(2)}%${feeInfo.willFundSol ? ' includes gas' : ''}): ${feeInfo.feeSol.toFixed(6)} SOL (~${feeInfo.zendFeeUsdt.toFixed(2)} USDT)\n` +
+      `Zend fee (${(feeInfo.feeBps / 100).toFixed(2)}%${feeInfo.willFundSol ? ' includes gas' : ''}): ~${feeInfo.zendFeeUsdt.toFixed(2)} USDT\n` +
       `You pay: *${usdtNeeded.toFixed(2)} USDT*\n\n` +
       `Who should receive it?\n\n` +
       `Just tell me naturally — e.g. "Mark OPay 7082406410" or "send to Amaka at GTB 0123456789"`;
@@ -4224,8 +4300,8 @@ bot.on(message('text'), async (ctx, next) => {
       confirmMsg += `⚠️ *Could not verify account* — please double-check details\n`;
     }
 
-    const feeLine = session.pendingTransaction?.feeSol
-      ? `Zend fee: ${session.pendingTransaction.feeSol.toFixed(6)} SOL (~${session.pendingTransaction.zendFeeUsdt?.toFixed(2)} USDT)\n`
+    const feeLine = session.pendingTransaction?.zendFeeUsdt
+      ? `Zend fee: ~${session.pendingTransaction.zendFeeUsdt.toFixed(2)} USDT\n`
       : '';
 
     const menuFromMint = session.pendingTransaction?.fromMint || SOLANA_TOKENS.USDT.mint;
@@ -4508,10 +4584,9 @@ bot.on(message('text'), async (ctx, next) => {
             );
             return;
           }
-          if (!feeInfo.willFundSol && solBalance < feeInfo.feeSol + MIN_SOL_FOR_GAS) {
+          if (!feeInfo.willFundSol && solBalance < MIN_SOL_FOR_GAS) {
             await ctx.reply(
-              `❌ *Insufficient SOL for fee*\n\n` +
-              `Fee: ${feeInfo.feeSol.toFixed(6)} SOL\n` +
+              `❌ *Insufficient SOL for gas*\n\n` +
               `Gas: ~${MIN_SOL_FOR_GAS} SOL\n` +
               `You have: ${solBalance.toFixed(6)} SOL\n\n` +
               `Top up your SOL balance first.`,
@@ -4569,7 +4644,7 @@ bot.on(message('text'), async (ctx, next) => {
           `Bank: ${md(parsed.bankName) || 'Solana'}\n` +
           `Account: \`${parsed.accountNumber || parsed.walletAddress}\`\n` +
           `Amount: ${formatNgn(parsed.amount)}\n` +
-          `Zend fee (${(feeInfo.feeBps / 100).toFixed(2)}%${feeInfo.willFundSol ? ' includes gas' : ''}): ${feeInfo.feeSol.toFixed(6)} SOL (~${feeInfo.zendFeeUsdt.toFixed(2)} USDT)\n` +
+          `Zend fee (${(feeInfo.feeBps / 100).toFixed(2)}%${feeInfo.willFundSol ? ' includes gas' : ''}): ~${feeInfo.zendFeeUsdt.toFixed(2)} USDT\n` +
           `You pay: *${usdtNeeded.toFixed(2)} ${fromSymbol}*\n` +
           `Rate: ${formatNgn(rate)} per Dollar\n\n` +
           `Confirm?`;
@@ -5718,12 +5793,15 @@ async function executeSendCore(
         }
       }
 
+      const feeWallet = process.env.ZEND_FEE_WALLET;
+      const feeUsdt = txData.zendFeeUsdt || 0;
+
       // Gas sponsorship: top up exact shortfall (including ATA rent if needed)
       const { funded, gasSponsored, shortfall, error: fundError } = await fundSolIfNeeded(
         user[0].walletAddress,
-        txData.feeSol || 0,
         order.address,
-        pajMint
+        pajMint,
+        feeWallet || undefined
       );
       if (shortfall && !funded) {
         throw new Error(
@@ -5733,27 +5811,37 @@ async function executeSendCore(
         );
       }
 
-      // Calculate total fee in SOL
-      const feeWallet = process.env.ZEND_FEE_WALLET;
-      const totalFeeSol = txData.feeSol || 0;
-
-      // Check token balance covers transfer
-      if (tokenBalance < order.amount) {
-        throw new Error(`Insufficient ${userFromSymbol} balance. You have: ${tokenBalance.toFixed(2)}, need: ${order.amount.toFixed(2)} for the transfer.`);
+      // Check token balance covers transfer + fee
+      const totalUsdtNeeded = order.amount + feeUsdt;
+      if (tokenBalance < totalUsdtNeeded) {
+        throw new Error(`Insufficient ${userFromSymbol} balance. You have: ${tokenBalance.toFixed(2)}, need: ${totalUsdtNeeded.toFixed(2)} for the transfer and fee.`);
       }
 
-      // Build SOL fee transfer instruction to bundle with main send
+      // Build USDT fee transfer instruction to bundle with main send
       const feeInstructions: any[] = [];
-      if (feeWallet && totalFeeSol > 0) {
+      if (feeWallet && feeUsdt > 0) {
         const feeWalletPubkey = new PublicKey(feeWallet);
-        const rawFeeLamports = BigInt(Math.round(totalFeeSol * LAMPORTS_PER_SOL));
+        const pajMintPubkey = new PublicKey(pajMint);
+        const senderPubkey = new PublicKey(user[0].walletAddress);
+
+        const senderTokenAccount = await getAssociatedTokenAddress(pajMintPubkey, senderPubkey);
+        const feeWalletTokenAccount = await getAssociatedTokenAddress(pajMintPubkey, feeWalletPubkey);
+
+        const rawFeeAmount = BigInt(Math.round(feeUsdt * Math.pow(10, pajToken.decimals)));
 
         feeInstructions.push(
-          SystemProgram.transfer({
-            fromPubkey: new PublicKey(user[0].walletAddress),
-            toPubkey: feeWalletPubkey,
-            lamports: rawFeeLamports,
-          })
+          createAssociatedTokenAccountIdempotentInstruction(
+            senderPubkey,
+            feeWalletTokenAccount,
+            feeWalletPubkey,
+            pajMintPubkey
+          ),
+          createTransferInstruction(
+            senderTokenAccount,
+            feeWalletTokenAccount,
+            senderPubkey,
+            rawFeeAmount
+          )
         );
       }
 
@@ -5762,9 +5850,9 @@ async function executeSendCore(
       solanaTxHash = await walletService.sendSplToken(
         keypair, order.address, pajMint, order.amount, pajToken.decimals,
         feeInstructions.length > 0 ? feeInstructions : undefined,
-        order.amount
+        totalUsdtNeeded
       );
-      console.log(`[Solana] ${userFromSymbol} sent to PAJ via USDT (+ fee bundled):`, solanaTxHash);
+      console.log(`[Solana] ${userFromSymbol} sent to PAJ via USDT (+ USDT fee bundled):`, solanaTxHash);
 
       await db.update(transactions)
         .set({ solanaTxHash, pajReference: offRampRef })
@@ -5826,7 +5914,7 @@ async function executeSend(
   const processingText =
     `⏳ *Processing...*\n\n` +
     `Sending ${txData.amountUsdt.toFixed(2)} ${fromToken.symbol}\n` +
-    `Fee: ${(txData.feeSol || 0).toFixed(6)} SOL\n` +
+    `Fee: ~${(txData.zendFeeUsdt || 0).toFixed(2)} USDT\n` +
     `Estimated: 1-5 minutes`;
 
   if (ctx.callbackQuery) {
@@ -5911,7 +5999,7 @@ async function executeSwap(
     }
 
     // Gas sponsorship for swaps
-    const { funded, gasSponsored, shortfall, error: fundError } = await fundSolIfNeeded(user[0].walletAddress, 0);
+    const { funded, gasSponsored, shortfall, error: fundError } = await fundSolIfNeeded(user[0].walletAddress);
     if (shortfall && !funded) {
       throw new Error(
         `Your wallet needs ~${shortfall.toFixed(6)} more SOL for swap fees. ` +
@@ -6158,11 +6246,10 @@ async function prepareSendConfirmation(
       );
       return;
     }
-    if (!willFundSol && solBalance < feeSol + MIN_SOL_FOR_GAS) {
+    if (!willFundSol && solBalance < MIN_SOL_FOR_GAS) {
       // This shouldn't happen if calculateSendFee is correct, but guard anyway
       await ctx.reply(
-        `❌ *Insufficient SOL for fee*\n\n` +
-        `Fee: ${feeSol.toFixed(6)} SOL\n` +
+        `❌ *Insufficient SOL for gas*\n\n` +
         `Gas: ~${MIN_SOL_FOR_GAS} SOL\n` +
         `You have: ${solBalance.toFixed(6)} SOL\n\n` +
         `Top up your SOL balance first.`,
@@ -6220,7 +6307,7 @@ async function prepareSendConfirmation(
     `Bank: ${md(bankName)}\n` +
     `Account: \`${recipientAccountNumber}\`\n` +
     `Amount: ${formatNgn(amountNgn)}\n` +
-    `Zend fee (${(feeBps / 100).toFixed(2)}%${willFundSol ? ' includes gas' : ''}): ${feeSol.toFixed(6)} SOL (~${zendFeeUsdt.toFixed(2)} USDT)\n` +
+    `Zend fee (${(feeBps / 100).toFixed(2)}%${willFundSol ? ' includes gas' : ''}): ~${zendFeeUsdt.toFixed(2)} USDT\n` +
     `You pay: *${usdtNeeded.toFixed(2)} ${selectedSymbol}*\n` +
     `Rate: ${formatNgn(rate)} per Dollar\n\n` +
     `Confirm?`;
@@ -7591,7 +7678,7 @@ bot.hears('👤 Users', async (ctx) => {
       return;
     }
     const lines = allUsers.map((u, i) =>
-      `${i + 1}. ${u.firstName}${u.telegramUsername ? ' (@' + u.telegramUsername + ')' : ''} — ${u.walletAddress.slice(0, 6)}...${u.walletAddress.slice(-4)} | ${u.createdAt.toISOString().split('T')[0]}`
+      `${i + 1}. ${escapeTelegramMarkdown(u.firstName)}${u.telegramUsername ? ' (@' + escapeTelegramMarkdown(u.telegramUsername.replace(/^@/, '')) + ')' : ''} — ${u.walletAddress.slice(0, 6)}...${u.walletAddress.slice(-4)} | ${u.createdAt.toISOString().split('T')[0]}`
     );
     await ctx.reply(
       `👤 *Last 20 Users*\n\n${lines.join('\n')}`,
