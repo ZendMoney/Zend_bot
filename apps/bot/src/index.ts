@@ -825,7 +825,7 @@ async function verifyBankAccount(
 const mainMenu = Markup.keyboard([
   ['💰 Balance', '📤 Send', '🔄 Swap'],
   ['📥 Receive', '💳 Bills', '📋 History'],
-  ['💳 Bills', '⚙️ Settings', '🌐 Community'],
+  ['🛒 Shop', '⚙️ Settings', '🌐 Community'],
 ]).resize();
 
 const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
