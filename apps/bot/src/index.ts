@@ -826,6 +826,7 @@ const mainMenu = Markup.keyboard([
   ['💰 Balance', '📤 Send', '🔄 Swap'],
   ['📥 Receive', '💳 Bills', '📋 History'],
   ['🛒 Shop', '⚙️ Settings', '🌐 Community'],
+  ['📦 Bulk Send', '📅 Schedule', '💴 Cash Out'],
 ]).resize();
 
 const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
@@ -3320,7 +3321,7 @@ bot.on(message('text'), async (ctx, next) => {
   const session = getSession(userId);
 
   // ─── Pass menu buttons to bot.hears() handlers ───
-  const menuButtons = ['💰 Balance', '📤 Send', '📥 Receive', '🔄 Swap', '💳 Bills', '📋 History', '⚙️ Settings', '🌐 Community'];
+  const menuButtons = ['💰 Balance', '📤 Send', '📥 Receive', '🔄 Swap', '💳 Bills', '📋 History', '⚙️ Settings', '🌐 Community', '🛒 Shop', '📦 Bulk Send', '📅 Schedule', '💴 Cash Out'];
   if (menuButtons.includes(text)) {
     return next();
   }
@@ -6366,6 +6367,10 @@ bot.action(/nlp_bank:(.+)/, async (ctx) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // 💴 CASH OUT (alias for Send)
 // ═════════════════════════════════════════════════════════════════════════════
+
+bot.hears('🛒 Shop', async (ctx) => {
+  await showShop(ctx);
+});
 
 bot.hears('💴 Cash Out', async (ctx) => {
   if (isGroupChat(ctx)) {
