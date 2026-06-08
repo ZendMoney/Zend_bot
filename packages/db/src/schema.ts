@@ -254,3 +254,15 @@ export const botFeatures = pgTable('bot_features', {
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
+
+// ─── User Feedback ───
+
+export const feedback = pgTable('feedback', {
+  id: serial('id').primaryKey(),
+  userId: varchar('user_id', { length: 50 }).notNull().references((): any => users.id),
+  message: text('message').notNull(),
+  category: varchar('category', { length: 30 }).notNull().default('general'), // general | bug | feature | support
+  status: varchar('status', { length: 20 }).notNull().default('open'), // open | in_progress | resolved | closed
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+});

@@ -78,6 +78,13 @@
       "when": 1779910000000,
       "tag": "0010_fix_onboarding",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1780945678970,
+      "tag": "0011_feedback",
+      "breakpoints": true
     }
   ]
 }

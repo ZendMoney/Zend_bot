@@ -16,7 +16,7 @@ import {
 import bs58 from 'bs58';
 import { message } from 'telegraf/filters';
 import { db, checkConnection } from '@zend/db';
-import { users, transactions, savedBankAccounts, scheduledTransfers, bitrefillOrders, ambassadorApplications, deviceSuspensionRequests, botFeatures, billPayments } from '@zend/db';
+import { users, transactions, savedBankAccounts, scheduledTransfers, bitrefillOrders, ambassadorApplications, deviceSuspensionRequests, botFeatures, billPayments, feedback } from '@zend/db';
 import { eq, sql, and, desc } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
 import { BitRefillClient } from '@zend/bitrefill-client';
@@ -196,8 +196,8 @@ interface TrackedMessage {
   deleteAt: number;
 }
 const messageQueue: TrackedMessage[] = [];
-const MESSAGE_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const PIN_TTL_MS = 5 * 1000; // PIN messages: delete after 5 seconds
+const MESSAGE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const PIN_TTL_MS = 15 * 1000; // PIN messages: delete after 15 seconds
 const MAX_QUEUE_SIZE = 5000;
 
 function trackMessage(chatId: number | string, messageId: number, isPin = false) {
@@ -266,8 +266,11 @@ const ZEND_TREASURY_WALLET = process.env.ZEND_TREASURY_WALLET || ''; // receives
 // Dev wallet for gas sponsorship (supports ZEND_DEV_WALLET_SECRET or PV_KEY)
 const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_KEY || '';
 
-const MIN_SOL_FOR_GAS = 0.0015; // base tx fee buffer (covers compute + priority fees for multi-instruction txs)
+const MIN_SOL_FOR_GAS = 0.003; // base tx fee buffer (~$0.50–0.70) for compute + priority fees + ATA rent margin
 const ATA_RENT_SOL = 0.002039; // rent to create an Associated Token Account
+const NEW_USER_SOL_BUFFER_MULTIPLIER = 2; // 2x buffer for users with no prior successful transactions
+const DEV_WALLET_LOW_BALANCE_THRESHOLD = 0.05; // alert if below ~$8–10 worth of SOL
+const DEV_WALLET_CRITICAL_THRESHOLD = 0.01; // critical alert if below this
 // Fee structure:
 // - Normal (user has SOL): 1% fee, capped at $2
 // - Funded (user has no SOL, we cover gas): 1.5% fee, capped at $3
@@ -277,8 +280,21 @@ const ZEND_FEE_NORMAL_CAP_USDT = 2;
 const ZEND_FEE_FUNDED_CAP_USDT = 3;
 
 /** Calculate exact SOL a user needs for a send (gas + optional ATA rent). */
-function calcRequiredSol(needsAtaCount: number): number {
-  return MIN_SOL_FOR_GAS + (needsAtaCount * ATA_RENT_SOL);
+function calcRequiredSol(needsAtaCount: number, isNewUser = false): number {
+  const base = MIN_SOL_FOR_GAS + (needsAtaCount * ATA_RENT_SOL);
+  return isNewUser ? base * NEW_USER_SOL_BUFFER_MULTIPLIER : base;
+}
+
+/** Check whether a user has never completed a transaction (new user). */
+async function isNewUser(userId: string): Promise<boolean> {
+  try {
+    const txnCount = await db.select({ count: sql`count(*)` }).from(transactions)
+      .where(and(eq(transactions.userId, userId), eq(transactions.status, 'completed')));
+    return Number(txnCount[0]?.count) === 0;
+  } catch (err) {
+    console.error('[Gas] isNewUser check failed:', err);
+    return false; // assume experienced user to avoid over-funding
+  }
 }
 
 /**
@@ -289,7 +305,8 @@ function calcRequiredSol(needsAtaCount: number): number {
  */
 async function calculateSendFee(
   transferUsdt: number,
-  userWalletAddress: string
+  userWalletAddress: string,
+  userId?: string
 ): Promise<{
   zendFeeUsdt: number;
   feeSol: number;
@@ -297,7 +314,8 @@ async function calculateSendFee(
   willFundSol: boolean;
 }> {
   const solBalance = await walletService.getSolBalance(userWalletAddress);
-  const normalRequired = calcRequiredSol(1); // assume 1 ATA creation for recipient
+  const newUser = userId ? await isNewUser(userId) : false;
+  const normalRequired = calcRequiredSol(1, newUser); // assume 1 ATA creation for recipient
   
   // Normal fee: 1%, cap $2
   const normalFeeUsdt = Math.min(transferUsdt * (ZEND_FEE_NORMAL_BPS / 10000), ZEND_FEE_NORMAL_CAP_USDT);
@@ -334,6 +352,51 @@ async function getDevWalletBalance(): Promise<number> {
 }
 
 /**
+ * Dev-wallet health check. Logs alerts when balance is low.
+ * Call this before any gas sponsorship attempt.
+ */
+async function checkDevWalletHealth(): Promise<{ healthy: boolean; balance: number; level: 'ok' | 'low' | 'critical' }> {
+  const balance = await getDevWalletBalance();
+  let level: 'ok' | 'low' | 'critical' = 'ok';
+  if (balance < DEV_WALLET_CRITICAL_THRESHOLD) {
+    level = 'critical';
+    console.error(`[Gas][ALERT] Dev wallet CRITICAL: ${balance.toFixed(6)} SOL. Gas sponsorship will fail soon. Top up immediately.`);
+  } else if (balance < DEV_WALLET_LOW_BALANCE_THRESHOLD) {
+    level = 'low';
+    console.warn(`[Gas][ALERT] Dev wallet LOW: ${balance.toFixed(6)} SOL. Consider topping up before user volume spikes.`);
+  } else {
+    console.log(`[Gas] Dev wallet health OK: ${balance.toFixed(6)} SOL`);
+  }
+  return { healthy: level === 'ok', balance, level };
+}
+
+/**
+ * Translate a low-level gas-funding error into a human-readable user message.
+ */
+function gasFundingErrorToUserMessage(error: string | undefined, shortfall?: number): string {
+  if (!error) {
+    return 'We could not cover the network fee for this transaction. Please try again in a moment.';
+  }
+  const e = error.toLowerCase();
+  if (e.includes('dev wallet not configured') || e.includes('no dev wallet')) {
+    return 'Gas sponsorship is temporarily unavailable. Please contact support.';
+  }
+  if (e.includes('low on sol') || e.includes('dev wallet low')) {
+    return 'Our gas station is running low on SOL right now. Please try again in a few minutes or add a small amount of SOL to your wallet.';
+  }
+  if (e.includes('blockhash') || e.includes('timeout') || e.includes('expired')) {
+    return 'The Solana network was too slow to confirm the gas top-up. Please try again.';
+  }
+  if (e.includes('insufficient funds')) {
+    return 'We could not reserve enough SOL to process this transaction. Please try a smaller amount or contact support.';
+  }
+  if (shortfall && shortfall > 0) {
+    return `We tried to top up your wallet with ${shortfall.toFixed(6)} SOL for network fees, but it didn't go through. Please try again or add a small amount of SOL manually.`;
+  }
+  return 'We could not cover the network fee for this transaction. Please try again or contact support if this keeps happening.';
+}
+
+/**
  * Smart gas funding — tops up the user with exactly the shortfall.
  * Checks recipient and fee wallet ATA needs.
  * Returns { funded: boolean; gasSponsored: boolean; shortfall?: number; error?: string }
@@ -342,36 +405,53 @@ async function fundSolIfNeeded(
   walletAddress: string,
   recipientAddress?: string,
   mintAddress?: string,
-  feeWalletAddress?: string
+  feeWalletAddress?: string,
+  userId?: string
 ): Promise<{ funded: boolean; gasSponsored: boolean; shortfall?: number; error?: string }> {
+  console.log(`[Gas] fundSolIfNeeded called for wallet=${walletAddress}, recipient=${recipientAddress || 'none'}, mint=${mintAddress || 'none'}, feeWallet=${feeWalletAddress || 'none'}, userId=${userId || 'unknown'}`);
+
   let needsAtaCount = 0;
   if (recipientAddress && mintAddress) {
     try {
-      if (!(await walletService.ataExists(recipientAddress, mintAddress))) {
-        needsAtaCount++;
-      }
-    } catch {
+      const exists = await walletService.ataExists(recipientAddress, mintAddress);
+      console.log(`[Gas] Recipient ATA exists=${exists} for ${recipientAddress}`);
+      if (!exists) needsAtaCount++;
+    } catch (err: any) {
+      console.warn(`[Gas] ATA check failed for recipient ${recipientAddress}:`, err.message);
       needsAtaCount++; // assume worst case
     }
   }
   if (feeWalletAddress && mintAddress) {
     try {
-      if (!(await walletService.ataExists(feeWalletAddress, mintAddress))) {
-        needsAtaCount++;
-      }
-    } catch {
+      const exists = await walletService.ataExists(feeWalletAddress, mintAddress);
+      console.log(`[Gas] Fee wallet ATA exists=${exists} for ${feeWalletAddress}`);
+      if (!exists) needsAtaCount++;
+    } catch (err: any) {
+      console.warn(`[Gas] ATA check failed for fee wallet ${feeWalletAddress}:`, err.message);
       needsAtaCount++; // assume worst case
     }
   }
 
-  const required = calcRequiredSol(needsAtaCount);
+  const newUser = userId ? await isNewUser(userId) : false;
+  const required = calcRequiredSol(needsAtaCount, newUser);
+  console.log(`[Gas] Required SOL=${required.toFixed(6)} (newUser=${newUser}, needsAta=${needsAtaCount})`);
+
   const balance = await walletService.getSolBalance(walletAddress);
+  console.log(`[Gas] User SOL balance=${balance.toFixed(6)} for ${walletAddress}`);
 
   if (balance >= required) {
+    console.log(`[Gas] No funding needed. Balance ${balance.toFixed(6)} >= required ${required.toFixed(6)}`);
     return { funded: false, gasSponsored: false };
   }
 
   const shortfall = required - balance;
+  console.log(`[Gas] Shortfall=${shortfall.toFixed(6)} SOL`);
+
+  // Health check before attempting sponsorship
+  const health = await checkDevWalletHealth();
+  if (!health.healthy) {
+    console.warn(`[Gas] Proceeding with sponsorship despite dev wallet level=${health.level}`);
+  }
 
   if (!DEV_WALLET_SECRET) {
     console.warn('[Gas] No dev wallet secret set — cannot fund SOL');
@@ -381,6 +461,7 @@ async function fundSolIfNeeded(
   const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
   const devBalance = await walletService.getSolBalance(devKeypair.publicKey.toBase58());
   const devNeeds = shortfall + MIN_SOL_FOR_GAS; // dev needs shortfall + its own tx fee
+  console.log(`[Gas] Dev wallet balance=${devBalance.toFixed(6)} SOL, needs=${devNeeds.toFixed(6)} SOL`);
   if (devBalance < devNeeds) {
     console.error(`[Gas] Dev wallet has ${devBalance.toFixed(6)} SOL but needs ${devNeeds.toFixed(6)} SOL to fund user ${walletAddress}`);
     return { funded: false, gasSponsored: false, shortfall, error: `Dev wallet low on SOL (${devBalance.toFixed(6)}). Please top up the dev wallet.` };
@@ -388,20 +469,25 @@ async function fundSolIfNeeded(
 
   // Retry up to 3 times with jitter
   for (let attempt = 1; attempt <= 3; attempt++) {
+    console.log(`[Gas] Funding attempt ${attempt}/3: sending ${shortfall.toFixed(6)} SOL to ${walletAddress}`);
     try {
       await walletService.sendSol(devKeypair, walletAddress, shortfall);
-      console.log('[Gas] Funded exact shortfall:', shortfall.toFixed(6), 'SOL (needsAta:', needsAtaCount, ') to', walletAddress);
+      console.log(`[Gas] SUCCESS: Funded ${shortfall.toFixed(6)} SOL (needsAta=${needsAtaCount}, newUser=${newUser}) to ${walletAddress}`);
       return { funded: true, gasSponsored: true, shortfall };
     } catch (err: any) {
       console.error(`[Gas] Attempt ${attempt}/3 failed to fund SOL:`, err.message);
       if (attempt === 3) {
+        console.error(`[Gas] FATAL: All 3 funding attempts exhausted for ${walletAddress}. Error:`, err.message);
         return { funded: false, gasSponsored: false, shortfall, error: err.message };
       }
       // Jittered backoff: 500ms, 1000ms, 1500ms
-      await new Promise(r => setTimeout(r, attempt * 500 + Math.random() * 200));
+      const delay = attempt * 500 + Math.random() * 200;
+      console.log(`[Gas] Retrying in ${delay.toFixed(0)}ms...`);
+      await new Promise(r => setTimeout(r, delay));
     }
   }
 
+  console.error(`[Gas] FATAL: Funding failed after 3 retries for ${walletAddress}`);
   return { funded: false, gasSponsored: false, shortfall, error: 'Funding failed after 3 retries' };
 }
 
@@ -661,9 +747,13 @@ async function seedBotFeatures() {
       { key: 'history', name: 'Transaction History', description: 'View all past transactions', category: 'info', sortOrder: 7 },
       { key: 'voice', name: 'Voice Commands', description: 'Send a voice note to execute commands', category: 'info', sortOrder: 8 },
       { key: 'scheduled', name: 'Scheduled Transfers', description: 'Schedule automatic recurring or one-time future payments', category: 'payment', sortOrder: 9 },
-      { key: 'shop', name: 'Shop (Airtime & Gift Cards)', description: 'Buy airtime, data bundles and retail vouchers via BitRefill', category: 'payment', sortOrder: 10 },
-      { key: 'settings', name: 'Settings', description: 'PIN, language, auto-save, PAJ linking, wallet export', category: 'settings', sortOrder: 11 },
-      { key: 'community', name: 'Community', description: 'Join the Zend Telegram community', category: 'info', sortOrder: 12 },
+      { key: 'bulk_send', name: 'Bulk Send', description: 'Pay many people at once with a single transaction', category: 'payment', sortOrder: 10 },
+      { key: 'bills', name: 'Bills & Utilities', description: 'Buy airtime, data, electricity and cable TV subscriptions', category: 'payment', sortOrder: 11 },
+      { key: 'settings', name: 'Settings', description: 'PIN, language, auto-save, PAJ linking, wallet export', category: 'settings', sortOrder: 12 },
+      { key: 'help', name: 'Help', description: 'Get support and join the Zend community', category: 'info', sortOrder: 13 },
+      { key: 'how_to_use', name: 'How to Use', description: 'Step-by-step guide to using Zend', category: 'info', sortOrder: 14 },
+      { key: 'features', name: 'Features', description: 'Explore everything Zend can do', category: 'info', sortOrder: 15 },
+      { key: 'feedback', name: 'Feedback', description: 'Share ideas, report bugs, or ask for help', category: 'info', sortOrder: 16 },
     ];
 
     for (const f of features) {
@@ -825,8 +915,9 @@ async function verifyBankAccount(
 const mainMenu = Markup.keyboard([
   ['💰 Balance', '📤 Send', '🔄 Swap'],
   ['📥 Receive', '💳 Bills', '📋 History'],
-  ['🛒 Shop', '⚙️ Settings', '🌐 Community'],
   ['📦 Bulk Send', '📅 Schedule'],
+  ['📖 How to Use', '✨ Features', '📝 Feedback'],
+  ['❓ Help'],
 ]).resize();
 
 const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
@@ -929,21 +1020,21 @@ bot.on(message('text'), async (ctx, next) => {
 
   await next(); // let the main handler process the message
 
-  // Immediately delete user messages for sensitive flows (more reliable than queue)
-  if (isSensitive) {
+  // Immediately delete ONLY PIN messages (security critical).
+  // Other sensitive messages are tracked and deleted by the cleanup queue after MESSAGE_TTL_MS.
+  if (isPin) {
     try {
       await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id);
-      console.log(`[AutoDelete] Deleted user message ${ctx.message.message_id} in state ${session.state}`);
+      console.log(`[AutoDelete] Deleted PIN user message ${ctx.message.message_id}`);
     } catch (err: any) {
-      console.log(`[AutoDelete] Failed to delete user message ${ctx.message.message_id}:`, err.message);
+      console.log(`[AutoDelete] Failed to delete PIN user message ${ctx.message.message_id}:`, err.message);
     }
-    // For PIN flows, also delete the bot's previous prompt message
-    if (isPin && session.lastBotMessageId) {
+    if (session.lastBotMessageId) {
       try {
         await ctx.telegram.deleteMessage(ctx.chat.id, session.lastBotMessageId);
-        console.log(`[AutoDelete] Deleted bot prompt ${session.lastBotMessageId}`);
+        console.log(`[AutoDelete] Deleted PIN bot prompt ${session.lastBotMessageId}`);
       } catch (err: any) {
-        console.log(`[AutoDelete] Failed to delete bot prompt ${session.lastBotMessageId}:`, err.message);
+        console.log(`[AutoDelete] Failed to delete PIN bot prompt ${session.lastBotMessageId}:`, err.message);
       }
     }
   }
@@ -1192,7 +1283,7 @@ async function executeBulkSend(
 
     // Calculate per-recipient fee based on current SOL balance
     const feeInfo = walletAddress
-      ? await calculateSendFee(transferUsdt, walletAddress)
+      ? await calculateSendFee(transferUsdt, walletAddress, userId)
       : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
     const amountUsdt = transferUsdt + feeInfo.zendFeeUsdt;
 
@@ -1264,7 +1355,7 @@ bot.action('bulk_send_confirm', async (ctx) => {
 
   if (!recipients || recipients.length === 0) {
     await ctx.answerCbQuery('Session expired');
-    await ctx.editMessageText('❌ Session expired. Please start over.', mainMenu);
+    await ctx.editMessageText('❌ Session expired. Please start over.');
     return;
   }
 
@@ -1277,7 +1368,7 @@ bot.action('bulk_send_cancel', async (ctx) => {
   const userId = ctx.from.id.toString();
   setSession(userId, { state: ConversationState.IDLE });
   await ctx.answerCbQuery('Cancelled');
-  await ctx.editMessageText('❌ Bulk send cancelled.', mainMenu);
+  await ctx.editMessageText('❌ Bulk send cancelled.');
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1393,7 +1484,7 @@ const adminMainKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback('👤 Users', 'admin_page:users'), Markup.button.callback('🧑‍🎓 Ambassadors', 'admin_page:ambassadors')],
   [Markup.button.callback('🚨 Suspensions', 'admin_page:suspensions'), Markup.button.callback('💰 Fees & Revenue', 'admin_page:fees')],
   [Markup.button.callback('🎯 Ref Links', 'admin_page:ambassador_refs'), Markup.button.callback('🔍 Search', 'admin_page:search')],
-  [Markup.button.callback('⚙️ Features', 'admin_page:features')],
+  [Markup.button.callback('⚙️ Features', 'admin_page:features'), Markup.button.callback('📝 Feedback', 'admin_page:feedback')],
 ]);
 
 bot.command('admin', async (ctx) => {
@@ -1692,6 +1783,94 @@ bot.action(/admin_toggle_feature:(\d+)/, async (ctx) => {
   const text = `⚙️ *Features* — ${activeCount} / ${features.length} active\n\nTap to toggle:`;
 
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+});
+
+// ─── Feedback (admin view) ───
+
+const FEEDBACK_PER_PAGE = 10;
+
+bot.action('admin_page:feedback', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const total = await db.select({ count: sql`count(*)` }).from(feedback);
+  const openCount = await db.select({ count: sql`count(*)` }).from(feedback).where(eq(feedback.status, 'open'));
+  const rows = await db.select().from(feedback).orderBy(desc(feedback.createdAt)).limit(FEEDBACK_PER_PAGE);
+
+  let list = rows.map((f, i) => {
+    const statusIcon = f.status === 'open' ? '🟡' : f.status === 'resolved' ? '✅' : f.status === 'in_progress' ? '🔵' : '⚪';
+    const preview = escapeTelegramMarkdown(f.message.slice(0, 80));
+    return `${i + 1}. ${statusIcon} #${f.id} | U\_${f.userId} | ${preview}${f.message.length > 80 ? '…' : ''}`;
+  }).join('\n\n');
+
+  const text =
+    `📝 *User Feedback* (page 1)\n\n` +
+    `Total: ${total[0]?.count || 0} | Open: ${openCount[0]?.count || 0}\n\n` +
+    `${list || 'No feedback yet.'}\n\n` +
+    `Tap a number to view / resolve.`;
+
+  const buttons = rows.map(f => [
+    Markup.button.callback(`#${f.id}`, `admin_feedback_detail:${f.id}`)
+  ]);
+  buttons.push([Markup.button.callback('◀️ Back', 'admin_back')]);
+
+  await ctx.editMessageText(text, { parse_mode: 'MarkdownV2', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_feedback_detail:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const feedbackId = parseInt(ctx.match[1], 10);
+  const rows = await db.select().from(feedback).where(eq(feedback.id, feedbackId)).limit(1);
+  if (rows.length === 0) { await ctx.answerCbQuery('Feedback not found'); return; }
+  const f = rows[0];
+
+  const statusIcon = f.status === 'open' ? '🟡' : f.status === 'resolved' ? '✅' : f.status === 'in_progress' ? '🔵' : '⚪';
+  const text =
+    `📝 *Feedback #${f.id}* ${statusIcon}\n\n` +
+    `*User:* \`${f.userId}\`\n` +
+    `*Category:* ${f.category}\n` +
+    `*Status:* ${f.status}\n` +
+    `*Created:* ${f.createdAt ? new Date(f.createdAt).toLocaleString('en-NG') : '—'}\n\n` +
+    `*Message:*\n${escapeTelegramMarkdown(f.message)}`;
+
+  const buttons: any[] = [];
+  if (f.status !== 'resolved') {
+    buttons.push([Markup.button.callback('✅ Mark Resolved', `admin_feedback_resolve:${f.id}`)]);
+  }
+  if (f.status !== 'in_progress' && f.status !== 'resolved') {
+    buttons.push([Markup.button.callback('🔵 Mark In Progress', `admin_feedback_progress:${f.id}`)]);
+  }
+  buttons.push([Markup.button.callback('◀️ Back', 'admin_page:feedback')]);
+
+  await ctx.editMessageText(text, { parse_mode: 'MarkdownV2', ...Markup.inlineKeyboard(buttons) });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/admin_feedback_resolve:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const feedbackId = parseInt(ctx.match[1], 10);
+  await db.update(feedback).set({ status: 'resolved', resolvedAt: new Date() }).where(eq(feedback.id, feedbackId));
+  await ctx.answerCbQuery('Marked resolved');
+  await ctx.editMessageText(`✅ Feedback #${feedbackId} marked as resolved.`, Markup.inlineKeyboard([[Markup.button.callback('◀️ Back to Feedback', 'admin_page:feedback')]]));
+});
+
+bot.action(/admin_feedback_progress:(\d+)/, async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username;
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+
+  const feedbackId = parseInt(ctx.match[1], 10);
+  await db.update(feedback).set({ status: 'in_progress' }).where(eq(feedback.id, feedbackId));
+  await ctx.answerCbQuery('Marked in progress');
+  await ctx.editMessageText(`🔵 Feedback #${feedbackId} marked as in progress.`, Markup.inlineKeyboard([[Markup.button.callback('◀️ Back to Feedback', 'admin_page:feedback')]]));
 });
 
 // ─── Ambassador Referrals ───
@@ -3321,7 +3500,7 @@ bot.on(message('text'), async (ctx, next) => {
   const session = getSession(userId);
 
   // ─── Pass menu buttons to bot.hears() handlers ───
-  const menuButtons = ['💰 Balance', '📤 Send', '📥 Receive', '🔄 Swap', '💳 Bills', '📋 History', '⚙️ Settings', '🌐 Community', '🛒 Shop', '📦 Bulk Send', '📅 Schedule'];
+  const menuButtons = ['💰 Balance', '📤 Send', '📥 Receive', '🔄 Swap', '💳 Bills', '📋 History', '⚙️ Settings', '📦 Bulk Send', '📅 Schedule', '📖 How to Use', '✨ Features', '📝 Feedback', '❓ Help'];
   if (menuButtons.includes(text)) {
     return next();
   }
@@ -3505,7 +3684,7 @@ bot.on(message('text'), async (ctx, next) => {
     for (const r of recipients) {
       const transferUsdt = r.amountNgn / rate;
       const feeInfo = walletAddress
-        ? await calculateSendFee(transferUsdt, walletAddress)
+        ? await calculateSendFee(transferUsdt, walletAddress, userId)
         : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
       totalUsdt += transferUsdt;
       totalFeeUsdt += feeInfo.zendFeeUsdt;
@@ -4131,7 +4310,7 @@ bot.on(message('text'), async (ctx, next) => {
     const transferUsdt = amount / rate;
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     const feeInfo = user[0]?.walletAddress
-      ? await calculateSendFee(transferUsdt, user[0].walletAddress)
+      ? await calculateSendFee(transferUsdt, user[0].walletAddress, userId)
       : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
     const usdtNeeded = transferUsdt + feeInfo.zendFeeUsdt;
 
@@ -4579,7 +4758,7 @@ bot.on(message('text'), async (ctx, next) => {
 
         const transferUsdt = parsed.amount / rate;
         const feeInfo = user[0]?.walletAddress
-          ? await calculateSendFee(transferUsdt, user[0].walletAddress)
+          ? await calculateSendFee(transferUsdt, user[0].walletAddress, userId)
           : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
         const usdtNeeded = transferUsdt + feeInfo.zendFeeUsdt;
 
@@ -5045,6 +5224,37 @@ bot.on(message('text'), async (ctx, next) => {
       `Use *📅 Schedule* to view or cancel.`,
       { parse_mode: 'Markdown', ...mainMenu }
     );
+    return;
+  }
+
+  // ─── FEEDBACK: AWAITING_FEEDBACK_TEXT ───
+  if (session.state === ConversationState.AWAITING_FEEDBACK_TEXT) {
+    const feedbackText = text.trim();
+    if (feedbackText.length < 3) {
+      await ctx.reply('❌ Please write a bit more so we can understand your feedback.', cancelKeyboard);
+      return;
+    }
+    if (feedbackText.length > 2000) {
+      await ctx.reply('❌ Feedback is too long. Please keep it under 2000 characters.', cancelKeyboard);
+      return;
+    }
+    try {
+      await db.insert(feedback).values({
+        userId,
+        message: feedbackText,
+        category: 'general',
+        status: 'open',
+      });
+      setSession(userId, { state: ConversationState.IDLE });
+      await ctx.reply(
+        `📝 *Feedback Received*\n\n` +
+        `Thank you\! We read every message and will follow up if needed.`,
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
+    } catch (err) {
+      console.error('[Feedback] Save error:', err);
+      await ctx.reply('❌ Could not save feedback. Please try again later.', mainMenu);
+    }
     return;
   }
 });
@@ -5817,14 +6027,12 @@ async function executeSendCore(
         user[0].walletAddress,
         order.address,
         pajMint,
-        feeWallet || undefined
+        feeWallet || undefined,
+        userId
       );
       if (shortfall && !funded) {
-        throw new Error(
-          `Your wallet needs ~${shortfall.toFixed(6)} more SOL for network fees. ` +
-          (fundError ? `Auto-funding failed: ${fundError}. ` : '') +
-          `Please deposit a small amount of SOL to your Zend wallet, or contact support.`
-        );
+        const userMsg = gasFundingErrorToUserMessage(fundError, shortfall);
+        throw new Error(userMsg);
       }
 
       // Check token balance covers transfer + fee
@@ -6017,13 +6225,10 @@ async function executeSwap(
     }
 
     // Gas sponsorship for swaps
-    const { funded, gasSponsored, shortfall, error: fundError } = await fundSolIfNeeded(user[0].walletAddress);
+    const { funded, gasSponsored, shortfall, error: fundError } = await fundSolIfNeeded(user[0].walletAddress, undefined, undefined, undefined, userId);
     if (shortfall && !funded) {
-      throw new Error(
-        `Your wallet needs ~${shortfall.toFixed(6)} more SOL for swap fees. ` +
-        (fundError ? `Auto-funding failed: ${fundError}. ` : '') +
-        `Please deposit a small amount of SOL to your Zend wallet, or contact support.`
-      );
+      const userMsg = gasFundingErrorToUserMessage(fundError, shortfall);
+      throw new Error(userMsg);
     }
 
     let txHash: string;
@@ -6231,7 +6436,7 @@ async function prepareSendConfirmation(
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
   let feeInfo = { zendFeeUsdt: 0, feeSol: 0, feeBps: 100, willFundSol: false };
   if (user[0]?.walletAddress) {
-    feeInfo = await calculateSendFee(transferUsdt, user[0].walletAddress);
+    feeInfo = await calculateSendFee(transferUsdt, user[0].walletAddress, userId);
   }
   const { zendFeeUsdt, feeSol, feeBps, willFundSol } = feeInfo;
   const usdtNeeded = transferUsdt + zendFeeUsdt;
@@ -7345,15 +7550,79 @@ bot.action('settings_pin', async (ctx) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 🌐 COMMUNITY
+// ❓ HELP / HOW TO USE / FEATURES / FEEDBACK
 // ═════════════════════════════════════════════════════════════════════════════
 
-bot.hears('🌐 Community', async (ctx) => {
+bot.hears('❓ Help', async (ctx) => {
   await ctx.reply(
-    `🌐 *Zend Community*\n\n` +
-    `Join our community for support, feedback, and updates:\n\n` +
+    `❓ *Zend Help*\n\n` +
+    `Need support? Reach out anytime:\n\n` +
+    `• 📖 Tap *How to Use* for a quick guide\n` +
+    `• ✨ Tap *Features* to see what Zend can do\n` +
+    `• 📝 Tap *Feedback* to share ideas or report bugs\n\n` +
     `👉 [Zend Community](https://t.me/zend_community)`,
     { parse_mode: 'Markdown', link_preview_options: { is_disabled: true }, ...mainMenu }
+  );
+});
+
+bot.hears('📖 How to Use', async (ctx) => {
+  await ctx.reply(
+    `📖 *How to Use Zend*\n\n` +
+    `*1. Add Money*\n` +
+    `Tap 💰 *Balance* → *Add Naira* → follow the bank transfer instructions. Your virtual account converts Naira to USDT instantly.\n\n` +
+    `*2. Send to Any Nigerian Bank*\n` +
+    `Tap 📤 *Send* → enter amount → choose or add a bank account → confirm with your PIN.\n\n` +
+    `*3. Receive Money*\n` +
+    `Tap 📥 *Receive* → share your wallet address or virtual account details.\n\n` +
+    `*4. Swap Crypto*\n` +
+    `Tap 🔄 *Swap* → pick the token pair → enter amount → confirm.\n\n` +
+    `*5. Pay Bills*\n` +
+    `Tap 💳 *Bills* → choose Airtime, Data, Electricity, or Cable → fill details → pay with USDT.\n\n` +
+    `*6. Bulk / Scheduled Sends*\n` +
+    `Tap 📦 *Bulk Send* to pay many people at once, or 📅 *Schedule* for recurring payments.\n\n` +
+    `*Tips:*\n` +
+    `• Keep a tiny amount of SOL for network gas, or let Zend sponsor it for a small fee.\n` +
+    `• Set a transaction PIN in ⚙️ *Settings* for extra security.\n` +
+    `• Voice commands work too — just send a voice note.`,
+    { parse_mode: 'Markdown', ...mainMenu }
+  );
+});
+
+bot.hears('✨ Features', async (ctx) => {
+  try {
+    const features = await db.select().from(botFeatures).where(eq(botFeatures.isActive, true)).orderBy(botFeatures.sortOrder);
+    if (!features.length) {
+      await ctx.reply('✨ No features listed right now. Check back soon!', mainMenu);
+      return;
+    }
+    let text = '✨ *Zend Features*\n\n';
+    const byCategory: Record<string, typeof features> = {};
+    for (const f of features) {
+      byCategory[f.category] = byCategory[f.category] || [];
+      byCategory[f.category].push(f);
+    }
+    for (const [category, list] of Object.entries(byCategory)) {
+      text += `*${md(category.toUpperCase())}*\n`;
+      for (const f of list) {
+        text += `• *${md(f.name)}* — ${md(f.description)}\n`;
+      }
+      text += '\n';
+    }
+    await ctx.reply(text, { parse_mode: 'Markdown', ...mainMenu });
+  } catch (err) {
+    console.error('[Features] Handler error:', err);
+    await ctx.reply('❌ Could not load features. Please try again.', mainMenu);
+  }
+});
+
+bot.hears('📝 Feedback', async (ctx) => {
+  const userId = ctx.from!.id.toString();
+  setSession(userId, { state: ConversationState.AWAITING_FEEDBACK_TEXT });
+  await ctx.reply(
+    `📝 *Send Feedback*\n\n` +
+    `We read every message\. Share a bug, feature idea, or anything else:\n\n` +
+    `Type your feedback below\. Tap ❌ Cancel to discard\.`,
+    { parse_mode: 'Markdown', ...cancelKeyboard }
   );
 });
 
@@ -8519,7 +8788,7 @@ async function runScheduledTransfers() {
         // Calculate fee for scheduled transfer
         const userRow = await db.select().from(users).where(eq(users.id, s.userId)).limit(1);
         const feeInfo = userRow[0]?.walletAddress
-          ? await calculateSendFee(transferUsdt, userRow[0].walletAddress)
+          ? await calculateSendFee(transferUsdt, userRow[0].walletAddress, s.userId)
           : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
         const amountUsdt = transferUsdt + feeInfo.zendFeeUsdt;
 
