@@ -734,9 +734,6 @@ async function getBotFeatures(): Promise<any[]> {
 
 async function seedBotFeatures() {
   try {
-    const existing = await db.select({ count: sql`count(*)` }).from(botFeatures);
-    if (Number(existing[0]?.count) > 0) return;
-
     const features = [
       { key: 'balance', name: 'Check Balance', description: 'Dollars (USDT/USDC) and SOL with live Naira rates', category: 'payment', sortOrder: 1 },
       { key: 'add_naira', name: 'Add Naira', description: 'Bank transfer to a virtual account, get Dollars in your wallet', category: 'payment', sortOrder: 2 },
@@ -756,10 +753,19 @@ async function seedBotFeatures() {
       { key: 'feedback', name: 'Feedback', description: 'Share ideas, report bugs, or ask for help', category: 'info', sortOrder: 16 },
     ];
 
+    const existingRows = await db.select({ key: botFeatures.key }).from(botFeatures);
+    const existingKeys = new Set(existingRows.map(r => r.key));
+
+    let inserted = 0;
     for (const f of features) {
+      if (existingKeys.has(f.key)) continue;
       await db.insert(botFeatures).values(f);
+      inserted++;
     }
-    console.log('[Features] Seeded', features.length, 'features');
+
+    if (inserted > 0) {
+      console.log('[Features] Seeded', inserted, 'new features (total expected:', features.length, ')');
+    }
   } catch (err) {
     console.error('[Features] Seed failed:', err);
   }
