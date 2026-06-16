@@ -40,13 +40,12 @@ RUN pnpm install
 # Copy source code
 COPY . .
 
-# Build if needed
-ENV QVAC_MODEL_DIR=/app/models
+# QVAC: cache on a Railway volume mount (Settings → Volumes → mount at /data/qvac)
+ENV QVAC_MODEL_DIR=/data/qvac
+ENV QVAC_CONFIG_PATH=/app/qvac.config.mjs
 ENV QVAC_USE_LIGHT_MODELS=true
+ENV QVAC_DOWNLOAD_ON_START=true
 ENV NODE_ENV=production
 
-# Create models directory
-RUN mkdir -p /app/models
-
-# Start command
-CMD ["sh", "-c", "pnpm db:migrate && pnpm exec tsx apps/bot/src/index.ts"]
+# Start: migrate → download models once to volume → run bot
+CMD ["sh", "-c", "mkdir -p \"$QVAC_MODEL_DIR\" && pnpm db:migrate && if [ \"$QVAC_DOWNLOAD_ON_START\" = \"true\" ]; then pnpm exec tsx apps/bot/scripts/ensure-qvac-models.ts; fi && pnpm exec tsx apps/bot/src/index.ts"]

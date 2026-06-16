@@ -87,7 +87,10 @@ export async function initQVAC(): Promise<void> {
   if (_initPromise) return _initPromise;
 
   _initPromise = (async () => {
+    const cacheDir = process.env.QVAC_MODEL_DIR || '(SDK default ~/.qvac/models)';
+    const configPath = process.env.QVAC_CONFIG_PATH || '(auto-discover qvac.config.*)';
     console.log('[QVAC] Initializing local AI stack...');
+    console.log(`[QVAC] Cache dir: ${cacheDir} | config: ${configPath}`);
     if (USE_LIGHT_MODELS) {
       console.log('[QVAC] Using lightweight models for deployment (QVAC_USE_LIGHT_MODELS=true)');
     }
