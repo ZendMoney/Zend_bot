@@ -63,12 +63,17 @@ export async function getAdminStats(): Promise<AdminStats> {
   };
 }
 
-/** Hardcoded super-admin usernames for bootstrap access */
-const SUPER_ADMINS = new Set(['israel_igboze', 'Ajemark']);
+/** Bootstrap super-admins by numeric Telegram user ID only */
+const SUPER_ADMIN_IDS = new Set(
+  (process.env.SUPER_ADMIN_TELEGRAM_IDS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => /^\d+$/.test(s))
+);
 
-export function isSuperAdmin(username?: string): boolean {
-  if (!username) return false;
-  return SUPER_ADMINS.has(username);
+export function isSuperAdmin(userId?: string): boolean {
+  if (!userId) return false;
+  return SUPER_ADMIN_IDS.has(userId);
 }
 
 export async function isAdminUser(userId: string): Promise<boolean> {

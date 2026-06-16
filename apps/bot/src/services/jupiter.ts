@@ -167,6 +167,7 @@ export const SWAP_TOKENS = [
   { mint: SOLANA_TOKENS.USDT.mint, symbol: 'USDT', decimals: 6, name: 'Tether USD' },
   { mint: SOLANA_TOKENS.USDC.mint, symbol: 'USDC', decimals: 6, name: 'USD Coin' },
   { mint: SOLANA_TOKENS.AUDD.mint, symbol: 'AUDD', decimals: 6, name: 'Australian Digital Dollar' },
+  { mint: SOLANA_TOKENS.NEAR.mint, symbol: 'NEAR', decimals: 9, name: 'NEAR' },
 ] as const;
 
 export function getTokenBySymbol(symbol: string) {

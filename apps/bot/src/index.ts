@@ -16,10 +16,9 @@ import {
 import bs58 from 'bs58';
 import { message } from 'telegraf/filters';
 import { db, checkConnection } from '@zend/db';
-import { users, transactions, savedBankAccounts, scheduledTransfers, bitrefillOrders, ambassadorApplications, deviceSuspensionRequests, botFeatures, billPayments, feedback } from '@zend/db';
+import { users, transactions, savedBankAccounts, scheduledTransfers, ambassadorApplications, deviceSuspensionRequests, botFeatures, billPayments, feedback } from '@zend/db';
 import { eq, sql, and, desc } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
-import { BitRefillClient } from '@zend/bitrefill-client';
 import { AirbillsClient } from '@zend/airbills-client';
 import {
   parseCommand, transcribeVoice, chatWithAI, chatWithKimi,
@@ -39,6 +38,17 @@ import {
 
 import crypto from 'crypto';
 import { rateLimitMiddleware } from './middleware/rateLimit.js';
+import { sessionMiddleware } from './middleware/session.js';
+import {
+  autoDeleteMiddleware,
+  registerUserMessageTracking,
+  startAutoDeleteCleanup,
+  PIN_TTL_MS,
+} from './middleware/auto-delete.js';
+import { getSession, setSession, initSessionStore } from './session/store.js';
+import type { ZendContext, ZendSession } from './session/types.js';
+import { checkSendBalance } from './utils/send-balance.js';
+import { runStartupHealthChecks } from './launch/health.js';
 import { getAdminStats, isSuperAdmin, isAdminUser } from './services/admin.js';
 import {
   buyAirtime, buyData, buyElectricity, buyCable,
@@ -51,6 +61,18 @@ import {
   purchaseElectricity as airbillsBuyElectricity,
   purchaseCable as airbillsBuyCable,
 } from './services/airbills/index.js';
+import {
+  calculateSendFee as calcSendFee,
+  formatSendFeeLabel,
+  MIN_SOL_FOR_GAS,
+  ATA_RENT_SOL,
+  calcRequiredSol,
+  ZEND_FEE_NORMAL_BPS,
+  ZEND_FEE_FUNDED_BPS,
+  type SendFeeInfo,
+} from './utils/fees.js';
+import { getSolPriceInUsdt } from './utils/sol-price.js';
+import { AUDD_ENABLED, isAuddSwapPair } from './utils/flags.js';
 
 const BOT_TOKEN = process.env.BOT_TOKEN!;
 const SOLANA_RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
@@ -69,221 +91,18 @@ const _pajEnums = await import('@zend/paj-client');
 const Currency = _pajEnums.Currency;
 const Chain = _pajEnums.Chain;
 
-// ─── Types ───
-interface ZendSession {
-  state: ConversationState;
-  pendingTransaction?: Partial<{
-    amountNgn: number;
-    amountUsdt: number;
-    recipientName: string;
-    recipientBankCode: string;
-    recipientBankName: string;
-    recipientAccountNumber: string;
-    recipientAccountName: string;
-    recipientWalletAddress: string;
-    zendFeeUsdt?: number;
-    feeSol?: number;
-    ngnRate?: number;
-    // Swap fields
-    fromMint?: string;
-    toMint?: string;
-    fromSymbol?: string;
-    toSymbol?: string;
-    fromDecimals?: number;
-    swapAmountBase?: number;
-    swapQuote?: any;
-    swapOutAmount?: number;
-    swapMinOut?: number;
-    swapPriceImpact?: number;
-    isLocalSwap?: boolean;
-  }>;
-  pinVerifyAction?: 'send' | 'swap' | 'export' | 'schedule' | 'bulk_send';
-  pajContact?: string; // email/phone pending OTP
-  onrampAmount?: number; // pending on-ramp amount in NGN
-  onrampTargetToken?: 'USDT' | 'AUDD'; // which token the on-ramp should credit
-  voiceAnalysis?: {
-    text: string;
-    amount: number | null;
-    recipientName: string | null;
-    bankCode: string | null;
-    bankName: string | null;
-    accountNumber: string | null;
-    walletAddress: string | null;
-  };
-  scheduleData?: {
-    recipientBankAccountId?: number;
-    recipientName?: string;
-    bankName?: string;
-    accountNumber?: string;
-    amountNgn?: number;
-    frequency?: 'once' | 'daily' | 'weekly' | 'monthly';
-    startAt?: Date;
-    pendingAccountNumber?: string; // used when adding new recipient
-  };
-  bridgeData?: {
-    chainKey: string;
-    sourceChain: string;
-    token: string;
-    tokenIn: string;
-  };
-  billData?: {
-    type?: 'airtime' | 'data' | 'electricity' | 'cable';
-    network?: string;
-    phone?: string;
-    planCode?: string;
-    planAmount?: number;
-    disco?: string;
-    meterNumber?: string;
-    meterType?: 'prepaid' | 'postpaid';
-    provider?: string;
-    smartCardNumber?: string;
-    bouquetCode?: string;
-    bouquetAmount?: number;
-    amount?: number;
-  };
-  shopData?: {
-    productId?: string;
-    productName?: string;
-    category?: string;
-    amount?: number;
-    packageId?: string;
-    currency?: string;
-    phoneNumber?: string;
-    invoiceId?: string;
-    paymentUri?: string;
-    paymentAddress?: string;
-    cryptoAmount?: string;
-    cryptoCurrency?: string;
-    bitrefillPriceUsd?: number;
-    totalUsdt?: number;
-  };
-  lastBotMessageId?: number; // message ID of last bot prompt (for cleanup)
-}
-
-interface ZendContext extends Context {
-  session: ZendSession;
-}
-
-// ─── Session Store (in-memory with TTL, replace with Redis in production) ───
-const sessions = new Map<string, ZendSession & { _lastAccessed: number }>();
-const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
-const MAX_SESSIONS = 10000;
-
-function getSession(userId: string): ZendSession {
-  const existing = sessions.get(userId);
-  if (existing) {
-    existing._lastAccessed = Date.now();
-    return existing;
-  }
-  const sess = { state: ConversationState.IDLE, _lastAccessed: Date.now() };
-  sessions.set(userId, sess);
-  // Evict oldest if over limit
-  if (sessions.size > MAX_SESSIONS) {
-    const oldest = sessions.keys().next().value;
-    if (oldest) sessions.delete(oldest);
-  }
-  return sess;
-}
-
-function setSession(userId: string, session: ZendSession): void {
-  sessions.set(userId, { ...session, _lastAccessed: Date.now() });
-}
-
-// ─── Auto-Delete Messages ───
-interface TrackedMessage {
-  chatId: number | string;
-  messageId: number;
-  deleteAt: number;
-}
-const messageQueue: TrackedMessage[] = [];
-const MESSAGE_TTL_MS = 30 * 60 * 1000; // 30 minutes
-const PIN_TTL_MS = 15 * 1000; // PIN messages: delete after 15 seconds
-const MAX_QUEUE_SIZE = 5000;
-
-function trackMessage(chatId: number | string, messageId: number, isPin = false) {
-  if (messageQueue.length >= MAX_QUEUE_SIZE) {
-    messageQueue.shift(); // drop oldest
-  }
-  messageQueue.push({
-    chatId,
-    messageId,
-    deleteAt: Date.now() + (isPin ? PIN_TTL_MS : MESSAGE_TTL_MS),
-  });
-}
-
-async function deleteMessageNow(chatId: number | string, messageId: number) {
-  try {
-    await bot.telegram.deleteMessage(chatId, messageId);
-  } catch {
-    // Already deleted or permission issue
-  }
-}
-
-// Cleanup loop — messages + sessions
-setInterval(async () => {
-  const now = Date.now();
-  // Delete expired messages
-  const toDelete: TrackedMessage[] = [];
-  for (let i = messageQueue.length - 1; i >= 0; i--) {
-    if (messageQueue[i].deleteAt <= now) {
-      toDelete.push(messageQueue[i]);
-      messageQueue.splice(i, 1);
-    }
-  }
-  for (const m of toDelete) {
-    try {
-      await bot.telegram.deleteMessage(m.chatId, m.messageId);
-    } catch {
-      // Message already deleted or too old
-    }
-  }
-  // Evict stale sessions
-  for (const [uid, sess] of sessions) {
-    if (now - sess._lastAccessed > SESSION_TTL_MS) {
-      sessions.delete(uid);
-    }
-  }
-}, 5000); // every 5 seconds
-
 // ─── Services ───
 const walletService = new WalletService(SOLANA_RPC);
-// BitRefill — hidden from menu; code kept for future re-enable
-const bitrefillClient = process.env.BITREFILL_API_KEY
-  ? new BitRefillClient(process.env.BITREFILL_API_KEY)
-  : null;
-const bitrefillBusinessClient = (process.env.BITREFILL_BUSINESS_API_ID && process.env.BITREFILL_BUSINESS_API_SECRET)
-  ? new BitRefillClient(process.env.BITREFILL_BUSINESS_API_ID, process.env.BITREFILL_BUSINESS_API_SECRET)
-  : null;
-const BITREFILL_MARKUP_BPS = parseInt(process.env.BITREFILL_MARKUP_BPS || '150');
-
 // AirBills — Nigerian bill payments via Solana
 const airbillsClient = process.env.AIRBILLS_API_KEY
   ? new AirbillsClient(process.env.AIRBILLS_API_KEY, process.env.AIRBILLS_BASE_URL)
   : null;
 
-const ZEND_TREASURY_WALLET = process.env.ZEND_TREASURY_WALLET || ''; // receives shop USDT payments
-
 // Dev wallet for gas sponsorship (supports ZEND_DEV_WALLET_SECRET or PV_KEY)
 const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_KEY || '';
 
-const MIN_SOL_FOR_GAS = 0.003; // base tx fee buffer (~$0.50–0.70) for compute + priority fees + ATA rent margin
-const ATA_RENT_SOL = 0.002039; // rent to create an Associated Token Account
-const NEW_USER_SOL_BUFFER_MULTIPLIER = 2; // 2x buffer for users with no prior successful transactions
 const DEV_WALLET_LOW_BALANCE_THRESHOLD = 0.05; // alert if below ~$8–10 worth of SOL
 const DEV_WALLET_CRITICAL_THRESHOLD = 0.01; // critical alert if below this
-// Fee structure:
-// - Normal (user has SOL): 1% fee, capped at $2
-// - Funded (user has no SOL, we cover gas): 1.5% fee, capped at $3
-const ZEND_FEE_NORMAL_BPS = 100;
-const ZEND_FEE_FUNDED_BPS = 150;
-const ZEND_FEE_NORMAL_CAP_USDT = 2;
-const ZEND_FEE_FUNDED_CAP_USDT = 3;
-
-/** Calculate exact SOL a user needs for a send (gas + optional ATA rent). */
-function calcRequiredSol(needsAtaCount: number, isNewUser = false): number {
-  const base = MIN_SOL_FOR_GAS + (needsAtaCount * ATA_RENT_SOL);
-  return isNewUser ? base * NEW_USER_SOL_BUFFER_MULTIPLIER : base;
-}
 
 /** Check whether a user has never completed a transaction (new user). */
 async function isNewUser(userId: string): Promise<boolean> {
@@ -297,47 +116,17 @@ async function isNewUser(userId: string): Promise<boolean> {
   }
 }
 
-/**
- * Calculate the appropriate Zend fee based on user's SOL balance.
- * Normal (has SOL): 1% capped at $2
- * Funded (no SOL): 1.5% capped at $3 (includes gas sponsorship cost)
- * Fees are collected in USDT, not SOL.
- */
+/** Zend send fee — gas sponsorship = SOL funded (USDT) + extra service fee */
 async function calculateSendFee(
   transferUsdt: number,
   userWalletAddress: string,
   userId?: string
-): Promise<{
-  zendFeeUsdt: number;
-  feeSol: number;
-  feeBps: number;
-  willFundSol: boolean;
-}> {
-  const solBalance = await walletService.getSolBalance(userWalletAddress);
+): Promise<SendFeeInfo> {
   const newUser = userId ? await isNewUser(userId) : false;
-  const normalRequired = calcRequiredSol(1, newUser); // assume 1 ATA creation for recipient
-  
-  // Normal fee: 1%, cap $2
-  const normalFeeUsdt = Math.min(transferUsdt * (ZEND_FEE_NORMAL_BPS / 10000), ZEND_FEE_NORMAL_CAP_USDT);
-  
-  if (solBalance >= normalRequired) {
-    return {
-      zendFeeUsdt: normalFeeUsdt,
-      feeSol: 0,
-      feeBps: ZEND_FEE_NORMAL_BPS,
-      willFundSol: false,
-    };
-  }
-  
-  // Funded fee: 1.5%, cap $3
-  const fundedFeeUsdt = Math.min(transferUsdt * (ZEND_FEE_FUNDED_BPS / 10000), ZEND_FEE_FUNDED_CAP_USDT);
-  
-  return {
-    zendFeeUsdt: fundedFeeUsdt,
-    feeSol: 0,
-    feeBps: ZEND_FEE_FUNDED_BPS,
-    willFundSol: true,
-  };
+  return calcSendFee(transferUsdt, userWalletAddress, walletService, newUser, {
+    getSolPriceInUsdt,
+    needsAtaCount: process.env.ZEND_FEE_WALLET?.trim() ? 2 : 1,
+  });
 }
 
 /** Get dev wallet SOL balance (for gas sponsorship health checks). */
@@ -552,24 +341,6 @@ function sanitizeAccountNumber(raw: string | null | undefined): string | null {
   return raw.replace(/\D/g, '');
 }
 
-// ─── SOL Price (CoinGecko) ───
-let _solPriceCache: { price: number; time: number } | null = null;
-
-async function getSolPriceInUsdt(): Promise<number> {
-  if (_solPriceCache && Date.now() - _solPriceCache.time < 120000) {
-    return _solPriceCache.price;
-  }
-  try {
-    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-    const data = await res.json();
-    const price = (data as any)?.solana?.usd || 140;
-    _solPriceCache = { price, time: Date.now() };
-    return price;
-  } catch {
-    return _solPriceCache?.price || 140;
-  }
-}
-
 // ─── AUDD Price (CoinGecko) ───
 let _auddPriceCache: { price: number; time: number } | null = null;
 
@@ -737,20 +508,17 @@ async function seedBotFeatures() {
     const features = [
       { key: 'balance', name: 'Check Balance', description: 'Dollars (USDT/USDC) and SOL with live Naira rates', category: 'payment', sortOrder: 1 },
       { key: 'add_naira', name: 'Add Naira', description: 'Bank transfer to a virtual account, get Dollars in your wallet', category: 'payment', sortOrder: 2 },
-      { key: 'send', name: 'Send to Bank', description: 'Send money to any Nigerian bank (GTB, UBA, Access, OPay, Kuda, etc.)', category: 'payment', sortOrder: 3 },
-      { key: 'receive', name: 'Receive Money', description: 'Crypto address for direct deposit + virtual bank account for Naira', category: 'payment', sortOrder: 4 },
-      { key: 'swap', name: 'Convert Currency', description: 'Exchange SOL ↔ USDT ↔ USDC ↔ AUDD', category: 'payment', sortOrder: 5 },
-      { key: 'deposit_crypto', name: 'Deposit from Other Apps', description: 'Send Dollars or AUDD from Binance, MetaMask, Trust Wallet → receive in Zend', category: 'payment', sortOrder: 6 },
-      { key: 'history', name: 'Transaction History', description: 'View all past transactions', category: 'info', sortOrder: 7 },
-      { key: 'voice', name: 'Voice Commands', description: 'Send a voice note to execute commands', category: 'info', sortOrder: 8 },
-      { key: 'scheduled', name: 'Scheduled Transfers', description: 'Schedule automatic recurring or one-time future payments', category: 'payment', sortOrder: 9 },
-      { key: 'bulk_send', name: 'Bulk Send', description: 'Pay many people at once with a single transaction', category: 'payment', sortOrder: 10 },
-      { key: 'bills', name: 'Bills & Utilities', description: 'Buy airtime, data, electricity and cable TV subscriptions', category: 'payment', sortOrder: 11 },
-      { key: 'settings', name: 'Settings', description: 'PIN, language, auto-save, PAJ linking, wallet export', category: 'settings', sortOrder: 12 },
-      { key: 'help', name: 'Help', description: 'Get support and join the Zend community', category: 'info', sortOrder: 13 },
-      { key: 'how_to_use', name: 'How to Use', description: 'Step-by-step guide to using Zend', category: 'info', sortOrder: 14 },
-      { key: 'features', name: 'Features', description: 'Explore everything Zend can do', category: 'info', sortOrder: 15 },
-      { key: 'feedback', name: 'Feedback', description: 'Share ideas, report bugs, or ask for help', category: 'info', sortOrder: 16 },
+      { key: 'receive', name: 'Receive Money', description: 'Crypto address for direct deposit + virtual bank account for Naira', category: 'payment', sortOrder: 3 },
+      { key: 'swap', name: 'Convert Currency', description: AUDD_ENABLED ? 'Exchange SOL ↔ USDT ↔ USDC ↔ AUDD' : 'Exchange SOL ↔ USDT ↔ USDC', category: 'payment', sortOrder: 4 },
+      { key: 'deposit_crypto', name: 'Deposit from Other Apps', description: 'Send crypto from any wallet → receive in Zend via NEAR Intents', category: 'payment', sortOrder: 5 },
+      { key: 'history', name: 'Transaction History', description: 'View all past transactions', category: 'info', sortOrder: 6 },
+      { key: 'voice', name: 'Voice Commands', description: 'Send a voice note to execute commands', category: 'info', sortOrder: 7 },
+      { key: 'bills', name: 'Bills & Utilities', description: 'Buy airtime, data, electricity and cable TV subscriptions', category: 'payment', sortOrder: 8 },
+      { key: 'settings', name: 'Settings', description: 'PIN, language, auto-save, PAJ linking, wallet export', category: 'settings', sortOrder: 9 },
+      { key: 'help', name: 'Help', description: 'Get support and join the Zend community', category: 'info', sortOrder: 10 },
+      { key: 'how_to_use', name: 'How to Use', description: 'Step-by-step guide to using Zend', category: 'info', sortOrder: 11 },
+      { key: 'features', name: 'Features', description: 'Explore everything Zend can do', category: 'info', sortOrder: 12 },
+      { key: 'feedback', name: 'Feedback', description: 'Share ideas, report bugs, or ask for help', category: 'info', sortOrder: 13 },
     ];
 
     const existingRows = await db.select({ key: botFeatures.key }).from(botFeatures);
@@ -919,9 +687,8 @@ async function verifyBankAccount(
 
 // ─── Keyboards ───
 const mainMenu = Markup.keyboard([
-  ['💰 Balance', '📤 Send', '🔄 Swap'],
+  ['💰 Balance', '🔄 Swap'],
   ['📥 Receive', '💳 Bills', '📋 History'],
-  ['📦 Bulk Send', '📅 Schedule'],
   ['📖 How to Use', '✨ Features', '📝 Feedback'],
   ['❓ Help'],
 ]).resize();
@@ -965,86 +732,12 @@ const bot = new Telegraf<ZendContext>(BOT_TOKEN);
 // Rate limiting — MUST be first
 bot.use(rateLimitMiddleware);
 
-// Session middleware
-bot.use(async (ctx, next) => {
-  const userId = ctx.from?.id.toString();
-  if (userId) {
-    (ctx as any).session = getSession(userId);
-  }
-  await next();
-});
-
-// Auto-delete all bot messages after 10 minutes (PIN after 5 sec)
-bot.use(async (ctx, next) => {
-  const originalReply = ctx.reply.bind(ctx);
-  ctx.reply = async function(text: any, extra?: any) {
-    const msg = await originalReply(text, extra);
-    if (msg && typeof msg === 'object' && 'message_id' in msg && ctx.chat) {
-      const isPin = typeof text === 'string' && text.toLowerCase().includes('pin');
-      trackMessage(ctx.chat.id, msg.message_id, isPin);
-    }
-    return msg;
-  };
-  const originalEdit = ctx.editMessageText.bind(ctx);
-  ctx.editMessageText = async function(text: any, extra?: any) {
-    const result = await originalEdit(text, extra);
-    if (result && typeof result === 'object' && 'message_id' in result && ctx.chat) {
-      const isPin = typeof text === 'string' && text.toLowerCase().includes('pin');
-      trackMessage(ctx.chat.id, result.message_id, isPin);
-    }
-    return result;
-  };
-  await next();
-});
-
-// Track & auto-delete user messages during sensitive flows
-bot.on(message('text'), async (ctx, next) => {
-  const userId = ctx.from?.id?.toString();
-  if (!userId || !ctx.chat || !ctx.message?.message_id) return next();
-  const session = getSession(userId);
-  const sensitiveStates = [
-    ConversationState.AWAITING_PIN,
-    ConversationState.AWAITING_PIN_VERIFY,
-    ConversationState.AWAITING_SEND_AMOUNT,
-    ConversationState.AWAITING_SWAP_AMOUNT,
-    ConversationState.AWAITING_BRIDGE_AMOUNT,
-    ConversationState.AWAITING_ONRAMP_AMOUNT,
-    ConversationState.AWAITING_SCHEDULE_AMOUNT,
-    ConversationState.AWAITING_SCHEDULE_FREQUENCY,
-    ConversationState.AWAITING_SCHEDULE_START,
-    ConversationState.AWAITING_EMAIL,
-    ConversationState.AWAITING_SEND_RECIPIENT,
-    ConversationState.AWAITING_BANK_DETAILS,
-    ConversationState.AWAITING_SHOP_PHONE,
-  ];
-  const isSensitive = sensitiveStates.includes(session.state);
-  const isPin = session.state === ConversationState.AWAITING_PIN || session.state === ConversationState.AWAITING_PIN_VERIFY;
-
-  if (isSensitive) {
-    trackMessage(ctx.chat.id, ctx.message.message_id, isPin);
-  }
-
-  await next(); // let the main handler process the message
-
-  // Immediately delete ONLY PIN messages (security critical).
-  // Other sensitive messages are tracked and deleted by the cleanup queue after MESSAGE_TTL_MS.
-  if (isPin) {
-    try {
-      await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id);
-      console.log(`[AutoDelete] Deleted PIN user message ${ctx.message.message_id}`);
-    } catch (err: any) {
-      console.log(`[AutoDelete] Failed to delete PIN user message ${ctx.message.message_id}:`, err.message);
-    }
-    if (session.lastBotMessageId) {
-      try {
-        await ctx.telegram.deleteMessage(ctx.chat.id, session.lastBotMessageId);
-        console.log(`[AutoDelete] Deleted PIN bot prompt ${session.lastBotMessageId}`);
-      } catch (err: any) {
-        console.log(`[AutoDelete] Failed to delete PIN bot prompt ${session.lastBotMessageId}:`, err.message);
-      }
-    }
-  }
-});
+bot.use(sessionMiddleware);
+bot.use(autoDeleteMiddleware((userId) =>
+  userId ? getSession(userId).state : ConversationState.IDLE
+));
+registerUserMessageTracking(bot, (userId) => getSession(userId).state);
+startAutoDeleteCleanup(bot);
 
 // ═════════════════════════════════════════════════════════════════════════════
 // GROUP CHAT: reply only when tagged
@@ -1468,20 +1161,17 @@ async function startOnboarding(ctx: ZendContext, userId: string) {
 // /ADMIN — Admin Dashboard
 // ═════════════════════════════════════════════════════════════════════════════
 
+/** Numeric Telegram user IDs only — usernames are not accepted */
 const ADMIN_TELEGRAM_IDS = (process.env.ADMIN_TELEGRAM_IDS || process.env.ADMIN_TELEGRAM_ID || '')
   .split(',')
-  .map(s => s.trim().toLowerCase())
-  .filter(Boolean);
+  .map(s => s.trim())
+  .filter(s => /^\d+$/.test(s));
 
-async function checkAdmin(userId: string, username?: string): Promise<boolean> {
-  if (ADMIN_TELEGRAM_IDS.length > 0) {
-    if (ADMIN_TELEGRAM_IDS.includes(userId)) return true;
-    if (username && ADMIN_TELEGRAM_IDS.includes(username.toLowerCase())) return true;
-  }
-  const u = await db.select({ isAdmin: users.isAdmin, telegramUsername: users.telegramUsername }).from(users).where(eq(users.id, userId)).limit(1);
-  if (u.length > 0 && u[0].isAdmin) return true;
-  if (u.length > 0 && u[0].telegramUsername && ADMIN_TELEGRAM_IDS.includes(u[0].telegramUsername.toLowerCase())) return true;
-  return false;
+async function checkAdmin(userId: string): Promise<boolean> {
+  if (isSuperAdmin(userId)) return true;
+  if (ADMIN_TELEGRAM_IDS.includes(userId)) return true;
+  const u = await db.select({ isAdmin: users.isAdmin }).from(users).where(eq(users.id, userId)).limit(1);
+  return u.length > 0 && u[0].isAdmin === true;
 }
 
 // ─── Admin Navigation ───
@@ -1496,7 +1186,7 @@ const adminMainKeyboard = Markup.inlineKeyboard([
 bot.command('admin', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) {
+  if (!(await checkAdmin(userId))) {
     await ctx.reply('❌ You do not have permission to access the admin panel.');
     return;
   }
@@ -1506,7 +1196,7 @@ bot.command('admin', async (ctx) => {
 bot.action('admin_back', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
   await ctx.editMessageText('🛠 *Zend Admin Panel*\n\nChoose a section:', { parse_mode: 'Markdown', ...adminMainKeyboard });
   await ctx.answerCbQuery();
 });
@@ -1515,7 +1205,7 @@ bot.action('admin_back', async (ctx) => {
 bot.action('admin_page:overview', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const userCount = await db.select({ count: sql`count(*)` }).from(users);
   const txCount = await db.select({ count: sql`count(*)` }).from(transactions);
@@ -1546,7 +1236,7 @@ const USERS_PER_PAGE = 20;
 bot.action('admin_page:users', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const total = await db.select({ count: sql`count(*)` }).from(users);
   const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
@@ -1582,7 +1272,7 @@ bot.action('admin_page:users', async (ctx) => {
 bot.action(/admin_users_page:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const page = parseInt(ctx.match[1], 10);
   const offset = page * USERS_PER_PAGE;
@@ -1616,7 +1306,7 @@ const AMBS_PER_PAGE = 10;
 bot.action('admin_page:ambassadors', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const total = await db.select({ count: sql`count(*)` }).from(ambassadorApplications);
   const apps = await db.select().from(ambassadorApplications).orderBy(sql`${ambassadorApplications.createdAt} desc`).limit(AMBS_PER_PAGE);
@@ -1639,7 +1329,7 @@ bot.action('admin_page:ambassadors', async (ctx) => {
 bot.action(/admin_ambassadors_page:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const page = parseInt(ctx.match[1], 10);
   const offset = page * AMBS_PER_PAGE;
@@ -1669,7 +1359,7 @@ const SUSP_PER_PAGE = 20;
 bot.action('admin_page:suspensions', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const total = await db.select({ count: sql`count(*)` }).from(deviceSuspensionRequests);
   const reqs = await db.select().from(deviceSuspensionRequests).orderBy(sql`${deviceSuspensionRequests.createdAt} desc`).limit(SUSP_PER_PAGE);
@@ -1691,7 +1381,7 @@ bot.action('admin_page:suspensions', async (ctx) => {
 bot.action(/admin_suspensions_page:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const page = parseInt(ctx.match[1], 10);
   const offset = page * SUSP_PER_PAGE;
@@ -1720,7 +1410,7 @@ bot.action(/admin_suspensions_page:(\d+)/, async (ctx) => {
 bot.action('admin_page:fees', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const totalZendFee = await db.select({ sum: sql`coalesce(sum(zend_fee_usdt), 0)` }).from(transactions).where(eq(transactions.status, 'completed'));
   const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_send'));
@@ -1729,17 +1419,18 @@ bot.action('admin_page:fees', async (ctx) => {
   const offrampCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'ngn_send'));
   const onrampCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
   const swapCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'swap'));
-  const shopCount = await db.select({ count: sql`count(*)` }).from(bitrefillOrders);
-  const shopVolume = await db.select({ sum: sql`coalesce(sum(amount_fiat), 0)` }).from(bitrefillOrders).where(eq(bitrefillOrders.status, 'completed'));
+  const billCount = await db.select({ count: sql`count(*)` }).from(billPayments);
+  const billVolume = await db.select({ sum: sql`coalesce(sum(amount_ngn), 0)` }).from(billPayments).where(eq(billPayments.status, 'success'));
 
   const text =
     `💰 *Fees & Revenue*\n\n` +
-    `🪙 Total Zend Fees: $${Number(totalZendFee[0]?.sum || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}\n\n` +
+    `🪙 Total Zend Fees: $${Number(totalZendFee[0]?.sum || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}\n` +
+    `📐 Fee config: ${ZEND_FEE_NORMAL_BPS / 100}% (normal) / max(${ZEND_FEE_FUNDED_BPS / 100}%, gas+$flat) (sponsored)\n\n` +
     `📊 *Volume by Type:*\n` +
     `📤 Off-Ramp: ${offrampCount[0]?.count || 0} tx | ₦${Number(totalNgnOut[0]?.sum || 0).toLocaleString()}\n` +
     `📥 On-Ramp: ${onrampCount[0]?.count || 0} tx | ₦${Number(totalNgnIn[0]?.sum || 0).toLocaleString()}\n` +
     `🔄 Swaps: ${swapCount[0]?.count || 0} tx\n` +
-    `🎁 Shop Orders: ${shopCount[0]?.count || 0} | $${Number(shopVolume[0]?.sum || 0).toLocaleString()}\n`;
+    `📱 Bill Payments: ${billCount[0]?.count || 0} | ₦${Number(billVolume[0]?.sum || 0).toLocaleString()}\n`;
 
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_back')]]) });
   await ctx.answerCbQuery();
@@ -1749,7 +1440,7 @@ bot.action('admin_page:fees', async (ctx) => {
 bot.action('admin_page:features', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const features = await db.select().from(botFeatures).orderBy(botFeatures.sortOrder);
   const buttons = features.map(f => [
@@ -1767,7 +1458,7 @@ bot.action('admin_page:features', async (ctx) => {
 bot.action(/admin_toggle_feature:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const featureId = parseInt(ctx.match[1], 10);
   const feature = await db.select().from(botFeatures).where(eq(botFeatures.id, featureId)).limit(1);
@@ -1798,7 +1489,7 @@ const FEEDBACK_PER_PAGE = 10;
 bot.action('admin_page:feedback', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const total = await db.select({ count: sql`count(*)` }).from(feedback);
   const openCount = await db.select({ count: sql`count(*)` }).from(feedback).where(eq(feedback.status, 'open'));
@@ -1828,7 +1519,7 @@ bot.action('admin_page:feedback', async (ctx) => {
 bot.action(/admin_feedback_detail:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const feedbackId = parseInt(ctx.match[1], 10);
   const rows = await db.select().from(feedback).where(eq(feedback.id, feedbackId)).limit(1);
@@ -1860,7 +1551,7 @@ bot.action(/admin_feedback_detail:(\d+)/, async (ctx) => {
 bot.action(/admin_feedback_resolve:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const feedbackId = parseInt(ctx.match[1], 10);
   await db.update(feedback).set({ status: 'resolved', resolvedAt: new Date() }).where(eq(feedback.id, feedbackId));
@@ -1871,7 +1562,7 @@ bot.action(/admin_feedback_resolve:(\d+)/, async (ctx) => {
 bot.action(/admin_feedback_progress:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const feedbackId = parseInt(ctx.match[1], 10);
   await db.update(feedback).set({ status: 'in_progress' }).where(eq(feedback.id, feedbackId));
@@ -1886,7 +1577,7 @@ const REFS_PER_PAGE = 15;
 bot.action('admin_page:ambassador_refs', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const total = await db.select({ count: sql`count(*)` }).from(ambassadorApplications);
   const ambassadors = await db.select().from(ambassadorApplications).orderBy(desc(ambassadorApplications.createdAt)).limit(REFS_PER_PAGE);
@@ -1932,7 +1623,7 @@ bot.action('admin_page:ambassador_refs', async (ctx) => {
 bot.action(/admin_ref_page:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const page = parseInt(ctx.match[1], 10);
   const offset = page * REFS_PER_PAGE;
@@ -1981,7 +1672,7 @@ bot.action(/admin_ref_page:(\d+)/, async (ctx) => {
 bot.action('admin_ambassador_leaderboard', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const ambassadors = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.status, 'confirmed'));
 
@@ -2007,7 +1698,7 @@ bot.action('admin_ambassador_leaderboard', async (ctx) => {
 bot.action(/admin_ambassador_detail:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const ambId = parseInt(ctx.match[1], 10);
   const ambRows = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.id, ambId)).limit(1);
@@ -2059,7 +1750,7 @@ bot.action(/admin_ambassador_detail:(\d+)/, async (ctx) => {
 bot.action(/admin_confirm_ambassador:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const ambId = parseInt(ctx.match[1], 10);
   await db.update(ambassadorApplications)
@@ -2073,7 +1764,7 @@ bot.action(/admin_confirm_ambassador:(\d+)/, async (ctx) => {
 bot.action(/admin_remove_ambassador:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const ambId = parseInt(ctx.match[1], 10);
   await db.update(ambassadorApplications)
@@ -2087,7 +1778,7 @@ bot.action(/admin_remove_ambassador:(\d+)/, async (ctx) => {
 bot.action(/admin_set_ambassador_code:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const ambId = parseInt(ctx.match[1], 10);
   const ambRows = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.id, ambId)).limit(1);
@@ -2108,7 +1799,7 @@ bot.action(/admin_set_ambassador_code:(\d+)/, async (ctx) => {
 bot.action(/admin_ambassador_signups:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const ambId = parseInt(ctx.match[1], 10);
   const ambRows = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.id, ambId)).limit(1);
@@ -2166,7 +1857,7 @@ const adminSearchKeyboard = Markup.inlineKeyboard([
 bot.action('admin_page:search', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
   await ctx.editMessageText('🔍 *Search*\n\nWhat do you want to look up?', { parse_mode: 'Markdown', ...adminSearchKeyboard });
   await ctx.answerCbQuery();
 });
@@ -2174,7 +1865,7 @@ bot.action('admin_page:search', async (ctx) => {
 bot.action('admin_search:txn', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
   setSession(userId, { state: ConversationState.AWAITING_ADMIN_TXN_SEARCH });
   await ctx.editMessageText('🔎 *Search Transaction*\n\nEnter the transaction ID (e.g., `ZND-12345`):', { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'admin_cancel_search')]]) });
   await ctx.answerCbQuery();
@@ -2183,7 +1874,7 @@ bot.action('admin_search:txn', async (ctx) => {
 bot.action('admin_search:user', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
   setSession(userId, { state: ConversationState.AWAITING_ADMIN_USER_SEARCH });
   await ctx.editMessageText('👤 *Search User*\n\nEnter a Telegram user ID or @username:', { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'admin_cancel_search')]]) });
   await ctx.answerCbQuery();
@@ -2262,7 +1953,7 @@ async function buildTxnDetailText(txn: any): Promise<string> {
   }
 
   if (txn.pajReference) text += `\n📌 *PAJ Ref:* \`${txn.pajReference}\`\n`;
-  if (txn.chainrailsIntentAddress) text += `📌 *ChainRails:* \`${txn.chainrailsIntentAddress}\`\n`;
+  if (txn.nearIntentDepositAddress) text += `📌 *NEAR Intents:* \`${txn.nearIntentDepositAddress}\`\n`;
 
   if (txn.createdAt) text += `\n🕐 *Created:* ${new Date(txn.createdAt).toLocaleString('en-NG')}\n`;
   if (txn.completedAt) text += `🕐 *Completed:* ${new Date(txn.completedAt).toLocaleString('en-NG')}\n`;
@@ -2323,7 +2014,7 @@ async function buildUserDetailText(userRow: any): Promise<string> {
 bot.action(/admin_txn:(.+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const txnId = ctx.match[1];
   const txnRows = await db.select().from(transactions).where(eq(transactions.id, txnId)).limit(1);
@@ -2345,7 +2036,7 @@ bot.action(/admin_txn:(.+)/, async (ctx) => {
 bot.action(/admin_user:(.+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const targetId = ctx.match[1];
   const userRows = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
@@ -2373,7 +2064,7 @@ bot.command('admin', async (ctx) => {
   const username = ctx.from.username;
 
   // Grant access to super-admins or DB-flagged admins
-  const hasAccess = isSuperAdmin(username) || await isAdminUser(userId);
+  const hasAccess = isSuperAdmin(userId) || await isAdminUser(userId);
   if (!hasAccess) {
     await ctx.reply('❌ You do not have admin access.');
     return;
@@ -2405,7 +2096,7 @@ bot.command('wallet', async (ctx) => {
     `👛 *Your Account*\n\n` +
     `*Your Address:*\n\n` +
     `${u.walletAddress}\n\n` +
-    `*Currencies:* SOL, USDT, USDC, AUDD\n\n` +
+    `*Currencies:* SOL, USDT, USDC${AUDD_ENABLED ? ', AUDD' : ''}\n\n` +
     `⚠️ To view your secret code, go to *⚙️ Settings*.`;
 
   const copyBtn = Markup.inlineKeyboard([
@@ -2420,851 +2111,6 @@ bot.command('wallet', async (ctx) => {
   }
 
   await ctx.reply(msg, { parse_mode: 'Markdown', ...copyBtn });
-});
-
-// ═════════════════════════════════════════════════════════════════════════════
-// 🎁 SHOP — BitRefill Integration
-// ═════════════════════════════════════════════════════════════════════════════
-
-// Cache for BitRefill products (TTL: 10 minutes)
-const bitrefillProductCache = new Map<string, { products: any[]; fetchedAt: number }>();
-const BITREFILL_CACHE_TTL = 10 * 60 * 1000;
-
-async function getCachedProducts(country: string, category?: string): Promise<any[]> {
-  const key = `${country}:${category || 'all'}`;
-  const cached = bitrefillProductCache.get(key);
-  if (cached && Date.now() - cached.fetchedAt < BITREFILL_CACHE_TTL) {
-    return cached.products;
-  }
-  const client = bitrefillClient || bitrefillBusinessClient;
-  if (!client) return [];
-  try {
-    const res = await client.getProducts({ country, category, limit: 50 });
-    const products = Array.isArray(res) ? res : (res.data || []);
-    console.log('[BitRefill] Fetched', products.length, 'products for', country, '- names:', products.map((p: any) => p.name).join(', '));
-    bitrefillProductCache.set(key, { products, fetchedAt: Date.now() });
-    return products;
-  } catch (err) {
-    console.error('[BitRefill] Failed to fetch products:', err);
-    return [];
-  }
-}
-
-// ─── Shop entry ───
-// BitRefill Shop — commented out in favour of AirBills
-// bot.command('shop', async (ctx) => {
-//   await showShop(ctx);
-// });
-// bot.hears('🎁 Shop', async (ctx) => {
-//   await showShop(ctx);
-// });
-
-async function showShop(ctx: ZendContext) {
-  if (!bitrefillClient && !bitrefillBusinessClient) {
-    await ctx.reply(
-      '🎁 *Shop*\n\n' +
-      'Shopping is temporarily unavailable. Please try again later.',
-      { parse_mode: 'Markdown', ...mainMenu }
-    );
-    return;
-  }
-
-  await ctx.reply(
-    '🛒 *Shop with Crypto*\n\n' +
-    'What do you want to buy?',
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('📱 Airtime', 'shop_cat:refill')],
-        [Markup.button.callback('📶 Data Bundles', 'shop_cat:data')],
-        [Markup.button.callback('🌍 Gift Cards', 'shop_cat:gift-card')],
-        [Markup.button.callback('🌐 eSIM', 'shop_cat:esim')],
-        [Markup.button.callback('📋 All Products', 'shop_cat:all')],
-        [Markup.button.callback('📦 My Orders', 'shop_orders')],
-      ]),
-    }
-  );
-}
-
-// ─── Category selection ───
-bot.action(/shop_cat:(.+)/, async (ctx) => {
-  const category = ctx.match[1];
-  const userId = ctx.from!.id.toString();
-
-  await ctx.answerCbQuery('Loading products...');
-
-  // BitRefill Nigeria products don't use standard categories — fetch all and filter client-side
-  const products = await getCachedProducts('NG');
-  let filtered = products.filter((p: any) => p.in_stock !== false);
-
-  const DATA_KEYWORDS = ['data', 'bundle', 'internet', 'sme', 'social', 'night', 'weekly', 'monthly', 'daily', 'subscription', 'pack'];
-  const CARRIER_NAMES = ['airtel', 'mtn', 'glo', '9mobile'];
-  const isDataProduct = (p: any) =>
-    p.type === 'bundle' ||
-    p.type === 'data_bundle' ||
-    DATA_KEYWORDS.some(k => p.name.toLowerCase().includes(k));
-  const isCarrierProduct = (p: any) =>
-    CARRIER_NAMES.some(c => p.name.toLowerCase().includes(c));
-
-  if (category === 'all') {
-    // Show everything, no extra filtering
-  } else if (category === 'data') {
-    filtered = filtered.filter((p: any) => isCarrierProduct(p) && isDataProduct(p));
-  } else if (category === 'refill') {
-    // Airtime: carrier products that are NOT data bundles
-    filtered = filtered.filter((p: any) => isCarrierProduct(p) && !isDataProduct(p));
-  } else if (category === 'gift-card') {
-    // Retail vouchers / gift cards: not carrier products
-    filtered = filtered.filter((p: any) => !isCarrierProduct(p));
-  } else if (category === 'esim') {
-    filtered = filtered.filter((p: any) =>
-      p.name.toLowerCase().includes('esim') || p.name.toLowerCase().includes('e-sim')
-    );
-  }
-
-  console.log('[BitRefill] Category:', category, '-', filtered.length, 'products:', filtered.map((p: any) => p.name).join(', '));
-
-  if (!filtered.length) {
-    await ctx.editMessageText(
-      '🎁 *Shop*\n\n' +
-      'No products available in this category right now.\n\n' +
-      'Please try again later.',
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
-        [Markup.button.callback('⬅️ Back', 'shop_back')],
-      ]) }
-    );
-    return;
-  }
-
-  const buttons = filtered.slice(0, 10).map((p: any) =>
-    [Markup.button.callback(p.name, `shop_product:${p.id}`)]
-  );
-  buttons.push([Markup.button.callback('⬅️ Back', 'shop_back')]);
-
-  await ctx.editMessageText(
-    `🛒 *Shop — ${category === 'refill' ? 'Airtime' : category === 'gift-card' ? 'Gift Cards' : category === 'esim' ? 'eSIM' : category === 'all' ? 'All Products' : 'Data Bundles'}*\n\n` +
-    `Choose a product:`,
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
-  );
-});
-
-// ─── Product selection ───
-bot.action(/shop_product:(.+)/, async (ctx) => {
-  const productId = ctx.match[1];
-  const userId = ctx.from!.id.toString();
-
-  await ctx.answerCbQuery('Loading...');
-
-  const client = bitrefillClient || bitrefillBusinessClient;
-  if (!client) return;
-
-  try {
-    const product = await client.getProduct(productId);
-    const session = getSession(userId);
-    session.shopData = {
-      productId: product.id,
-      productName: product.name,
-      category: product.category,
-    };
-
-    // Build amount buttons
-    const buttons: any[] = [];
-
-    if (product.packages && product.packages.length > 0) {
-      // Fixed packages
-      for (const pkg of product.packages.slice(0, 8)) {
-        const pkgCurrency = pkg.currency || product.currency || '';
-        const isNgn = product.currency === 'NGN' || pkg.currency === 'NGN' || pkg.price_currency === 'NGN';
-        const priceSymbol = isNgn ? '₦' : (pkg.price_currency === 'USD' ? '$' : (pkg.price_currency || '$') + ' ');
-        buttons.push([Markup.button.callback(
-          `${pkg.value.toLocaleString()} ${pkgCurrency} — ~${priceSymbol}${pkg.price.toLocaleString()}`,
-          `shop_pkg:${pkg.package_id}`
-        )]);
-      }
-    } else if (product.range) {
-      // Variable amount
-      const presets = [500, 1000, 2000, 5000, 10000];
-      const validPresets = presets.filter(a =>
-        a >= product.range!.min && a <= product.range!.max
-      );
-      for (const amt of validPresets.slice(0, 5)) {
-        buttons.push([Markup.button.callback(
-          `${product.currency} ${amt.toLocaleString()}`,
-          `shop_amount:${amt}`
-        )]);
-      }
-      buttons.push([Markup.button.callback('✏️ Custom Amount', 'shop_custom_amount')]);
-    }
-
-    buttons.push([Markup.button.callback('⬅️ Back', 'shop_back')]);
-
-    await ctx.editMessageText(
-      `🛒 *${md(product.name)}*\n\n` +
-      `${product.in_stock ? '✅ In Stock' : '❌ Out of Stock'}\n` +
-      `Country: ${product.country || 'Nigeria'}\n` +
-      `Currency: ${product.currency}\n\n` +
-      `Choose an amount:`,
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
-    );
-  } catch (err) {
-    console.error('[Shop] Product fetch error:', err);
-    await ctx.editMessageText(
-      '❌ Could not load product details. Please try again.',
-      Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'shop_back')]])
-    );
-  }
-});
-
-// ─── Package selection ───
-bot.action(/shop_pkg:(.+)/, async (ctx) => {
-  const packageId = ctx.match[1];
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-
-  if (!session.shopData) return;
-
-  // Find package details from cache
-  const products = await getCachedProducts('NG');
-  const product = products.find((p: any) => p.id === session.shopData!.productId);
-  const pkg = product?.packages?.find((p: any) => p.package_id === packageId);
-
-  session.shopData.packageId = packageId;
-  session.shopData.amount = typeof pkg?.value === 'string' ? parseFloat(pkg.value) || 0 : (pkg?.value || 0);
-  session.shopData.currency = pkg?.currency || product?.currency || 'NGN';
-
-  await askForPhoneNumber(ctx, userId);
-});
-
-// ─── Amount selection ───
-bot.action(/shop_amount:(.+)/, async (ctx) => {
-  const amount = parseFloat(ctx.match[1]);
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-
-  if (!session.shopData) return;
-
-  session.shopData.amount = amount;
-
-  const products = await getCachedProducts('NG');
-  const product = products.find((p: any) => p.id === session.shopData!.productId);
-  session.shopData.currency = product?.currency || 'NGN';
-
-  await askForPhoneNumber(ctx, userId);
-});
-
-// ─── Custom amount ───
-bot.action('shop_custom_amount', async (ctx) => {
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-
-  if (!session.shopData) return;
-
-  session.state = ConversationState.AWAITING_SHOP_AMOUNT;
-
-  await ctx.editMessageText(
-    `🛒 *${session.shopData.productName}*\n\n` +
-    `Enter the amount you want to buy (in ${session.shopData.currency || 'NGN'}):`,
-    { parse_mode: 'Markdown' }
-  );
-});
-
-// ─── Handle custom amount text input ───
-bot.use(async (ctx, next) => {
-  if (!ctx.message || !('text' in ctx.message)) return next();
-
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-
-  if (session.state === ConversationState.AWAITING_SHOP_AMOUNT) {
-    const text = ctx.message.text.trim().replace(/,/g, '');
-    const amount = parseFloat(text);
-
-    if (isNaN(amount) || amount <= 0) {
-      await ctx.reply('❌ Please enter a valid amount.', mainMenu);
-      return;
-    }
-
-    session.shopData!.amount = amount;
-    session.state = ConversationState.IDLE;
-
-    const products = await getCachedProducts('NG');
-    const product = products.find((p: any) => p.id === session.shopData!.productId);
-    session.shopData!.currency = product?.currency || 'NGN';
-
-    await askForPhoneNumber(ctx, userId);
-    return;
-  }
-
-  return next();
-});
-
-// ─── Ask for phone number ───
-async function askForPhoneNumber(ctx: ZendContext, userId: string) {
-  const session = getSession(userId);
-  session.state = ConversationState.AWAITING_SHOP_PHONE;
-
-  const isAirtime = session.shopData?.category === 'refill' ||
-                    session.shopData?.productName?.toLowerCase().includes('mtn') ||
-                    session.shopData?.productName?.toLowerCase().includes('airtel');
-
-  await ctx.reply(
-    `🛒 *${session.shopData!.productName}*\n\n` +
-    `Amount: *${session.shopData!.currency} ${session.shopData!.amount!.toLocaleString()}*\n\n` +
-    `${isAirtime ? '📱 Enter the phone number to recharge:' : '📧 Enter your email (optional) or type "skip":'}`,
-    { parse_mode: 'Markdown', ...cancelKeyboard }
-  );
-}
-
-// ─── Handle phone number input ───
-bot.use(async (ctx, next) => {
-  if (!ctx.message || !('text' in ctx.message)) return next();
-
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-
-  if (session.state === ConversationState.AWAITING_SHOP_PHONE) {
-    const text = ctx.message.text.trim();
-
-    if (text === '❌ Cancel') {
-      session.state = ConversationState.IDLE;
-      session.shopData = undefined;
-      await ctx.reply('❌ Order cancelled.', mainMenu);
-      return;
-    }
-
-    // Simple phone validation for Nigeria
-    const phoneRegex = /^\+?234\d{10}$|^0\d{10}$/;
-    const isAirtime = session.shopData?.category === 'refill' ||
-                      session.shopData?.productName?.toLowerCase().includes('mtn') ||
-                      session.shopData?.productName?.toLowerCase().includes('airtel');
-
-    if (isAirtime && !phoneRegex.test(text)) {
-      await ctx.reply(
-        '❌ Please enter a valid Nigerian phone number.\n\n' +
-        'Examples: `+2348012345678` or `08012345678`',
-        { parse_mode: 'Markdown', ...cancelKeyboard }
-      );
-      return;
-    }
-
-    session.shopData!.phoneNumber = text;
-    session.state = ConversationState.IDLE;
-
-    await showShopConfirm(ctx, userId);
-    return;
-  }
-
-  return next();
-});
-
-// ─── Show order confirmation ───
-async function showShopConfirm(ctx: ZendContext, userId: string) {
-  const session = getSession(userId);
-  const sd = session.shopData!;
-
-  await ctx.reply('⏳ Calculating price...');
-
-  try {
-    const cachedProducts = await getCachedProducts('NG');
-    const product = cachedProducts.find((p: any) => p.id === sd.productId);
-    const pkg = product?.packages?.find((p: any) => p.value === sd.amount);
-
-    // Calculate BitRefill price in USD
-    let bitrefillPriceUsd = 0;
-    if (pkg) {
-      const isNgnPrice = pkg.price_currency === 'NGN' || product.currency === 'NGN';
-      if (isNgnPrice) {
-        // Convert NGN price to USD using live PAJ rate
-        let ngnRate = 1550;
-        try {
-          const rates = await getPAJRates();
-          ngnRate = rates.offRampRate;
-        } catch { /* use fallback */ }
-        bitrefillPriceUsd = pkg.price / ngnRate;
-      } else {
-        bitrefillPriceUsd = pkg.price;
-      }
-    } else if (product?.range && sd.amount) {
-      // Estimate: use amount as proxy for USD (NGN is ~1600:1, but BitRefill might price differently)
-      // For variable products, we'll need to create an invoice to get exact price
-      let ngnRate = 1600;
-      try {
-        const rates = await getPAJRates();
-        ngnRate = rates.offRampRate;
-      } catch { /* use fallback */ }
-      bitrefillPriceUsd = sd.amount / ngnRate;
-    }
-
-    // Add Zend margin
-    const marginMultiplier = 1 + BITREFILL_MARKUP_BPS / 10000;
-    const totalUsdt = bitrefillPriceUsd * marginMultiplier;
-
-    sd.bitrefillPriceUsd = bitrefillPriceUsd;
-    sd.totalUsdt = totalUsdt;
-
-    const canUseBalance = !!bitrefillBusinessClient && !!ZEND_TREASURY_WALLET;
-
-    const buttons: any[] = [];
-    if (canUseBalance) {
-      buttons.push([Markup.button.callback(`✅ Pay $${totalUsdt.toFixed(2)} USDT`, 'shop_pay_balance')]);
-    }
-    buttons.push([Markup.button.callback('💳 Pay with Crypto (External)', 'shop_pay_crypto')]);
-    buttons.push([Markup.button.callback('❌ Cancel', 'shop_cancel')]);
-
-    await ctx.reply(
-      `🧾 *Order Summary*\n\n` +
-      `Product: ${sd.productName}\n` +
-      `Amount: ${sd.currency} ${sd.amount?.toLocaleString()}\n` +
-      `${sd.phoneNumber ? `Phone: \`${sd.phoneNumber}\`\n` : ''}` +
-      `\n` +
-      `Base Price: ~$${bitrefillPriceUsd.toFixed(2)} USDT\n` +
-      `Zend Fee (${(BITREFILL_MARKUP_BPS / 100).toFixed(2)}%): ~$${(totalUsdt - bitrefillPriceUsd).toFixed(4)} USDT\n` +
-      `*Total: $${totalUsdt.toFixed(2)} USDT*\n\n` +
-      `${canUseBalance
-        ? 'Pay instantly from your Zend balance — no external wallet needed.'
-        : 'Pay directly with your crypto wallet.'}`,
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
-    );
-  } catch (err: any) {
-    console.error('[Shop] Confirm error:', err);
-    await ctx.reply('❌ Could not calculate price. Please try again.', mainMenu);
-    session.shopData = undefined;
-  }
-}
-
-// ─── Pay with Zend Balance (Phase 2) ───
-bot.action('shop_pay_balance', async (ctx) => {
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-  const sd = session.shopData;
-
-  if (!sd || !bitrefillBusinessClient || !ZEND_TREASURY_WALLET) {
-    await ctx.answerCbQuery('Not available');
-    return;
-  }
-
-  await ctx.answerCbQuery('Processing...');
-  await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
-
-  try {
-    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-    if (!user.length) {
-      await ctx.reply('❌ User not found.', mainMenu);
-      session.shopData = undefined;
-      return;
-    }
-
-    const walletAddress = user[0].walletAddress;
-
-    // Check USDT balance
-    const usdtBalance = await walletService.getTokenBalance(walletAddress, SOLANA_TOKENS.USDT.mint);
-    if (usdtBalance < (sd.totalUsdt || 0)) {
-      await ctx.reply(
-        `❌ *Insufficient Balance*\n\n` +
-        `You need *$${(sd.totalUsdt || 0).toFixed(2)} USDT* but only have *$${usdtBalance.toFixed(2)} USDT*.\n\n` +
-        `Tap 💵 *Add Naira* or 📥 *Receive* to top up.`,
-        { parse_mode: 'Markdown', ...mainMenu }
-      );
-      session.shopData = undefined;
-      return;
-    }
-
-    // Check SOL for gas
-    const hasGas = await walletService.hasEnoughSolForGas(walletAddress, MIN_SOL_FOR_GAS);
-    if (!hasGas) {
-      const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
-      await walletService.sendSol(devKeypair, walletAddress, MIN_SOL_FOR_GAS);
-      console.log('[Gas] Funded SOL for shop purchase');
-    }
-
-    // ─── Step 1: Create BitRefill invoice FIRST (don't charge user yet)
-    await ctx.reply('⏳ Creating order with BitRefill...');
-
-    const products: any[] = [{
-      product_id: sd.productId,
-      quantity: 1,
-    }];
-
-    // Use package_id if user selected a package (data bundles)
-    if (sd.packageId) {
-      products[0].package_id = sd.packageId;
-    } else if (sd.amount && sd.amount > 0) {
-      // For value-based products (airtime) or custom amounts
-      products[0].value = sd.amount;
-    }
-
-    // Fallback: try to match package by value for legacy sessions
-    if (!products[0].package_id && !products[0].value) {
-      const cachedProducts = await getCachedProducts('NG');
-      const product = cachedProducts.find((p: any) => p.id === sd.productId);
-      const pkg = product?.packages?.find((p: any) => String(p.value) === String(sd.amount));
-      if (pkg) {
-        products[0].package_id = pkg.package_id;
-      } else if (sd.amount && sd.amount > 0) {
-        products[0].value = sd.amount;
-      }
-    }
-
-    if (sd.phoneNumber && sd.phoneNumber !== 'skip') {
-      products[0].phone_number = sd.phoneNumber;
-    }
-
-    const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || '';
-    const webhookUrl = webhookBaseUrl ? `${webhookBaseUrl.replace(/\/$/, '')}/webhooks/bitrefill` : undefined;
-
-    const invoice = await bitrefillBusinessClient.createInvoice({
-      products,
-      payment_method: 'balance',
-      auto_pay: false,
-      webhook_url: webhookUrl,
-      email: user[0]?.email || undefined,
-    });
-
-    console.log('[Shop] Invoice created:', invoice.id, 'status:', invoice.status);
-
-    // Save order immediately (pending)
-    await db.insert(bitrefillOrders).values({
-      userId,
-      bitrefillInvoiceId: invoice.id,
-      productId: sd.productId!,
-      productName: sd.productName!,
-      category: sd.category || 'refill',
-      amountFiat: String(sd.amount || 0),
-      currencyFiat: sd.currency,
-      amountCrypto: String(sd.totalUsdt || 0),
-      cryptoCurrency: 'USDT',
-      status: 'pending',
-      recipientPhone: sd.phoneNumber,
-      recipientEmail: user[0]?.email,
-      metadata: invoice,
-    });
-
-    // ─── Step 2: Ping BitRefill until invoice needs payment or fails ───
-    let checkedInvoice = invoice;
-    let attempts = 0;
-    const maxAttempts = 15;
-
-    while (attempts < maxAttempts) {
-      attempts++;
-      checkedInvoice = await bitrefillBusinessClient.getInvoice(invoice.id);
-      console.log(`[Shop] Poll ${attempts}: invoice ${invoice.id} status = ${checkedInvoice.status}`);
-
-      if (checkedInvoice.status === 'complete') {
-        // Already complete (rare but possible)
-        break;
-      }
-      if (checkedInvoice.status === 'failed') {
-        await db.update(bitrefillOrders)
-          .set({ status: 'failed', metadata: checkedInvoice })
-          .where(eq(bitrefillOrders.bitrefillInvoiceId, invoice.id));
-        throw new Error('BitRefill order failed');
-      }
-      if (checkedInvoice.status === 'unpaid') {
-        // Invoice is valid and awaiting payment — proceed
-        break;
-      }
-      // Wait 1.5s before next poll
-      await new Promise(r => setTimeout(r, 1500));
-    }
-
-    if (attempts >= maxAttempts && checkedInvoice.status !== 'complete' && checkedInvoice.status !== 'unpaid') {
-      await db.update(bitrefillOrders)
-        .set({ status: 'failed', metadata: checkedInvoice })
-        .where(eq(bitrefillOrders.bitrefillInvoiceId, invoice.id));
-      throw new Error('BitRefill invoice did not reach payable state');
-    }
-
-    // ─── Step 3: Charge user only after invoice is valid ───
-    const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
-    const keypair = Keypair.fromSecretKey(secretKey);
-
-    await ctx.reply('⏳ Sending USDT payment...');
-    const txHash = await walletService.sendUsdt(keypair, ZEND_TREASURY_WALLET, sd.totalUsdt || 0);
-    console.log('[Shop] USDT payment sent:', txHash);
-
-    // ─── Step 4: Pay the invoice with business balance ───
-    await ctx.reply('⏳ Fulfilling your order...');
-    await bitrefillBusinessClient.payInvoice(invoice.id);
-    console.log('[Shop] Invoice paid:', invoice.id);
-
-    // ─── Step 5: Poll until complete or failed ───
-    let finalInvoice = checkedInvoice;
-    let pollAttempts = 0;
-    const maxPollAttempts = 30;
-
-    while (pollAttempts < maxPollAttempts) {
-      pollAttempts++;
-      await new Promise(r => setTimeout(r, 2000));
-      finalInvoice = await bitrefillBusinessClient.getInvoice(invoice.id);
-      console.log(`[Shop] Post-pay poll ${pollAttempts}: status = ${finalInvoice.status}`);
-
-      if (finalInvoice.status === 'complete') {
-        break;
-      }
-      if (finalInvoice.status === 'failed') {
-        break;
-      }
-    }
-
-    // ─── Step 6: Deliver result ───
-    if (finalInvoice.status === 'complete' && finalInvoice.orders?.length) {
-      const orderId = finalInvoice.orders[0].id;
-      const order = await bitrefillBusinessClient.getOrder(orderId);
-
-      await db.update(bitrefillOrders)
-        .set({
-          status: 'complete',
-          codes: order.redemption_info ? [order.redemption_info] : [],
-          completedAt: new Date(),
-        })
-        .where(eq(bitrefillOrders.bitrefillInvoiceId, invoice.id));
-
-      const codeText = order.redemption_info
-        ? order.redemption_info.pin
-          ? `Code: \`${order.redemption_info.code}\`\nPin: \`${order.redemption_info.pin}\``
-          : `Code: \`${order.redemption_info.code}\``
-        : '✅ Your order has been fulfilled.';
-
-      await ctx.reply(
-        `🎉 *Order Complete!*\n\n` +
-        `${sd.productName}\n` +
-        `${sd.currency} ${sd.amount?.toLocaleString()}\n\n` +
-        `${codeText}\n\n` +
-        `Paid: $${(sd.totalUsdt || 0).toFixed(2)} USDT\n` +
-        `Ref: \`${invoice.id}\``,
-        { parse_mode: 'Markdown', ...mainMenu }
-      );
-    } else if (finalInvoice.status === 'failed') {
-      await db.update(bitrefillOrders)
-        .set({ status: 'failed', metadata: finalInvoice })
-        .where(eq(bitrefillOrders.bitrefillInvoiceId, invoice.id));
-
-      await ctx.reply(
-        `❌ *Order Failed*\n\n` +
-        `${sd.productName}\n` +
-        `Amount: ${sd.currency} ${sd.amount?.toLocaleString()}\n\n` +
-        `The payment was sent but BitRefill could not fulfil the order.\n` +
-        `Our team has been notified and will refund your USDT.\n` +
-        `Ref: \`${invoice.id}\``,
-        { parse_mode: 'Markdown', ...mainMenu }
-      );
-    } else {
-      // Still processing — webhook will handle completion
-      await ctx.reply(
-        `⏳ *Order Processing*\n\n` +
-        `${sd.productName}\n` +
-        `Amount: ${sd.currency} ${sd.amount?.toLocaleString()}\n\n` +
-        `Paid: $${(sd.totalUsdt || 0).toFixed(2)} USDT\n` +
-        `You'll receive a notification when it's ready.`,
-        { parse_mode: 'Markdown', ...mainMenu }
-      );
-    }
-
-    session.shopData = undefined;
-
-  } catch (err: any) {
-    console.error('[Shop] Balance payment failed:', err);
-    await ctx.reply(
-      `❌ *Payment Failed*\n\n` +
-      `Error: ${err.message || 'Unknown error'}\n\n` +
-      `If USDT was deducted, it will be refunded. Please try again.`,
-      { parse_mode: 'Markdown', ...mainMenu }
-    );
-    session.shopData = undefined;
-  }
-});
-
-// ─── Pay with Crypto (Phase 1 fallback) ───
-bot.action('shop_pay_crypto', async (ctx) => {
-  const userId = ctx.from!.id.toString();
-  await ctx.answerCbQuery('Creating invoice...');
-  await createBitRefillInvoice(ctx, userId);
-});
-
-// ─── Cancel order ───
-bot.action('shop_cancel', async (ctx) => {
-  const userId = ctx.from!.id.toString();
-  const session = getSession(userId);
-  session.shopData = undefined;
-  await ctx.answerCbQuery('Cancelled');
-  await ctx.editMessageText('❌ Order cancelled.');
-});
-
-// ─── Create invoice (Phase 1 — direct crypto payment) ───
-async function createBitRefillInvoice(ctx: ZendContext, userId: string) {
-  const session = getSession(userId);
-  const sd = session.shopData!;
-
-  const client = bitrefillClient || bitrefillBusinessClient;
-  if (!client) {
-    await ctx.reply('❌ Shop is not configured. Please try again later.', mainMenu);
-    return;
-  }
-
-  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-  const email = user[0]?.email || undefined;
-
-  await ctx.reply('⏳ Creating your invoice...');
-
-  try {
-    const products: any[] = [{
-      product_id: sd.productId,
-      quantity: 1,
-    }];
-
-    const cachedProducts = await getCachedProducts('NG');
-    const product = cachedProducts.find((p: any) => p.id === sd.productId);
-    const pkg = product?.packages?.find((p: any) => p.value === sd.amount);
-
-    if (pkg) {
-      products[0].package_id = pkg.package_id;
-    } else {
-      products[0].value = sd.amount;
-    }
-
-    if (sd.phoneNumber && sd.phoneNumber !== 'skip') {
-      products[0].phone_number = sd.phoneNumber;
-    }
-
-    const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || '';
-    const webhookUrl = webhookBaseUrl ? `${webhookBaseUrl.replace(/\/$/, '')}/webhooks/bitrefill` : undefined;
-
-    const invoice = await client.createInvoice({
-      products,
-      payment_method: 'bitcoin',
-      refund_address: user[0]?.walletAddress,
-      webhook_url: webhookUrl,
-      email,
-    });
-
-    await db.insert(bitrefillOrders).values({
-      userId,
-      bitrefillInvoiceId: invoice.id,
-      productId: sd.productId!,
-      productName: sd.productName!,
-      category: sd.category || 'refill',
-      amountFiat: String(sd.amount || 0),
-      currencyFiat: sd.currency,
-      status: 'pending',
-      recipientPhone: sd.phoneNumber,
-      recipientEmail: email,
-      paymentAddress: invoice.payment?.address,
-      paymentUri: invoice.payment?.BIP21,
-      cryptoCurrency: invoice.crypto_currency || invoice.payment?.currency,
-      amountCrypto: invoice.crypto_amount || invoice.payment?.amount,
-      metadata: invoice,
-    });
-
-    const paymentText = invoice.payment?.BIP21
-      ? `[Pay with Bitcoin](${invoice.payment.BIP21})`
-      : invoice.payment?.address
-        ? `Address: \`${invoice.payment.address}\``
-        : 'Payment details will be sent shortly.';
-
-    await ctx.reply(
-      `🧾 *Invoice Created*\n\n` +
-      `Product: ${sd.productName}\n` +
-      `Amount: ${sd.currency} ${sd.amount?.toLocaleString()}\n` +
-      `${sd.phoneNumber ? `Phone: \`${sd.phoneNumber}\`\n` : ''}` +
-      `\n` +
-      `*Payment Required:*\n` +
-      `Amount: ${invoice.crypto_amount || invoice.payment?.amount || '...'} ${invoice.crypto_currency || invoice.payment?.currency || 'BTC'}\n` +
-      `${paymentText}\n\n` +
-      `⏱️ Your order will be processed once payment is confirmed.\n` +
-      `You'll receive a notification here when it's ready.`,
-      { parse_mode: 'Markdown', ...mainMenu }
-    );
-
-    session.shopData = undefined;
-
-  } catch (err: any) {
-    console.error('[Shop] Invoice creation failed:', err);
-    await ctx.reply(
-      `❌ *Order Failed*\n\n` +
-      `Could not create invoice.\n` +
-      `Error: ${err.message || 'Unknown error'}\n\n` +
-      `Please try again later.`,
-      { parse_mode: 'Markdown', ...mainMenu }
-    );
-    session.shopData = undefined;
-  }
-}
-
-// ─── My Orders ───
-bot.action('shop_orders', async (ctx) => {
-  const userId = ctx.from!.id.toString();
-
-  await ctx.answerCbQuery('Loading orders...');
-
-  const orders = await db.select().from(bitrefillOrders)
-    .where(eq(bitrefillOrders.userId, userId))
-    .orderBy(bitrefillOrders.createdAt)
-    .limit(10);
-
-  if (!orders.length) {
-    await ctx.editMessageText(
-      '📦 *My Orders*\n\n' +
-      'You have no orders yet.\n\n' +
-      'Tap 🎁 *Shop* to get started!',
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
-        [Markup.button.callback('🎁 Go to Shop', 'shop_back')],
-      ]) }
-    );
-    return;
-  }
-
-  let msg = '📦 *My Orders*\n\n';
-  const buttons: any[] = [];
-
-  for (let i = 0; i < orders.length; i++) {
-    const o = orders[i];
-    const statusEmoji = o.status === 'complete' ? '✅' : o.status === 'pending' ? '⏳' : '❌';
-    msg += `${i + 1}. ${statusEmoji} *${o.productName}* — ${o.currencyFiat} ${o.amountFiat}\n`;
-    if (o.status === 'complete' && o.codes) {
-      buttons.push([Markup.button.callback(`📋 Copy ${o.productName} Code`, `shop_copy:${o.id}`)]);
-    }
-  }
-
-  buttons.push([Markup.button.callback('⬅️ Back to Shop', 'shop_back')]);
-
-  await ctx.editMessageText(msg, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
-});
-
-// ─── Copy code from order ───
-bot.action(/shop_copy:(.+)/, async (ctx) => {
-  const orderId = parseInt(ctx.match[1]);
-  const userId = ctx.from!.id.toString();
-
-  const orders = await db.select().from(bitrefillOrders)
-    .where(and(eq(bitrefillOrders.id, orderId), eq(bitrefillOrders.userId, userId)))
-    .limit(1);
-
-  if (!orders.length) {
-    await ctx.answerCbQuery('Order not found');
-    return;
-  }
-
-  const codes = orders[0].codes as any[];
-  if (!codes?.length) {
-    await ctx.answerCbQuery('No code available');
-    return;
-  }
-
-  const codeText = codes.map((c: any) => c.pin ? `${c.code} (Pin: ${c.pin})` : c.code).join('\n');
-
-  await ctx.reply(
-    `📋 *Your Code*\n\n` +
-    `${orders[0].productName}\n\n` +
-    `\`${codeText}\``,
-    { parse_mode: 'Markdown' }
-  );
-  await ctx.answerCbQuery('Code sent!');
-});
-
-// ─── Back button ───
-bot.action('shop_back', async (ctx) => {
-  await ctx.answerCbQuery();
-  await showShop(ctx);
 });
 
 // ─── Export key helper (called after PIN is verified) ───
@@ -3364,6 +2210,7 @@ async function buildBalanceMessage(userId: string): Promise<string | null> {
     let totalNgn = 0;
 
     for (const bal of balances) {
+      if (!AUDD_ENABLED && bal.symbol === 'AUDD') continue;
       let ngnEquiv = 0;
       if (bal.symbol === 'SOL') {
         ngnEquiv = bal.amount * solPrice * offRampRate;
@@ -3371,7 +2218,7 @@ async function buildBalanceMessage(userId: string): Promise<string | null> {
         ngnEquiv = bal.amount * offRampRate;
       }
       totalNgn += ngnEquiv;
-      const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : bal.symbol === 'AUDD' ? '🇦🇺' : '🟡';
+      const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : bal.symbol === 'AUDD' ? '🇦🇺' : bal.symbol === 'NEAR' ? '⚡' : '🟡';
       msg += `${emoji} *${bal.symbol}*  ${formatBalance(bal.amount, bal.symbol)}  (≈${formatNgn(ngnEquiv)})\n`;
     }
 
@@ -3465,6 +2312,11 @@ bot.action('add_naira_start', async (ctx) => {
 // ═════════════════════════════════════════════════════════════════════════════
 
 async function startAddAudd(ctx: ZendContext, userId: string) {
+  if (!AUDD_ENABLED) {
+    await ctx.reply('🇦🇺 AUDD is not available right now. Use *💵 Add Naira* or *📥 Receive* for USDT.', { parse_mode: 'Markdown', ...mainMenu });
+    return;
+  }
+
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
 
   if (user.length === 0) {
@@ -3715,7 +2567,7 @@ bot.on(message('text'), async (ctx, next) => {
     }
 
     const feeRateText = anyFunded
-      ? `1.5% (includes gas) capped at $3`
+      ? `max(${(ZEND_FEE_FUNDED_BPS / 100).toFixed(1)}%, gas cost + small fee)`
       : `1% capped at $2`;
 
     let summary =
@@ -3740,7 +2592,11 @@ bot.on(message('text'), async (ctx, next) => {
 
     // Require PIN if set
     if (user[0]?.transactionPin) {
-      setSession(userId, { state: ConversationState.AWAITING_PIN_VERIFY, pinVerifyAction: 'bulk_send', pendingTransaction: { bulkRecipients: recipients } as any });
+      setSession(userId, {
+        state: ConversationState.AWAITING_PIN_VERIFY,
+        pinVerifyAction: 'bulk_send',
+        pendingTransaction: { bulkRecipients: recipients } as any,
+      });
       await ctx.reply(
         `${summary}\n\n🔐 Enter your 4-digit PIN to confirm this bulk send:`,
         { parse_mode: 'Markdown', ...cancelKeyboard }
@@ -3833,7 +2689,7 @@ bot.on(message('text'), async (ctx, next) => {
   // ─── BRIDGE: AWAITING_BRIDGE_AMOUNT ───
   if (session.state === ConversationState.AWAITING_BRIDGE_AMOUNT) {
     const bd = session.bridgeData;
-    if (!bd) {
+    if (!bd || !bd.destinationAsset || !bd.destinationSymbol) {
       setSession(userId, { state: ConversationState.IDLE });
       await ctx.reply('❌ Session expired. Please start over.', mainMenu);
       return;
@@ -3845,12 +2701,12 @@ bot.on(message('text'), async (ctx, next) => {
       return;
     }
 
-    const decimals = TOKEN_DECIMALS[bd.sourceChain]?.[bd.token] || 6;
+    const decimals = NEAR_INTENTS_DECIMALS[bd.sourceChain]?.[bd.token] || 6;
     const baseAmount = Math.floor(amount * Math.pow(10, decimals)).toString();
 
-    const chainRails = getChainRailsClient();
-    if (!chainRails) {
-      await ctx.reply('❌ ChainRails not configured.', mainMenu);
+    const nearIntents = getNearIntentsClient();
+    if (!nearIntents) {
+      await ctx.reply('❌ NEAR Intents not configured.', mainMenu);
       setSession(userId, { state: ConversationState.IDLE });
       return;
     }
@@ -3863,47 +2719,20 @@ bot.on(message('text'), async (ctx, next) => {
     }
 
     try {
-      await ctx.reply('⏳ Generating deposit address...');
+      await ctx.reply('⏳ Generating deposit address via NEAR Intents...');
 
-      // Get quote for fee estimate
-      let quote: any = null;
-      try {
-        quote = await chainRails.getBestQuote({
-          tokenIn: bd.tokenIn,
-          tokenOut: TOKEN_ADDRESSES.SOLANA_MAINNET.USDT,
-          sourceChain: bd.sourceChain,
-          destinationChain: 'SOLANA_MAINNET',
-          amount: baseAmount,
-          amountSymbol: bd.token,
-          recipient: user[0].walletAddress,
-        });
-      } catch (quoteErr: any) {
-        console.log('[Bridge] Quote failed (non-critical):', quoteErr.message);
-      }
-
-      // Create intent with user-specified amount
-      console.log('[Bridge] Creating intent:', {
-        sourceChain: bd.sourceChain,
-        token: bd.token,
+      const quote = await nearIntents.getQuote({
+        originAsset: bd.assetId,
+        destinationAsset: bd.destinationAsset,
         amount: baseAmount,
         recipient: user[0].walletAddress,
       });
 
-      const intent = await chainRails.createIntent({
-        amount: baseAmount,
-        amountSymbol: bd.token,
-        tokenIn: bd.tokenIn,
-        sourceChain: bd.sourceChain,
-        destinationChain: 'SOLANA_MAINNET',
-        recipient: user[0].walletAddress,
-        metadata: {
-          userId,
-          telegramUserId: userId,
-          sourceChain: bd.sourceChain,
-          token: bd.token,
-          originalAmount: amount.toString(),
-        },
-      });
+      const depositAddress = quote.quote.depositAddress;
+      const amountOutFormatted = quote.quote.amountOutFormatted;
+      const feeLine = quote.quote.withdrawFee
+        ? `• Est. network fee: ~${quote.quote.withdrawFee}\n`
+        : '';
 
       // Record in DB
       const txId = generateTxId();
@@ -3912,46 +2741,40 @@ bot.on(message('text'), async (ctx, next) => {
         userId,
         type: 'crypto_receive',
         status: 'pending',
-        chainrailsIntentAddress: intent.intent_address,
+        nearIntentDepositAddress: depositAddress,
         recipientWalletAddress: user[0].walletAddress,
         fromAmount: amount.toString(),
-        fromMint: bd.tokenIn,
-        toMint: TOKEN_ADDRESSES.SOLANA_MAINNET.USDT,
+        fromMint: bd.assetId,
+        toMint: bd.destinationAsset,
       });
 
-      const chainDisplay = CHAIN_NAMES[bd.sourceChain] || bd.sourceChain;
-      await indexTransaction(userId, txId, `Received crypto from ${chainDisplay} bridge`, {
+      const chainDisplay = CHAIN_DISPLAY_NAMES[bd.sourceChain] || bd.sourceChain;
+      await indexTransaction(userId, txId, `Deposit from ${chainDisplay} via NEAR Intents`, {
         amount,
         chain: chainDisplay,
+        depositAddress,
       });
-      const tokenDecimals = TOKEN_DECIMALS[bd.sourceChain]?.[bd.token] || 6;
-      const actualFeeRaw = intent.fees_in_asset_token || intent.app_fee_in_asset_token;
-      const actualFee = actualFeeRaw ? (Number(actualFeeRaw) / Math.pow(10, tokenDecimals)).toFixed(6) : null;
-      const feeLine = actualFee
-        ? `• Fee: ~${actualFee} ${bd.token}\n`
-        : quote?.totalFeeFormatted
-          ? `• Est. fee: ~${quote.totalFeeFormatted} ${bd.token}\n`
-          : '';
 
       await ctx.reply(
-        `🌉 *Receive ${bd.token} from ${chainDisplay}*\n\n` +
+        `🌉 *Deposit ${bd.token} from ${chainDisplay}*\n\n` +
         `Send *${amount} ${bd.token}* to this address:\n\n` +
-        `${intent.intent_address}\n\n` +
+        `${depositAddress}\n\n` +
         `⚠️ *Important:*\n` +
         `• Only send ${bd.token} on ${chainDisplay}\n` +
-        `• You'll receive Dollars (USDT) in your Zend account\n` +
+        `• You'll receive ~${amountOutFormatted} ${bd.destinationSymbol} in your Zend account\n` +
         feeLine +
-        `• Expires: ${new Date(intent.expires_at).toLocaleString('en-NG')}\n\n` +
+        `• Expires: ${new Date(quote.quote.deadline).toLocaleString('en-NG')}\n\n` +
         `Reference: \`${txId}\``,
         { parse_mode: 'Markdown', ...mainMenu }
       );
       await ctx.reply('📋 Tap to copy the address:', Markup.inlineKeyboard([
-        [{ text: '📋 Copy Address', copy_text: { text: intent.intent_address } } as any]
+        [{ text: '📋 Copy Address', copy_text: { text: depositAddress } } as any]
       ]));
     } catch (err: any) {
       console.error('[Bridge] Failed:', err);
+      setSession(userId, { state: ConversationState.IDLE });
       await ctx.reply(
-        `❌ *Receive Error*\n\n` +
+        `❌ *Deposit Error*\n\n` +
         `Could not generate deposit address.\n` +
         `Error: ${err.message || 'Unknown error'}\n\n` +
         `Please try again later or contact support.`,
@@ -3960,6 +2783,143 @@ bot.on(message('text'), async (ctx, next) => {
     }
 
     setSession(userId, { state: ConversationState.IDLE });
+    return;
+  }
+
+  // ─── WITHDRAW: AWAITING_WITHDRAW_RECIPIENT ───
+  if (session.state === ConversationState.AWAITING_WITHDRAW_RECIPIENT) {
+    const wd = session.withdrawData;
+    if (!wd) {
+      setSession(userId, { state: ConversationState.IDLE });
+      await ctx.reply('❌ Session expired.', mainMenu);
+      return;
+    }
+
+    const recipientAddress = text.trim();
+    if (!validateChainAddress(wd.destChain, recipientAddress)) {
+      await ctx.reply(
+        `❌ Invalid address for ${formatChainName(wd.destChain)}.\nPlease check and try again.`,
+        cancelKeyboard
+      );
+      return;
+    }
+
+    setSession(userId, {
+      ...session,
+      state: ConversationState.AWAITING_WITHDRAW_AMOUNT,
+      withdrawData: { ...wd, recipientAddress },
+    });
+
+    await ctx.reply(
+      `📤 *Withdraw Preview*\n\n` +
+      `From: Zend *${wd.sourceSymbol}*\n` +
+      `To: *${formatChainName(wd.destChain)}* (${wd.destToken})\n` +
+      `Recipient: \`${recipientAddress}\`\n\n` +
+      `How much ${wd.sourceSymbol} do you want to send?\n` +
+      `Example: 10, 25, 50`,
+      { parse_mode: 'Markdown', ...cancelKeyboard }
+    );
+    return;
+  }
+
+  // ─── WITHDRAW: AWAITING_WITHDRAW_AMOUNT ───
+  if (session.state === ConversationState.AWAITING_WITHDRAW_AMOUNT) {
+    const wd = session.withdrawData;
+    if (!wd?.recipientAddress) {
+      setSession(userId, { state: ConversationState.IDLE });
+      await ctx.reply('❌ Session expired.', mainMenu);
+      return;
+    }
+
+    const amount = parseFloat(text.trim().replace(/,/g, ''));
+    if (isNaN(amount) || amount <= 0) {
+      await ctx.reply('❌ Please enter a valid amount.', cancelKeyboard);
+      return;
+    }
+
+    const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    if (user.length === 0) {
+      await ctx.reply('Please run /start first.', mainMenu);
+      return;
+    }
+
+    const balance = await walletService.getTokenBalance(
+      user[0].walletAddress,
+      SOLANA_TOKENS[wd.sourceSymbol].mint
+    );
+    if (balance < amount) {
+      await ctx.reply(
+        `❌ Insufficient balance.\nYou have ${balance.toFixed(2)} ${wd.sourceSymbol}, need ${amount}.`,
+        cancelKeyboard
+      );
+      return;
+    }
+
+    try {
+      await ctx.reply('⏳ Getting quote from NEAR Intents...');
+
+      const quote = await createWithdrawQuote({
+        sourceSymbol: wd.sourceSymbol,
+        amount,
+        destChain: wd.destChain,
+        destToken: wd.destToken,
+        destAssetId: wd.destAssetId,
+        recipientAddress: wd.recipientAddress,
+        refundWallet: user[0].walletAddress,
+      });
+
+      const depositAddress = quote.quote.depositAddress;
+      const amountOutFormatted = quote.quote.amountOutFormatted;
+      const txId = generateTxId();
+
+      await db.insert(transactions).values({
+        id: txId,
+        userId,
+        type: 'crypto_send',
+        status: 'pending',
+        nearIntentDepositAddress: depositAddress,
+        fromAmount: amount.toString(),
+        fromMint: SOLANA_ORIGIN_ASSETS[wd.sourceSymbol],
+        toMint: wd.destAssetId,
+        recipientWalletAddress: wd.recipientAddress,
+        metadata: { direction: 'withdraw', destChain: wd.destChain, destToken: wd.destToken },
+      });
+
+      setSession(userId, {
+        state: ConversationState.IDLE,
+        withdrawData: {
+          ...wd,
+          amount,
+          depositAddress,
+          txId,
+          amountOutFormatted,
+        },
+      });
+
+      await ctx.reply(
+        `📤 *Confirm Withdrawal*\n\n` +
+        `Send: *${amount} ${wd.sourceSymbol}*\n` +
+        `To: *${formatChainName(wd.destChain)}*\n` +
+        `Recipient: \`${wd.recipientAddress}\`\n` +
+        `They receive: ~${amountOutFormatted} ${wd.destToken}\n` +
+        (quote.quote.withdrawFee ? `Est. fee: ~${quote.quote.withdrawFee}\n` : '') +
+        `\nReference: \`${txId}\``,
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Confirm', 'confirm_withdraw')],
+            [Markup.button.callback('❌ Cancel', 'cancel_withdraw')],
+          ]),
+        }
+      );
+    } catch (err: any) {
+      console.error('[Withdraw] Quote failed:', err);
+      setSession(userId, { state: ConversationState.IDLE });
+      await ctx.reply(
+        `❌ Could not get withdrawal quote.\n${err.message || 'Try again later.'}`,
+        mainMenu
+      );
+    }
     return;
   }
 
@@ -4332,7 +3292,7 @@ bot.on(message('text'), async (ctx, next) => {
 
     let msg = `📤 Send ${formatNgn(amount)}\n` +
       `Rate: ${formatNgn(rate)} per Dollar\n` +
-      `Zend fee (${(feeInfo.feeBps / 100).toFixed(2)}%${feeInfo.willFundSol ? ' includes gas' : ''}): ~${feeInfo.zendFeeUsdt.toFixed(2)} USDT\n` +
+      `${formatSendFeeLabel(feeInfo)}\n` +
       `You pay: *${usdtNeeded.toFixed(2)} USDT*\n\n` +
       `Who should receive it?\n\n` +
       `Just tell me naturally — e.g. "Mark OPay 7082406410" or "send to Amaka at GTB 0123456789"`;
@@ -4534,19 +3494,37 @@ bot.on(message('text'), async (ctx, next) => {
     }
 
     if (session.billData?.type === 'data') {
-      // Fetch and show data plans
       const loading = await showLoading(ctx, 'Fetching data plans...');
       try {
-        const plans = await getDataPlans(session.billData.network!);
-        if (plans.length === 0) {
-          await finishLoading(ctx, loading.message_id, '❌ No data plans found.');
-          setSession(userId, { state: ConversationState.IDLE });
-          await ctx.reply('Menu:', mainMenu);
-          return;
+        let rows: ReturnType<typeof Markup.button.callback>[][] = [];
+        if (airbillsClient) {
+          let plans: Array<{ id: string; name: string; amount: number }> = [];
+          try {
+            plans = await airbillsClient.getPlans(session.billData.network!);
+          } catch {
+            plans = await airbillsClient.getPlans('data');
+          }
+          if (plans.length === 0) {
+            await finishLoading(ctx, loading.message_id, '❌ No data plans found for this network.');
+            setSession(userId, { state: ConversationState.IDLE });
+            await ctx.reply('Menu:', mainMenu);
+            return;
+          }
+          rows = plans.map((p) =>
+            [Markup.button.callback(`${p.name} — ₦${p.amount.toLocaleString()}`, `bill_plan_${p.id}_${p.amount}`)]
+          );
+        } else {
+          const plans = await getDataPlans(session.billData.network!);
+          if (plans.length === 0) {
+            await finishLoading(ctx, loading.message_id, '❌ No data plans found.');
+            setSession(userId, { state: ConversationState.IDLE });
+            await ctx.reply('Menu:', mainMenu);
+            return;
+          }
+          rows = plans.map((p: DataPlan) =>
+            [Markup.button.callback(`${p.name} — ₦${p.amount.toLocaleString()} (${p.validity})`, `bill_plan_${p.planCode}_${p.amount}`)]
+          );
         }
-        const rows = plans.map((p: DataPlan) =>
-          [Markup.button.callback(`${p.name} — ₦${p.amount.toLocaleString()} (${p.validity})`, `bill_plan_${p.planCode}_${p.amount}`)]
-        );
         await finishLoading(ctx, loading.message_id, `🌐 Select a data plan for ${session.billData.phone}:`);
         await ctx.reply('Choose a plan:', Markup.inlineKeyboard(rows));
         setSession(userId, session);
@@ -4845,7 +3823,7 @@ bot.on(message('text'), async (ctx, next) => {
           `Bank: ${md(parsed.bankName) || 'Solana'}\n` +
           `Account: \`${parsed.accountNumber || parsed.walletAddress}\`\n` +
           `Amount: ${formatNgn(parsed.amount)}\n` +
-          `Zend fee (${(feeInfo.feeBps / 100).toFixed(2)}%${feeInfo.willFundSol ? ' includes gas' : ''}): ~${feeInfo.zendFeeUsdt.toFixed(2)} USDT\n` +
+          `${formatSendFeeLabel(feeInfo)}\n` +
           `You pay: *${usdtNeeded.toFixed(2)} ${fromSymbol}*\n` +
           `Rate: ${formatNgn(rate)} per Dollar\n\n` +
           `Confirm?`;
@@ -4900,6 +3878,7 @@ bot.on(message('text'), async (ctx, next) => {
           let totalNgn = 0;
 
           for (const bal of balances) {
+            if (!AUDD_ENABLED && bal.symbol === 'AUDD') continue;
             let ngnEquiv = 0;
             if (bal.symbol === 'SOL') {
               ngnEquiv = bal.amount * solPrice * offRampRate;
@@ -4907,7 +3886,7 @@ bot.on(message('text'), async (ctx, next) => {
               ngnEquiv = bal.amount * offRampRate;
             }
             totalNgn += ngnEquiv;
-            const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : bal.symbol === 'AUDD' ? '🇦🇺' : '🟡';
+            const emoji = bal.symbol === 'SOL' ? '🔵' : bal.symbol === 'USDT' ? '🟢' : bal.symbol === 'AUDD' ? '🇦🇺' : bal.symbol === 'NEAR' ? '⚡' : '🟡';
             msg += `${emoji} *${bal.symbol}*  ${formatBalance(bal.amount, bal.symbol)}  (≈${formatNgn(ngnEquiv)})\n`;
           }
 
@@ -4992,17 +3971,34 @@ bot.on(message('text'), async (ctx, next) => {
     }
 
     const action = session.pinVerifyAction;
-    setSession(userId, { state: ConversationState.IDLE });
+    const savedPendingTx = session.pendingTransaction;
+    const savedWithdrawData = session.withdrawData;
 
-    if (action === 'send') {
-      const pt = session.pendingTransaction;
-      if (!pt) {
+    if (action === 'swap') {
+      const pt = savedPendingTx;
+      if (!pt || !pt.swapQuote) {
+        setSession(userId, { state: ConversationState.IDLE });
         await ctx.reply('❌ Session expired. Please start over.', mainMenu);
         return;
       }
+      setSession(userId, { state: ConversationState.IDLE, pendingTransaction: pt });
+      await executeSwap(ctx, userId, pt);
+    } else if (action === 'export') {
+      setSession(userId, { state: ConversationState.IDLE });
+      await doExportKey(ctx, userId);
+    } else if (action === 'withdraw') {
+      setSession(userId, { state: ConversationState.IDLE, withdrawData: savedWithdrawData });
+      await executeNearIntentWithdraw(ctx, userId);
+    } else if (action === 'send') {
+      const pt = savedPendingTx;
+      if (!pt?.amountNgn || !pt.amountUsdt) {
+        await ctx.reply('❌ Session expired. Please start over.', mainMenu);
+        return;
+      }
+      setSession(userId, { state: ConversationState.IDLE, pendingTransaction: pt });
       await executeSend(ctx, userId, {
-        amountNgn: pt.amountNgn!,
-        amountUsdt: pt.amountUsdt!,
+        amountNgn: pt.amountNgn,
+        amountUsdt: pt.amountUsdt,
         ngnRate: pt.ngnRate,
         zendFeeUsdt: pt.zendFeeUsdt,
         feeSol: pt.feeSol,
@@ -5013,43 +4009,40 @@ bot.on(message('text'), async (ctx, next) => {
         recipientAccountName: pt.recipientAccountName,
         recipientName: pt.recipientName,
       });
-    } else if (action === 'swap') {
-      const pt = session.pendingTransaction;
-      if (!pt || !pt.swapQuote) {
+    } else if (action === 'bulk_send') {
+      const recipients = (savedPendingTx as any)?.bulkRecipients as Array<{
+        amountNgn: number; bankCode: string; bankName: string; accountNumber: string; accountName: string;
+      }> | undefined;
+      if (!recipients?.length) {
+        setSession(userId, { state: ConversationState.IDLE });
         await ctx.reply('❌ Session expired. Please start over.', mainMenu);
         return;
       }
-      // Re-use confirm_swap logic inline since we need the session
-      await executeSwap(ctx, userId, pt);
-    } else if (action === 'export') {
-      await doExportKey(ctx, userId);
+      setSession(userId, { state: ConversationState.IDLE });
+      await executeBulkSend(ctx, userId, recipients);
     } else if (action === 'schedule') {
       const sd = session.scheduleData;
-      if (!sd || !sd.startAt) {
+      const startAt = sd?.startAt;
+      if (!sd?.amountNgn || !startAt) {
+        setSession(userId, { state: ConversationState.IDLE });
         await ctx.reply('❌ Session expired. Please start over.', mainMenu);
         return;
       }
-      await saveScheduledTransfer(userId, sd, sd.startAt);
+      setSession(userId, { state: ConversationState.IDLE });
+      await saveScheduledTransfer(userId, sd, startAt);
       await ctx.reply(
         `✅ *Scheduled Transfer Created!*\n\n` +
-        `To: ${md(sd.recipientName)}\n` +
-        `Bank: ${md(sd.bankName)}\n` +
+        `To: ${md(sd.recipientName || 'Recipient')}\n` +
+        `Bank: ${md(sd.bankName || '')}\n` +
         `Account: \`${sd.accountNumber}\`\n` +
-        `Amount: ${formatNgn(sd.amountNgn!)}\n` +
+        `Amount: ${formatNgn(sd.amountNgn)}\n` +
         `Frequency: ${sd.frequency}\n` +
-        `Starts: ${sd.startAt.toLocaleDateString('en-NG')}\n\n` +
+        `Starts: ${startAt.toLocaleDateString('en-NG')}\n\n` +
         `Use *📅 Schedule* to view or cancel.`,
         { parse_mode: 'Markdown', ...mainMenu }
       );
-    } else if (action === 'bulk_send') {
-      const pt = session.pendingTransaction;
-      const recipients = (pt as any)?.bulkRecipients as Array<{ amountNgn: number; bankCode: string; bankName: string; accountNumber: string; accountName: string }> | undefined;
-      if (!recipients || recipients.length === 0) {
-        await ctx.reply('❌ Session expired. Please start over.', mainMenu);
-        return;
-      }
-      await executeBulkSend(ctx, userId, recipients);
     } else {
+      setSession(userId, { state: ConversationState.IDLE });
       await ctx.reply('✅ PIN verified.', mainMenu);
     }
     return;
@@ -5205,11 +4198,15 @@ bot.on(message('text'), async (ctx, next) => {
     // Check if PIN is required
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     if (user.length > 0 && user[0].transactionPin) {
-      setSession(userId, { ...session, state: ConversationState.AWAITING_PIN_VERIFY, pinVerifyAction: 'schedule' });
+      setSession(userId, {
+        state: ConversationState.AWAITING_PIN_VERIFY,
+        pinVerifyAction: 'schedule',
+        scheduleData: sd,
+      });
       const pinMsg = await ctx.reply(
         `🔐 *Security Check*\n\n` +
         `Enter your 4-digit PIN to confirm this scheduled transfer:`,
-        cancelKeyboard
+        { parse_mode: 'Markdown', ...cancelKeyboard }
       );
       getSession(userId).lastBotMessageId = pinMsg.message_id;
       return;
@@ -5669,6 +4666,10 @@ async function showVirtualAccount(
   }
 
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  if (!user.length || !user[0].walletAddress) {
+    await ctx.reply('❌ User profile incomplete. Please run /start.', mainMenu);
+    return;
+  }
   const walletAddress = user[0].walletAddress;
 
   // Use provided amount or default to minimum
@@ -5703,7 +4704,7 @@ async function showVirtualAccount(
       fiatAmount,
       currency: Currency.NGN,
       recipient: walletAddress,
-      mint: SOLANA_TOKENS.USDT.mint,
+      mint: targetToken === 'AUDD' ? SOLANA_TOKENS.AUDD.mint : SOLANA_TOKENS.USDT.mint,
       chain: Chain.SOLANA,
       webhookURL: webhookUrl,
     }, sessionToken);
@@ -5726,6 +4727,7 @@ async function showVirtualAccount(
     console.log('[PAJ] Virtual account created:', order.accountNumber, 'for ₦', fiatAmount, 'bank:', order.bank, 'name:', order.accountName, 'orderId:', order.id, 'fullOrder:', JSON.stringify(order));
   } catch (err: any) {
     console.error('[PAJ] createOnramp failed:', err);
+    console.error('[PAJ] createOnramp error details:', err.response?.data || err.body || 'No extra details');
     if (isPajSessionError(err)) {
       await clearPajSession(userId);
       await finishLoading(ctx, loadingVA.message_id, '⚠️ Your PAJ session expired. Please re-link in Settings.');
@@ -5799,18 +4801,31 @@ bot.hears('📤 Send', async (ctx) => {
     return;
   }
 
-  // Ask which token to send from
+  if (AUDD_ENABLED) {
+    await ctx.reply(
+      `📤 *Send Money*\n\n` +
+      `Send from which balance?`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('USDT', 'send_token:USDT')],
+          [Markup.button.callback('AUDD', 'send_token:AUDD')],
+          [Markup.button.callback('❌ Cancel', 'cancel_send')],
+        ]),
+      }
+    );
+    return;
+  }
+
+  setSession(userId, {
+    state: ConversationState.AWAITING_SEND_AMOUNT,
+    pendingTransaction: { fromMint: SOLANA_TOKENS.USDT.mint },
+  });
   await ctx.reply(
     `📤 *Send Money*\n\n` +
-    `Send from which balance?`,
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('USDT', 'send_token:USDT')],
-        [Markup.button.callback('AUDD', 'send_token:AUDD')],
-        [Markup.button.callback('❌ Cancel', 'cancel_send')],
-      ]),
-    }
+    `How much do you want to send? (in Naira)\n\n` +
+    `Examples: 50000, 100000, 5000`,
+    { parse_mode: 'Markdown', ...cancelKeyboard }
   );
 });
 
@@ -5818,6 +4833,13 @@ bot.action(/send_token:([A-Z]+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from!.id.toString();
   const tokenSymbol = ctx.match[1];
+
+  if (!AUDD_ENABLED && tokenSymbol === 'AUDD') {
+    await ctx.editMessageText('❌ AUDD sends are not available right now.');
+    await ctx.reply('Menu:', mainMenu);
+    return;
+  }
+
   const token = Object.values(SOLANA_TOKENS).find(t => t.symbol === tokenSymbol);
 
   if (!token) {
@@ -6440,7 +5462,10 @@ async function prepareSendConfirmation(
 
   // ─── Calculate fee based on SOL balance ───
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-  let feeInfo = { zendFeeUsdt: 0, feeSol: 0, feeBps: 100, willFundSol: false };
+  let feeInfo: SendFeeInfo = {
+    zendFeeUsdt: 0, feeSol: 0, feeBps: 100, willFundSol: false,
+    transferUsdt, totalUsdt: transferUsdt,
+  };
   if (user[0]?.walletAddress) {
     feeInfo = await calculateSendFee(transferUsdt, user[0].walletAddress, userId);
   }
@@ -6451,9 +5476,17 @@ async function prepareSendConfirmation(
   if (user[0]?.walletAddress) {
     const tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, selectedMint);
     const solBalance = await walletService.getSolBalance(user[0].walletAddress);
-    if (selectedMint === SOLANA_TOKENS.AUDD.mint) {
-      // For AUDD, just check they have some — actual swap check happens in executeSendCore
-      if (tokenBalance <= 0) {
+    const balanceCheck = checkSendBalance({
+      tokenBalance,
+      solBalance,
+      transferUsdt,
+      zendFeeUsdt,
+      willFundSol,
+      isAudd: selectedMint === SOLANA_TOKENS.AUDD.mint,
+    });
+
+    if (!balanceCheck.ok) {
+      if (balanceCheck.error === 'no_audd') {
         await ctx.reply(
           `❌ *No AUDD Balance*\n\n` +
           `You don't have any AUDD to send.\n\n` +
@@ -6462,29 +5495,28 @@ async function prepareSendConfirmation(
         );
         return;
       }
-    } else if (tokenBalance < transferUsdt) {
-      const shortfall = transferUsdt - tokenBalance;
-      await ctx.reply(
-        `❌ *Insufficient Balance*\n\n` +
-        `You want to send ${formatNgn(amountNgn)}\n` +
-        `You need: *${transferUsdt.toFixed(2)} ${selectedSymbol}*\n` +
-        `You have: *${tokenBalance.toFixed(2)} ${selectedSymbol}*\n` +
-        `Short by: *${shortfall.toFixed(2)} ${selectedSymbol}*\n\n` +
-        `Add more Dollars to your wallet or send a smaller amount.`,
-        { parse_mode: 'Markdown', ...mainMenu }
-      );
-      return;
-    }
-    if (!willFundSol && solBalance < MIN_SOL_FOR_GAS) {
-      // This shouldn't happen if calculateSendFee is correct, but guard anyway
-      await ctx.reply(
-        `❌ *Insufficient SOL for gas*\n\n` +
-        `Gas: ~${MIN_SOL_FOR_GAS} SOL\n` +
-        `You have: ${solBalance.toFixed(6)} SOL\n\n` +
-        `Top up your SOL balance first.`,
-        { parse_mode: 'Markdown', ...mainMenu }
-      );
-      return;
+      if (balanceCheck.error === 'insufficient_token') {
+        await ctx.reply(
+          `❌ *Insufficient Balance*\n\n` +
+          `You want to send ${formatNgn(amountNgn)}\n` +
+          `You need: *${balanceCheck.usdtNeeded.toFixed(2)} ${selectedSymbol}* (incl. ${zendFeeUsdt.toFixed(2)} fee)\n` +
+          `You have: *${tokenBalance.toFixed(2)} ${selectedSymbol}*\n` +
+          `Short by: *${balanceCheck.shortfall!.toFixed(2)} ${selectedSymbol}*\n\n` +
+          `Add more Dollars to your wallet or send a smaller amount.`,
+          { parse_mode: 'Markdown', ...mainMenu }
+        );
+        return;
+      }
+      if (balanceCheck.error === 'insufficient_sol') {
+        await ctx.reply(
+          `❌ *Insufficient SOL for gas*\n\n` +
+          `Gas: ~${MIN_SOL_FOR_GAS} SOL\n` +
+          `You have: ${solBalance.toFixed(6)} SOL\n\n` +
+          `Top up your SOL balance first.`,
+          { parse_mode: 'Markdown', ...mainMenu }
+        );
+        return;
+      }
     }
   }
 
@@ -6536,7 +5568,7 @@ async function prepareSendConfirmation(
     `Bank: ${md(bankName)}\n` +
     `Account: \`${recipientAccountNumber}\`\n` +
     `Amount: ${formatNgn(amountNgn)}\n` +
-    `Zend fee (${(feeBps / 100).toFixed(2)}%${willFundSol ? ' includes gas' : ''}): ~${zendFeeUsdt.toFixed(2)} USDT\n` +
+    `${formatSendFeeLabel({ zendFeeUsdt, feeBps, willFundSol, gasCostUsdt: feeInfo.gasCostUsdt, extraFeeUsdt: feeInfo.extraFeeUsdt, feeSol, feeMode: feeInfo.feeMode, percentageFeeUsdt: feeInfo.percentageFeeUsdt })}\n` +
     `You pay: *${usdtNeeded.toFixed(2)} ${selectedSymbol}*\n` +
     `Rate: ${formatNgn(rate)} per Dollar\n\n` +
     `Confirm?`;
@@ -6579,10 +5611,6 @@ bot.action(/nlp_bank:(.+)/, async (ctx) => {
 // 💴 CASH OUT (alias for Send)
 // ═════════════════════════════════════════════════════════════════════════════
 
-bot.hears('🛒 Shop', async (ctx) => {
-  await showShop(ctx);
-});
-
 bot.hears('💴 Cash Out', async (ctx) => {
   if (isGroupChat(ctx)) {
     await promptPrivateChat(ctx, 'cash out');
@@ -6614,14 +5642,54 @@ async function showReceive(ctx: ZendContext, userId: string) {
   }
 
   const walletAddress = user[0].walletAddress;
-  const virtualAccount = user[0].virtualAccount as any;
+  let virtualAccount = user[0].virtualAccount as any;
+
+  // Always generate a fresh virtual account on Receive if PAJ is linked
+  const hasPajSession = user[0]?.pajSessionToken && user[0]?.pajSessionExpiresAt && new Date(user[0].pajSessionExpiresAt) > new Date();
+  if (hasPajSession) {
+    const pajClient = await getPAJClient();
+    if (pajClient) {
+      try {
+        const order = await pajClient.createOnramp({
+          fiatAmount: PAJ_MIN_DEPOSIT_NGN,
+          currency: Currency.NGN,
+          recipient: walletAddress,
+          mint: SOLANA_TOKENS.USDT.mint,
+          chain: Chain.SOLANA,
+          webhookURL: process.env.WEBHOOK_BASE_URL
+            ? `${process.env.WEBHOOK_BASE_URL.replace(/\/$/, '')}/webhooks/paj`
+            : 'https://example.com/webhook',
+        }, user[0].pajSessionToken!);
+
+        virtualAccount = {
+          bankCode: 'WEM',
+          bankName: order.bank,
+          accountNumber: order.accountNumber,
+          accountName: order.accountName,
+          orderId: order.id,
+          amount: PAJ_MIN_DEPOSIT_NGN,
+          createdAt: new Date().toISOString(),
+        };
+
+        await db.update(users)
+          .set({ virtualAccount })
+          .where(eq(users.id, userId));
+
+        console.log('[PAJ] Fresh VA generated on Receive:', order.accountNumber);
+      } catch (err: any) {
+        console.error('[PAJ] Refresh VA on Receive failed:', err);
+        // Fall back to the cached virtual account (if any)
+      }
+    }
+  }
+
   const hasVA = virtualAccount?.accountNumber;
 
   let msg = `📥 *Receive Money*\n\n`;
   msg += `Choose how you want to get paid:\n\n`;
 
   msg += `*🪙 Crypto*\n`;
-  msg += `Send Dollars (USDT/USDC), AUDD or SOL to:\n`;
+  msg += `Send Dollars (USDT/USDC)${AUDD_ENABLED ? ', AUDD' : ''} or SOL to:\n`;
   msg += `${walletAddress}\n\n`;
 
   if (hasVA) {
@@ -6649,8 +5717,11 @@ async function showReceive(ctx: ZendContext, userId: string) {
   } else {
     kbRows.push([Markup.button.callback('💵 Add Naira', 'add_naira_start')]);
   }
-  kbRows.push([Markup.button.callback('🇦🇺 Add AUDD', 'add_aud_start')]);
+  if (AUDD_ENABLED) {
+    kbRows.push([Markup.button.callback('🇦🇺 Add AUDD', 'add_aud_start')]);
+  }
   kbRows.push([Markup.button.callback('🌉 Receive from Other Apps', 'bridge_start')]);
+  kbRows.push([Markup.button.callback('📤 Send to Other Apps', 'withdraw_start')]);
 
   await ctx.reply(msg, {
     parse_mode: 'Markdown',
@@ -6672,7 +5743,25 @@ bot.action('bridge_start', async (ctx) => {
 // ═════════════════════════════════════════════════════════════════════════════
 
 import { getSwapQuote, buildSwapTransaction, SWAP_TOKENS, getTokenBySymbol, formatTokenAmount } from './services/jupiter.js';
-import { getChainRailsClient, TOKEN_ADDRESSES, CHAIN_NAMES } from '@zend/chainrails-client';
+import { getNearIntentsClient, type NearIntentsQuote } from '@zend/near-intents-client';
+import {
+  verifyPajWebhookSignature,
+  normalizePajWebhookEvent,
+  webhookEventKey,
+  isDuplicateWebhook,
+  markWebhookProcessed,
+} from './utils/paj-webhook.js';
+import {
+  DEPOSIT_CHAINS,
+  WITHDRAW_CHAINS,
+  SOLANA_DEST_ASSETS,
+  SOLANA_ORIGIN_ASSETS,
+  createWithdrawQuote,
+  fundNearIntentDeposit,
+  getDestinationAssetId,
+  validateChainAddress,
+  formatChainName,
+} from './services/near-intents-flow.js';
 
 async function showSwapMenu(ctx: ZendContext, userId: string) {
   await ctx.reply(
@@ -6685,10 +5774,18 @@ async function showSwapMenu(ctx: ZendContext, userId: string) {
         [Markup.button.callback('SOL → USDT', 'swap:SOL:USDT')],
         [Markup.button.callback('USDC → USDT', 'swap:USDC:USDT')],
         [Markup.button.callback('USDT → SOL', 'swap:USDT:SOL')],
-        [Markup.button.callback('SOL → AUDD', 'swap:SOL:AUDD')],
-        [Markup.button.callback('AUDD → SOL', 'swap:AUDD:SOL')],
-        [Markup.button.callback('USDT → AUDD', 'swap:USDT:AUDD')],
-        [Markup.button.callback('AUDD → USDT', 'swap:AUDD:USDT')],
+        ...(AUDD_ENABLED
+          ? [
+              [Markup.button.callback('SOL → AUDD', 'swap:SOL:AUDD')],
+              [Markup.button.callback('AUDD → SOL', 'swap:AUDD:SOL')],
+              [Markup.button.callback('USDT → AUDD', 'swap:USDT:AUDD')],
+              [Markup.button.callback('AUDD → USDT', 'swap:AUDD:USDT')],
+            ]
+          : []),
+        [Markup.button.callback('NEAR → USDT', 'swap:NEAR:USDT')],
+        [Markup.button.callback('USDT → NEAR', 'swap:USDT:NEAR')],
+        [Markup.button.callback('NEAR → SOL', 'swap:NEAR:SOL')],
+        [Markup.button.callback('SOL → NEAR', 'swap:SOL:NEAR')],
         [Markup.button.callback('❌ Cancel', 'cancel_swap')],
       ]),
     }
@@ -6709,6 +5806,12 @@ bot.action(/swap:([A-Z]+):([A-Z]+)/, async (ctx) => {
   const userId = ctx.from!.id.toString();
   const fromSymbol = ctx.match[1];
   const toSymbol = ctx.match[2];
+
+  if (!AUDD_ENABLED && isAuddSwapPair(fromSymbol, toSymbol)) {
+    await ctx.editMessageText('❌ AUDD swaps are not available right now.');
+    await ctx.reply('Menu:', mainMenu);
+    return;
+  }
 
   const fromToken = getTokenBySymbol(fromSymbol);
   const toToken = getTokenBySymbol(toSymbol);
@@ -7022,7 +6125,7 @@ bot.action(/schedule_cancel:(\d+)/, async (ctx) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 🌉 CHAINRAILS BRIDGE (Cross-chain Deposit)
+// 🌉 NEAR INTENTS DEPOSIT (Cross-chain Deposit)
 // ═════════════════════════════════════════════════════════════════════════════
 
 // Handle swap amount input
@@ -7221,25 +6324,20 @@ bot.action('confirm_swap', async (ctx) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 🌉 CHAINRAILS BRIDGE (Cross-chain Deposit)
+// 🌉 NEAR INTENTS DEPOSIT (Cross-chain Deposit)
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Map shorthand chain names to ChainRails chain IDs
-const BRIDGE_CHAIN_MAP: Record<string, string> = {
-  ethereum: 'ETHEREUM_MAINNET',
-  base: 'BASE_MAINNET',
-  bsc: 'BSC_MAINNET',
-  arbitrum: 'ARBITRUM_MAINNET',
-  optimism: 'OPTIMISM_MAINNET',
-  polygon: 'POLYGON_MAINNET',
-  avalanche: 'AVALANCHE_MAINNET',
-};
+import {
+  NEAR_INTENTS_ASSETS,
+  CHAIN_DISPLAY_NAMES,
+  TOKEN_DECIMALS as NEAR_INTENTS_DECIMALS,
+} from '@zend/near-intents-client';
 
 async function showBridgeMenu(ctx: ZendContext, userId: string) {
-  const chainRails = getChainRailsClient();
-  if (!chainRails) {
+  const nearIntents = getNearIntentsClient();
+  if (!nearIntents) {
     await ctx.reply(
-      `🌉 *Receive from Other Apps*\n\n` +
+      `🌉 *Deposit from Other Apps*\n\n` +
       `Receive Dollars from Binance, MetaMask, or any app.\n\n` +
       `⚠️ *Service not configured.*\n\n` +
       `For now, use:\n` +
@@ -7250,18 +6348,25 @@ async function showBridgeMenu(ctx: ZendContext, userId: string) {
     return;
   }
 
+  const rows: any[] = [];
+  for (let i = 0; i < DEPOSIT_CHAINS.length; i += 2) {
+    const row = [
+      Markup.button.callback(CHAIN_DISPLAY_NAMES[DEPOSIT_CHAINS[i]], `bridge_chain:${DEPOSIT_CHAINS[i]}`),
+    ];
+    if (DEPOSIT_CHAINS[i + 1]) {
+      row.push(Markup.button.callback(CHAIN_DISPLAY_NAMES[DEPOSIT_CHAINS[i + 1]], `bridge_chain:${DEPOSIT_CHAINS[i + 1]}`));
+    }
+    rows.push(row);
+  }
+  rows.push([Markup.button.callback('❌ Cancel', 'cancel_bridge')]);
+
   await ctx.reply(
-    `🌉 *Receive from Other Apps*\n\n` +
-    `Send Dollars from Binance, MetaMask, Trust Wallet, or any app.\n\n` +
-    `Where are you sending from?`,
+    `🌉 *Deposit from Other Apps*\n\n` +
+    `Send crypto from any wallet → receive Dollars in Zend via NEAR Intents.\n\n` +
+    `Select the chain you're sending from:`,
     {
       parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('🔗 Ethereum', 'bridge_chain:ethereum'), Markup.button.callback('🔵 Base', 'bridge_chain:base')],
-        [Markup.button.callback('🟡 BSC', 'bridge_chain:bsc'), Markup.button.callback('🔷 Arbitrum', 'bridge_chain:arbitrum')],
-        [Markup.button.callback('🔴 Optimism', 'bridge_chain:optimism'), Markup.button.callback('🟣 Polygon', 'bridge_chain:polygon')],
-        [Markup.button.callback('❌ Cancel', 'cancel_bridge')],
-      ]),
+      ...Markup.inlineKeyboard(rows),
     }
   );
 }
@@ -7270,26 +6375,24 @@ bot.command('bridge', async (ctx) => {
   await showBridgeMenu(ctx, ctx.from.id.toString());
 });
 
-// Step 2: After chain selected, show token options (USDC / USDT)
+// Step 2: After chain selected, show token options
 bot.action(/bridge_chain:([a-z]+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const chainKey = ctx.match[1];
-  const sourceChain = BRIDGE_CHAIN_MAP[chainKey];
-  if (!sourceChain) {
+  const assets = NEAR_INTENTS_ASSETS[chainKey];
+  if (!assets) {
     await ctx.editMessageText('❌ Unsupported chain.');
     return;
   }
-  const chainDisplay = CHAIN_NAMES[sourceChain] || sourceChain;
 
-  // Check which tokens are available on this chain
-  const hasUsdc = !!TOKEN_ADDRESSES[sourceChain]?.USDC;
-  const hasUsdt = !!TOKEN_ADDRESSES[sourceChain]?.USDT;
+  const chainDisplay = CHAIN_DISPLAY_NAMES[chainKey] || chainKey;
   const buttons: any[] = [];
-  if (hasUsdc) buttons.push(Markup.button.callback('USDC', `bridge:${chainKey}:USDC`));
-  if (hasUsdt) buttons.push(Markup.button.callback('USDT', `bridge:${chainKey}:USDT`));
+  for (const symbol of Object.keys(assets)) {
+    buttons.push(Markup.button.callback(symbol, `bridge:${chainKey}:${symbol}`));
+  }
 
   await ctx.editMessageText(
-    `🌉 *Receive from Other Apps*\n\n` +
+    `🌉 *Deposit from Other Apps*\n\n` +
     `From: *${chainDisplay}*\n\n` +
     `What are you sending?`,
     {
@@ -7308,48 +6411,73 @@ bot.action('bridge_back', async (ctx) => {
   await showBridgeMenu(ctx, ctx.from!.id.toString());
 });
 
-// Token decimals per chain for base-unit conversion
-const TOKEN_DECIMALS: Record<string, Record<string, number>> = {
-  ETHEREUM_MAINNET: { USDC: 6, USDT: 6, DAI: 18, ETH: 18 },
-  BASE_MAINNET: { USDC: 6, USDT: 6, DAI: 18, ETH: 18 },
-  BSC_MAINNET: { USDC: 18, USDT: 18, DAI: 18, BNB: 18 },
-  ARBITRUM_MAINNET: { USDC: 6, USDT: 6, DAI: 18, ETH: 18 },
-  OPTIMISM_MAINNET: { USDC: 6, USDT: 6, DAI: 18, ETH: 18 },
-  POLYGON_MAINNET: { USDC: 6, USDT: 6, DAI: 18, MATIC: 18 },
-  SOLANA_MAINNET: { USDC: 6, USDT: 6, SOL: 9 },
-};
-
 bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from!.id.toString();
   const chainKey = ctx.match[1];
   const token = ctx.match[2];
 
-  const sourceChain = BRIDGE_CHAIN_MAP[chainKey];
-  if (!sourceChain) {
-    await ctx.editMessageText('❌ Unsupported chain.');
+  const assetId = NEAR_INTENTS_ASSETS[chainKey]?.[token];
+  if (!assetId) {
+    await ctx.editMessageText(`❌ ${token} is not supported from ${CHAIN_DISPLAY_NAMES[chainKey] || chainKey} yet.`);
     return;
   }
 
-  const tokenIn = TOKEN_ADDRESSES[sourceChain]?.[token];
-  if (!tokenIn) {
-    await ctx.editMessageText(`❌ ${token} is not supported from ${CHAIN_NAMES[sourceChain] || sourceChain} yet.`);
-    return;
-  }
+  const chainDisplay = CHAIN_DISPLAY_NAMES[chainKey] || chainKey;
 
-  const chainDisplay = CHAIN_NAMES[sourceChain] || sourceChain;
-
-  // Store bridge data in session and ask for amount
+  // Store partial bridge data and ask for destination token
   setSession(userId, {
-    state: ConversationState.AWAITING_BRIDGE_AMOUNT,
-    bridgeData: { chainKey, sourceChain, token, tokenIn },
+    state: ConversationState.IDLE,
+    bridgeData: { chainKey, sourceChain: chainKey, token, assetId },
   });
 
   await ctx.editMessageText(
-    `🌉 *Receive from Other Apps*\n\n` +
+    `🌉 *Deposit from Other Apps*\n\n` +
     `From: *${chainDisplay}*\n` +
     `Currency: *${token}*\n\n` +
-    `How much ${token} do you want to receive?\n\n` +
+    `Receive in Zend as:`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('USDT', `bridge_dest:${chainKey}:${token}:USDT`)],
+        [Markup.button.callback('USDC', `bridge_dest:${chainKey}:${token}:USDC`)],
+        [Markup.button.callback('← Back', `bridge_chain:${chainKey}`)],
+        [Markup.button.callback('❌ Cancel', 'cancel_bridge')],
+      ]),
+    }
+  );
+});
+
+bot.action(/bridge_dest:([a-z]+):([A-Z]+):(USDT|USDC)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const chainKey = ctx.match[1];
+  const token = ctx.match[2];
+  const destSymbol = ctx.match[3];
+
+  const assetId = NEAR_INTENTS_ASSETS[chainKey]?.[token];
+  if (!assetId) {
+    await ctx.editMessageText(`❌ ${token} is not supported from ${CHAIN_DISPLAY_NAMES[chainKey] || chainKey} yet.`);
+    return;
+  }
+
+  const destinationAsset = SOLANA_DEST_ASSETS[destSymbol];
+  if (!destinationAsset) {
+    await ctx.editMessageText(`❌ ${destSymbol} is not supported as a receive token.`);
+    return;
+  }
+
+  setSession(userId, {
+    state: ConversationState.AWAITING_BRIDGE_AMOUNT,
+    bridgeData: { chainKey, sourceChain: chainKey, token, assetId, destinationAsset, destinationSymbol: destSymbol },
+  });
+
+  await ctx.editMessageText(
+    `🌉 *Deposit from Other Apps*\n\n` +
+    `From: *${CHAIN_DISPLAY_NAMES[chainKey] || chainKey}*\n` +
+    `Currency: *${token}*\n` +
+    `Receive as: *${destSymbol}*\n\n` +
+    `How much ${token} do you want to deposit?\n\n` +
     `Examples:\n` +
     `• 10\n` +
     `• 50\n` +
@@ -7360,8 +6488,258 @@ bot.action(/bridge:([a-z]+):([A-Z]+)/, async (ctx) => {
 
 bot.action('cancel_bridge', async (ctx) => {
   await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  setSession(userId, { state: ConversationState.IDLE });
   await ctx.editMessageText('❌ Cancelled.');
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 📤 NEAR INTENTS WITHDRAWAL (Zend → external chain)
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function showWithdrawMenu(ctx: ZendContext, userId: string) {
+  const nearIntents = getNearIntentsClient();
+  if (!nearIntents) {
+    await ctx.reply(
+      `📤 *Send to Other Apps*\n\n` +
+      `⚠️ Cross-chain withdrawals are not configured.\n` +
+      `Contact support or try again later.`,
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+    return;
+  }
+
+  const rows: any[] = [];
+  for (let i = 0; i < WITHDRAW_CHAINS.length; i += 2) {
+    const row = [
+      Markup.button.callback(CHAIN_DISPLAY_NAMES[WITHDRAW_CHAINS[i]], `withdraw_chain:${WITHDRAW_CHAINS[i]}`),
+    ];
+    if (WITHDRAW_CHAINS[i + 1]) {
+      row.push(Markup.button.callback(CHAIN_DISPLAY_NAMES[WITHDRAW_CHAINS[i + 1]], `withdraw_chain:${WITHDRAW_CHAINS[i + 1]}`));
+    }
+    rows.push(row);
+  }
+  rows.push([Markup.button.callback('❌ Cancel', 'cancel_withdraw')]);
+
+  await ctx.reply(
+    `📤 *Send to Other Apps*\n\n` +
+    `Send Dollars from Zend to Binance, MetaMask, Trust Wallet, etc.\n\n` +
+    `Select destination chain:`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }
+  );
+}
+
+bot.action('withdraw_start', async (ctx) => {
+  await ctx.answerCbQuery();
+  if (isGroupChat(ctx)) {
+    await promptPrivateChat(ctx, 'send crypto to other apps');
+    return;
+  }
+  await showWithdrawMenu(ctx, ctx.from!.id.toString());
+});
+
+bot.action(/withdraw_chain:([a-z]+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const chainKey = ctx.match[1];
+  const assets = NEAR_INTENTS_ASSETS[chainKey];
+  if (!assets) {
+    await ctx.editMessageText('❌ Unsupported chain.');
+    return;
+  }
+
+  const buttons: any[] = Object.keys(assets).map(symbol =>
+    Markup.button.callback(symbol, `withdraw_dest:${chainKey}:${symbol}`)
+  );
+
+  await ctx.editMessageText(
+    `📤 *Send to ${formatChainName(chainKey)}*\n\n` +
+    `What token should the recipient receive?`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        buttons,
+        [Markup.button.callback('← Back', 'withdraw_back')],
+        [Markup.button.callback('❌ Cancel', 'cancel_withdraw')],
+      ]),
+    }
+  );
+});
+
+bot.action('withdraw_back', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showWithdrawMenu(ctx, ctx.from!.id.toString());
+});
+
+bot.action(/withdraw_dest:([a-z]+):([A-Z]+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const chainKey = ctx.match[1];
+  const destToken = ctx.match[2];
+  const destAssetId = getDestinationAssetId(chainKey, destToken);
+  if (!destAssetId) {
+    await ctx.editMessageText(`❌ ${destToken} is not supported on ${formatChainName(chainKey)}.`);
+    return;
+  }
+
+  setSession(userId, {
+    state: ConversationState.IDLE,
+    withdrawData: { destChain: chainKey, destToken, destAssetId, sourceSymbol: 'USDT' },
+  });
+
+  await ctx.editMessageText(
+    `📤 *Send to ${formatChainName(chainKey)}*\n\n` +
+    `Recipient receives: *${destToken}*\n\n` +
+    `Pay from your Zend balance:`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('USDT', `withdraw_source:USDT`)],
+        [Markup.button.callback('USDC', `withdraw_source:USDC`)],
+        [Markup.button.callback('← Back', `withdraw_chain:${chainKey}`)],
+        [Markup.button.callback('❌ Cancel', 'cancel_withdraw')],
+      ]),
+    }
+  );
+});
+
+bot.action(/withdraw_source:(USDT|USDC)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const sourceSymbol = ctx.match[1] as 'USDT' | 'USDC';
+  const session = getSession(userId);
+  if (!session.withdrawData) {
+    await ctx.editMessageText('❌ Session expired. Please start over.');
+    return;
+  }
+
+  setSession(userId, {
+    ...session,
+    state: ConversationState.AWAITING_WITHDRAW_RECIPIENT,
+    withdrawData: { ...session.withdrawData, sourceSymbol },
+  });
+
+  await ctx.editMessageText(
+    `📤 *Send ${sourceSymbol} → ${session.withdrawData.destToken}*\n` +
+    `To: *${formatChainName(session.withdrawData.destChain)}*\n\n` +
+    `Enter the recipient's wallet address on ${formatChainName(session.withdrawData.destChain)}:`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'cancel_withdraw')]]) }
+  );
+});
+
+bot.action('cancel_withdraw', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  setSession(userId, { state: ConversationState.IDLE });
+  await ctx.editMessageText('❌ Cancelled.');
+});
+
+bot.action('confirm_withdraw', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  if (isGroupChat(ctx)) {
+    await promptPrivateChat(ctx, 'send crypto to other apps');
+    return;
+  }
+
+  const session = getSession(userId);
+  if (!session.withdrawData?.amount || !session.withdrawData.depositAddress) {
+    await ctx.editMessageText('❌ Session expired. Please start over.');
+    return;
+  }
+
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  if (user.length === 0) {
+    await ctx.reply('Please run /start first.', mainMenu);
+    return;
+  }
+
+  if (user[0].transactionPin) {
+    setSession(userId, { ...session, state: ConversationState.AWAITING_PIN_VERIFY, pinVerifyAction: 'withdraw' });
+    await ctx.editMessageText(
+      `🔐 *Security Check*\n\nEnter your 4-digit PIN to confirm this withdrawal:`,
+      { parse_mode: 'Markdown' }
+    );
+    const waitMsg = await ctx.reply('Waiting for PIN...', cancelKeyboard);
+    getSession(userId).lastBotMessageId = waitMsg.message_id;
+    return;
+  }
+
+  await executeNearIntentWithdraw(ctx, userId);
+});
+
+async function executeNearIntentWithdraw(ctx: ZendContext, userId: string) {
+  const session = getSession(userId);
+  const wd = session.withdrawData;
+  if (!wd?.amount || !wd.depositAddress || !wd.recipientAddress || !wd.txId) {
+    await ctx.reply('❌ Withdrawal session expired. Please start over.', mainMenu);
+    setSession(userId, { state: ConversationState.IDLE });
+    return;
+  }
+
+  const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  if (user.length === 0) {
+    await ctx.reply('Please run /start first.', mainMenu);
+    return;
+  }
+
+  try {
+    await ctx.reply('⏳ Sending tokens via NEAR Intents...');
+
+    const solanaTxHash = await fundNearIntentDeposit(
+      user[0].walletEncryptedKey,
+      wd.sourceSymbol,
+      wd.amount,
+      wd.depositAddress,
+      SOLANA_RPC
+    );
+
+    const nearIntents = getNearIntentsClient();
+    if (nearIntents) {
+      try {
+        await nearIntents.submitDepositTx(wd.depositAddress, solanaTxHash);
+      } catch (submitErr) {
+        console.warn('[Withdraw] submitDepositTx failed (non-fatal):', submitErr);
+      }
+    }
+
+    await db.update(transactions)
+      .set({
+        status: 'processing',
+        solanaTxHash,
+        metadata: { direction: 'withdraw', destChain: wd.destChain, destToken: wd.destToken },
+      })
+      .where(eq(transactions.id, wd.txId));
+
+    await indexTransaction(userId, wd.txId, `Withdraw to ${formatChainName(wd.destChain)} via NEAR Intents`, {
+      amount: wd.amount,
+      chain: wd.destChain,
+      recipient: wd.recipientAddress,
+    });
+
+    setSession(userId, { state: ConversationState.IDLE });
+
+    await ctx.reply(
+      `✅ *Withdrawal Submitted!*\n\n` +
+      `Sent: *${wd.amount} ${wd.sourceSymbol}*\n` +
+      `To: *${formatChainName(wd.destChain)}* → \`${wd.recipientAddress}\`\n` +
+      `Recipient receives: ~${wd.amountOutFormatted || '?'} ${wd.destToken}\n\n` +
+      `Solana tx: \`https://solscan.io/tx/${solanaTxHash}\`\n` +
+      `Reference: \`${wd.txId}\`\n\n` +
+      `⏱️ Cross-chain delivery usually takes 2–15 minutes.`,
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+  } catch (err: any) {
+    console.error('[Withdraw] Failed:', err);
+    await db.update(transactions)
+      .set({ status: 'failed', metadata: { error: err.message } })
+      .where(eq(transactions.id, wd.txId));
+    setSession(userId, { state: ConversationState.IDLE });
+    await ctx.reply(
+      `❌ *Withdrawal Failed*\n\n${err.message || 'Unknown error'}\nNo funds were deducted.`,
+      { parse_mode: 'Markdown', ...mainMenu }
+    );
+  }
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 📋 HISTORY
@@ -7810,17 +7188,19 @@ bot.action(/^bill_data_(.+)$/, async (ctx) => {
 bot.action(/^bill_plan_(.+)_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from!.id.toString();
-  const planCode = ctx.match![1];
+  const planId = ctx.match![1];
   const planAmount = parseInt(ctx.match![2], 10);
   const session = getSession(userId);
-  session.billData = { ...session.billData, planCode, planAmount };
+  session.billData = airbillsClient
+    ? { ...session.billData, planId, planAmount }
+    : { ...session.billData, planCode: planId, planAmount };
   setSession(userId, session);
 
   const usdtAmount = planAmount / 1400;
   await ctx.editMessageText(
     `🌐 *Confirm Data Purchase*\n\n` +
     `Phone: ${session.billData?.phone}\n` +
-    `Plan: ${planCode}\n` +
+    `Plan: ${planId}\n` +
     `Amount: ₦${planAmount.toLocaleString()}\n` +
     `≈ ${usdtAmount.toFixed(4)} USDT`,
     {
@@ -7883,7 +7263,9 @@ bot.action('bill_confirm', async (ctx) => {
       if (bill.type === 'airtime' && bill.phone && bill.amount && bill.network) {
         result = await airbillsBuyAirtime(airbillsClient, userId, bill.phone, bill.amount, bill.network);
       } else if (bill.type === 'data' && bill.phone && bill.planAmount && bill.network) {
-        result = await airbillsBuyData(airbillsClient, userId, bill.phone, bill.planAmount, bill.network);
+        result = await airbillsBuyData(
+          airbillsClient, userId, bill.phone, bill.planAmount, bill.network, bill.planId || bill.planCode
+        );
       } else if (bill.type === 'electricity' && bill.meterNumber && bill.amount && bill.disco) {
         result = await airbillsBuyElectricity(airbillsClient, userId, bill.meterNumber, bill.amount, bill.disco);
       } else if (bill.type === 'cable' && bill.smartCardNumber && bill.amount && bill.provider) {
@@ -7932,7 +7314,7 @@ bot.action('bill_confirm', async (ctx) => {
 async function requireAdmin(ctx: ZendContext): Promise<boolean> {
   const userId = ctx.from!.id.toString();
   const username = ctx.from!.username;
-  const hasAccess = isSuperAdmin(username) || await isAdminUser(userId);
+  const hasAccess = isSuperAdmin(userId) || await isAdminUser(userId);
   if (!hasAccess) {
     await ctx.reply('❌ Admin access required.');
   }
@@ -8067,7 +7449,7 @@ bot.hears('🔙 Back to Menu', async (ctx) => {
 });
 
 // ─── Auto-delete helper for sensitive messages ───
-async function autoDeleteReply(ctx: ZendContext, text: string, extra?: any, delayMs = 120000) {
+async function autoDeleteReply(ctx: ZendContext, text: string, extra?: any, delayMs = PIN_TTL_MS) {
   const msg = await ctx.reply(text, extra);
   setTimeout(async () => {
     try {
@@ -8138,7 +7520,7 @@ bot.catch((err, ctx) => {
 // BALANCE CHANGE DETECTOR — notifies users of direct Solana deposits
 // ═════════════════════════════════════════════════════════════════════════════
 
-const balanceSnapshots = new Map<string, { sol: number; usdt: number; usdc: number; audd: number }>();
+const balanceSnapshots = new Map<string, { sol: number; usdt: number; usdc: number; audd: number; near: number }>();
 
 async function checkBalanceChanges(botInstance: Telegraf<any>) {
   try {
@@ -8151,6 +7533,7 @@ async function checkBalanceChanges(botInstance: Telegraf<any>) {
           usdt: balances.find((b: any) => b.symbol === 'USDT')?.amount || 0,
           usdc: balances.find((b: any) => b.symbol === 'USDC')?.amount || 0,
           audd: balances.find((b: any) => b.symbol === 'AUDD')?.amount || 0,
+          near: balances.find((b: any) => b.symbol === 'NEAR')?.amount || 0,
         };
 
         const prev = balanceSnapshots.get(user.id);
@@ -8193,6 +7576,16 @@ async function checkBalanceChanges(botInstance: Telegraf<any>) {
               `🎉 *Funds Received!*\n\n` +
               `*+${auddDiff.toFixed(2)} AUDD* has arrived in your Zend wallet.\n\n` +
               `New balance: *${current.audd.toFixed(2)} AUDD*`,
+              { parse_mode: 'Markdown' }
+            );
+          }
+          if (current.near - (prev?.near || 0) > 0.000001) {
+            const nearDiff = current.near - (prev?.near || 0);
+            await botInstance.telegram.sendMessage(
+              user.id,
+              `🎉 *Funds Received!*\n\n` +
+              `*+${nearDiff.toFixed(4)} NEAR* has arrived in your Zend wallet.\n\n` +
+              `New balance: *${current.near.toFixed(4)} NEAR*`,
               { parse_mode: 'Markdown' }
             );
           }
@@ -8243,16 +7636,31 @@ function startWebhookServer(botInstance: Telegraf<any>) {
       req.on('data', chunk => body += chunk);
       req.on('end', async () => {
         try {
-          const event = JSON.parse(body);
-          console.log('📩 PAJ Webhook:', event.type, event.reference);
-
-          // Guard against malformed/health-check webhooks
-          if (!event.type) {
-            console.log('[PAJ Webhook] No event type — likely ping/health-check. Body:', body.slice(0, 200));
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ received: true, note: 'No event type' }));
+          const signature = req.headers['x-paj-signature'] as string | undefined;
+          if (!verifyPajWebhookSignature(body, signature)) {
+            console.warn('[PAJ Webhook] Invalid signature');
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Unauthorized' }));
             return;
           }
+
+          const parsed = JSON.parse(body);
+          const event = normalizePajWebhookEvent(parsed);
+          if (!event) {
+            console.log('[PAJ Webhook] Unrecognized payload:', body.slice(0, 200));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ received: true, note: 'Unrecognized event' }));
+            return;
+          }
+
+          const idemKey = webhookEventKey({ type: event.type, reference: event.reference });
+          if (idemKey && isDuplicateWebhook(idemKey)) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ received: true, note: 'Duplicate' }));
+            return;
+          }
+
+          console.log('📩 PAJ Webhook:', event.type, event.reference);
 
           switch (event.type) {
             case 'onramp.deposit.confirmed': {
@@ -8260,6 +7668,10 @@ function startWebhookServer(botInstance: Telegraf<any>) {
               let txRows = await db.select().from(transactions)
                 .where(eq(transactions.pajReference, event.reference))
                 .limit(1);
+
+              if (txRows.length > 0 && txRows[0].status === 'completed') {
+                break;
+              }
 
               if (txRows.length === 0) {
                 // Try to find user by virtual account orderId
@@ -8377,6 +7789,14 @@ function startWebhookServer(botInstance: Telegraf<any>) {
               break;
             }
             case 'offramp.settlement.confirmed': {
+              const offrampRows = await db.select().from(transactions)
+                .where(eq(transactions.pajReference, event.reference))
+                .limit(1);
+
+              if (offrampRows.length > 0 && offrampRows[0].status === 'completed') {
+                break;
+              }
+
               await db.update(transactions)
                 .set({ status: 'completed', completedAt: new Date() })
                 .where(eq(transactions.pajReference, event.reference));
@@ -8408,6 +7828,8 @@ function startWebhookServer(botInstance: Telegraf<any>) {
               break;
             }
           }
+
+          if (idemKey) markWebhookProcessed(idemKey);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ received: true }));
         } catch (err: any) {
@@ -8419,43 +7841,40 @@ function startWebhookServer(botInstance: Telegraf<any>) {
       return;
     }
 
-    // ChainRails Webhooks
-    if (url === '/webhooks/chain-rails' && method === 'POST') {
-      // Verify webhook secret if configured
-      const webhookSecret = process.env.CHAINRAILS_WEBHOOK_SECRET;
-      const receivedSecret = req.headers['x-webhook-secret'];
-      if (webhookSecret && receivedSecret !== webhookSecret) {
-        console.warn('[ChainRails Webhook] Invalid secret');
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Unauthorized' }));
-        return;
-      }
-
+    // NEAR Intents Webhooks
+    if (url === '/webhooks/near-intents' && method === 'POST') {
       let body = '';
       req.on('data', chunk => body += chunk);
       req.on('end', async () => {
         try {
           const event = JSON.parse(body);
-          console.log('📩 ChainRails Webhook:', event.event || event.type, event.intent_address || event.id);
+          console.log('📩 NEAR Intents Webhook:', event.status, event.depositAddress);
 
-          const intentAddress = event.intent_address || event.address || event.id;
-          const status = event.intent_status || event.status;
-          const amount = event.initialAmount || event.amount;
-          const token = event.asset_token_symbol || event.token;
+          const depositAddress = event.depositAddress || event.deposit_address;
+          const status = event.status;
+          const amount = event.amountOut || event.amount_out;
+          const token = event.destinationAsset?.symbol || event.originAsset?.symbol || 'USDT';
 
-          if (!intentAddress) {
+          if (!depositAddress) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Missing intent_address' }));
+            res.end(JSON.stringify({ error: 'Missing depositAddress' }));
             return;
           }
 
-          // Find transaction by ChainRails intent address
+          const idemKey = webhookEventKey({ status, reference: depositAddress });
+          if (idemKey && isDuplicateWebhook(idemKey)) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ received: true, note: 'Duplicate' }));
+            return;
+          }
+
+          // Find transaction by NEAR Intents deposit address
           const txRows = await db.select().from(transactions)
-            .where(eq(transactions.chainrailsIntentAddress, intentAddress))
+            .where(eq(transactions.nearIntentDepositAddress, depositAddress))
             .limit(1);
 
           if (txRows.length === 0) {
-            console.warn('[ChainRails Webhook] No transaction found for intent:', intentAddress);
+            console.warn('[NEAR Intents Webhook] No transaction found for deposit:', depositAddress);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ received: true, note: 'No matching transaction' }));
             return;
@@ -8465,13 +7884,13 @@ function startWebhookServer(botInstance: Telegraf<any>) {
 
           // Idempotency: don't re-process completed transactions
           if (tx.status === 'completed') {
-            console.log('[ChainRails Webhook] Transaction already completed, skipping:', intentAddress);
+            console.log('[NEAR Intents Webhook] Transaction already completed, skipping:', depositAddress);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ received: true, note: 'Already completed' }));
             return;
           }
 
-          const txStatus = status === 'COMPLETED' ? 'completed' : status === 'FAILED' ? 'failed' : 'processing';
+          const txStatus = status === 'SUCCESS' ? 'completed' : status === 'FAILED' || status === 'REFUNDED' ? 'failed' : 'processing';
 
           // Update transaction
           await db.update(transactions)
@@ -8483,102 +7902,36 @@ function startWebhookServer(botInstance: Telegraf<any>) {
             .where(eq(transactions.id, tx.id));
 
           // Notify user via Telegram
+          const isWithdraw = tx.type === 'crypto_send' || (tx.metadata as any)?.direction === 'withdraw';
           if (txStatus === 'completed') {
             const userId = tx.userId;
             try {
+              const msg = isWithdraw
+                ? `✅ *Withdrawal Complete!*\n\n` +
+                  `${amount || ''} ${token} delivered to the recipient address.\n\n` +
+                  `Reference: \`${tx.id}\``
+                : `✅ *Deposit Received!*\n\n` +
+                  `${amount || ''} ${token} has arrived in your Zend account via NEAR Intents.\n\n` +
+                  `Reference: \`${tx.id}\``;
+              await botInstance.telegram.sendMessage(userId, msg, { parse_mode: 'Markdown', ...mainMenu });
+            } catch (notifyErr) {
+              console.log('[NEAR Intents] Could not notify user:', notifyErr);
+            }
+          } else if (txStatus === 'failed' && isWithdraw) {
+            try {
               await botInstance.telegram.sendMessage(
-                userId,
-                `✅ *Deposit Received!*\n\n` +
-                `${amount || ''} ${token || 'USDT'} has arrived in your Zend account.\n\n` +
-                `Reference: \`${tx.id}\``,
+                tx.userId,
+                `❌ *Withdrawal Failed*\n\nReference: \`${tx.id}\`\nFunds should be refunded to your Zend wallet.`,
                 { parse_mode: 'Markdown', ...mainMenu }
               );
-            } catch (notifyErr) {
-              console.log('[ChainRails] Could not notify user:', notifyErr);
-            }
+            } catch { /* non-critical */ }
           }
 
+          if (idemKey) markWebhookProcessed(idemKey);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ received: true }));
         } catch (err: any) {
-          console.error('ChainRails webhook error:', err);
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: err.message }));
-        }
-      });
-      return;
-    }
-
-    // BitRefill Webhooks
-    if (url === '/webhooks/bitrefill' && method === 'POST') {
-      let body = '';
-      req.on('data', chunk => body += chunk);
-      req.on('end', async () => {
-        try {
-          const event = JSON.parse(body);
-          console.log('📩 BitRefill Webhook:', event.event, event.invoice_id);
-
-          // Find our order record
-          const orders = await db.select().from(bitrefillOrders)
-            .where(eq(bitrefillOrders.bitrefillInvoiceId, event.invoice_id))
-            .limit(1);
-
-          if (!orders.length) {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ received: true }));
-            return;
-          }
-
-          const order = orders[0];
-          const userId = order.userId;
-
-          if (event.event === 'invoice.complete' || event.status === 'complete') {
-            await db.update(bitrefillOrders)
-              .set({
-                status: 'complete',
-                codes: event.codes || event.redemption_codes || [],
-                completedAt: new Date(),
-              })
-              .where(eq(bitrefillOrders.id, order.id));
-
-            const codes = event.codes || event.redemption_codes || [];
-            let codesText = '';
-            if (codes.length) {
-              codesText = '\n\n' + codes.map((c: any) =>
-                c.pin
-                  ? `Code: \`${c.code}\`\nPin: \`${c.pin}\``
-                  : `Code: \`${c.code}\``
-              ).join('\n\n');
-            }
-
-            await botInstance.telegram.sendMessage(
-              userId,
-              `🎉 *Order Complete!*\n\n` +
-              `${order.productName}\n` +
-              `${order.currencyFiat} ${order.amountFiat}` +
-              `${codesText}\n\n` +
-              `Reference: \`${order.id}\``,
-              { parse_mode: 'Markdown' }
-            );
-          } else if (event.event === 'invoice.failed' || event.status === 'failed') {
-            await db.update(bitrefillOrders)
-              .set({ status: 'failed', metadata: event })
-              .where(eq(bitrefillOrders.id, order.id));
-
-            await botInstance.telegram.sendMessage(
-              userId,
-              `❌ *Order Failed*\n\n` +
-              `${order.productName} could not be fulfilled.\n\n` +
-              `If you paid, a refund will be processed to your wallet.\n` +
-              `Reference: \`${order.id}\``,
-              { parse_mode: 'Markdown' }
-            );
-          }
-
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ received: true }));
-        } catch (err: any) {
-          console.error('[BitRefill Webhook] Error:', err);
+          console.error('NEAR Intents webhook error:', err);
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: err.message }));
         }
@@ -8647,20 +8000,20 @@ function startWebhookServer(botInstance: Telegraf<any>) {
       return;
     }
 
-    // Telegram Bot Webhooks
-    if (url === '/webhook/telegram' && method === 'POST') {
+    // Telegram Bot Webhooks — ack immediately (Telegram times out if handler is slow)
+    if (url.split('?')[0] === '/webhook/telegram' && method === 'POST') {
       let body = '';
       req.on('data', chunk => body += chunk);
-      req.on('end', async () => {
+      req.on('end', () => {
+        res.writeHead(200);
+        res.end('OK');
         try {
           const update = JSON.parse(body);
-          await botInstance.handleUpdate(update);
-          res.writeHead(200);
-          res.end('OK');
+          botInstance.handleUpdate(update).catch((err: any) => {
+            console.error('[Webhook] Telegram update error:', err);
+          });
         } catch (err: any) {
-          console.error('[Webhook] Telegram update error:', err);
-          res.writeHead(500);
-          res.end('Error');
+          console.error('[Webhook] Telegram parse error:', err);
         }
       });
       return;
@@ -8736,12 +8089,11 @@ function startWebhookServer(botInstance: Telegraf<any>) {
     res.end(JSON.stringify({ error: 'Not found' }));
   });
 
-  server.listen(port, () => {
+  server.listen(port, '0.0.0.0', () => {
     const host = process.env.RAILWAY_PUBLIC_DOMAIN || `localhost:${port}`;
     console.log(`🌐 Webhook server running on http://${host}`);
     console.log(`   PAJ webhook URL: https://${host}/webhooks/paj`);
-    console.log(`   ChainRails webhook URL: https://${host}/webhooks/chain-rails`);
-    console.log(`   BitRefill webhook URL: https://${host}/webhooks/bitrefill`);
+    console.log(`   NEAR Intents webhook URL: https://${host}/webhooks/near-intents`);
     console.log(`   AirBills webhook URL: https://${host}/webhooks/airbills`);
     console.log(`   Telegram webhook URL: https://${host}/webhook/telegram`);
     console.log(`   Ambassador API: https://${host}/api/ambassador`);
@@ -8754,6 +8106,66 @@ function startWebhookServer(botInstance: Telegraf<any>) {
 // ═════════════════════════════════════════════════════════════════════════════
 // LAUNCH
 // ═════════════════════════════════════════════════════════════════════════════
+
+// ─── NEAR Intents Status Poller (fallback when webhooks miss) ───
+let _nearIntentPollRunning = false;
+
+async function pollNearIntentTransactions(botInstance: Telegraf<any>) {
+  if (_nearIntentPollRunning) return;
+  _nearIntentPollRunning = true;
+  try {
+    const client = getNearIntentsClient();
+    if (!client) return;
+
+    const pending = await db.select().from(transactions)
+      .where(and(
+        sql`${transactions.nearIntentDepositAddress} IS NOT NULL`,
+        sql`${transactions.status} IN ('pending', 'processing')`
+      ))
+      .limit(20);
+
+    for (const tx of pending) {
+      if (!tx.nearIntentDepositAddress) continue;
+      try {
+        const status = await client.getStatus(tx.nearIntentDepositAddress);
+        const txStatus = status.status === 'SUCCESS' ? 'completed'
+          : status.status === 'FAILED' || status.status === 'REFUNDED' ? 'failed'
+          : 'processing';
+
+        if (txStatus === tx.status) continue;
+
+        await db.update(transactions)
+          .set({
+            status: txStatus,
+            toAmount: status.amountOut || tx.toAmount,
+            completedAt: txStatus === 'completed' ? new Date() : undefined,
+            solanaTxHash: status.destinationTxHash || tx.solanaTxHash,
+          })
+          .where(eq(transactions.id, tx.id));
+
+        const isWithdraw = tx.type === 'crypto_send';
+        if (txStatus === 'completed') {
+          const msg = isWithdraw
+            ? `✅ *Withdrawal Complete!*\n\nYour cross-chain withdrawal has been delivered.\nReference: \`${tx.id}\``
+            : `✅ *Deposit Received!*\n\nFunds have arrived in your Zend account.\nReference: \`${tx.id}\``;
+          await botInstance.telegram.sendMessage(tx.userId, msg, { parse_mode: 'Markdown', ...mainMenu });
+        } else if (txStatus === 'failed' && isWithdraw) {
+          await botInstance.telegram.sendMessage(
+            tx.userId,
+            `❌ *Withdrawal Failed*\n\nReference: \`${tx.id}\``,
+            { parse_mode: 'Markdown', ...mainMenu }
+          );
+        }
+      } catch (pollErr) {
+        console.warn('[NEAR Poll] Error for', tx.id, pollErr);
+      }
+    }
+  } catch (err) {
+    console.error('[NEAR Poll] Error:', err);
+  } finally {
+    _nearIntentPollRunning = false;
+  }
+}
 
 // ─── Scheduled Transfer Executor ───
 let _scheduledRunning = false;
@@ -8881,12 +8293,12 @@ async function runScheduledTransfers() {
 }
 
 async function main() {
-  const dbOk = await checkConnection();
-  if (!dbOk) {
-    console.error('❌ Database connection failed.');
+  await initSessionStore();
+
+  const health = await runStartupHealthChecks({ getPAJClient, airbillsClient });
+  if (!health.database) {
     process.exit(1);
   }
-  console.log('✅ Database connected');
 
   // Initialize QVAC local AI stack
   try {
@@ -8896,31 +8308,6 @@ async function main() {
     console.log('   Models:', JSON.stringify(qvacStatus.models));
   } catch (err: any) {
     console.warn('⚠️  QVAC init failed:', err.message);
-  }
-
-  const pajClient = await getPAJClient();
-  if (pajClient) {
-    try {
-      const rates = await pajClient.getAllRates();
-      console.log('✅ PAJ connected — On-ramp:', rates.onRampRate.rate, 'Off-ramp:', rates.offRampRate.rate);
-    } catch (err) {
-      console.warn('⚠️  PAJ rate check failed:', err);
-    }
-  } else {
-    console.warn('⚠️  PAJ not configured');
-  }
-
-  // ChainRails startup check
-  const chainRails = getChainRailsClient();
-  if (chainRails) {
-    try {
-      const chains = await chainRails.getSupportedChains('mainnet');
-      console.log('🔗 ChainRails supported chains:', chains.join(', '));
-    } catch (err: any) {
-      console.warn('⚠️  ChainRails chains check failed:', err.message);
-    }
-  } else {
-    console.warn('⚠️  ChainRails not configured');
   }
 
   // Seed bot features table for AI awareness
@@ -8971,6 +8358,14 @@ async function main() {
   // Start scheduled transfer executor (every 60 seconds)
   setInterval(runScheduledTransfers, 60000);
   console.log('📅 Scheduled transfer executor started (every 60s)');
+
+  // Poll NEAR Intents pending deposits/withdrawals (every 2 minutes)
+  setInterval(() => pollNearIntentTransactions(bot), 120000);
+  console.log('🔗 NEAR Intents status poller started (every 120s)');
+
+  if (process.env.NODE_ENV === 'production' && SOLANA_RPC.includes('devnet')) {
+    console.warn('⚠️  SOLANA_RPC_URL points to devnet in production — switch to mainnet for real funds');
+  }
 
   // Balance change detector disabled — was hitting Solana RPC rate limits.
   // Re-enable later with batching + retry logic if needed.

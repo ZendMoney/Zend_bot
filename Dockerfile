@@ -32,7 +32,6 @@ COPY packages/paj-client/package.json packages/paj-client/package.json
 COPY packages/chainrails-client/package.json packages/chainrails-client/package.json
 COPY packages/nlu/package.json packages/nlu/package.json
 COPY packages/qvac-sdk/package.json packages/qvac-sdk/package.json
-COPY packages/bitrefill-client/package.json packages/bitrefill-client/package.json
 COPY packages/airbills-client/package.json packages/airbills-client/package.json
 
 # Install dependencies (QVAC compiles native addons during install)

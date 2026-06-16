@@ -1,6 +1,6 @@
 // ─── AirBills API Client ───
 // Nigerian bill payments powered by Solana stablecoins
-// Docs: Contact AirBills (0xpsolite) for API access
+// Docs: https://app.airbills.org — contact @0xpsolite for API access
 
 const DEFAULT_BASE_URL = 'https://api.airbills.org/v1';
 
@@ -31,18 +31,27 @@ export interface AirbillsOrder {
   paymentUri?: string;
   createdAt: string;
   completedAt?: string;
-  token?: string; // electricity token, data PIN, etc.
+  token?: string;
   metadata?: any;
 }
 
 export interface CreateOrderParams {
-  service: string; // 'airtime' | 'data' | 'electricity' | 'cable' | 'betting' | 'transport'
+  service: string;
   planId?: string;
-  recipient: string; // phone, meter number, smartcard, etc.
-  amount?: number; // for variable amounts (airtime)
+  recipient: string;
+  amount?: number;
   currency?: string;
   email?: string;
   webhookUrl?: string;
+  network?: string;
+  provider?: string;
+  metadata?: Record<string, unknown>;
+}
+
+interface AirbillsApiResponse<T> {
+  status: string;
+  message: string;
+  data: T | null;
 }
 
 export class AirbillsClient {
@@ -61,16 +70,37 @@ export class AirbillsClient {
       headers: {
         'Content-Type': 'application/json',
         'X-API-Key': this.apiKey,
+        Accept: 'application/json',
         ...(options.headers || {}),
       },
     });
 
-    if (!response.ok) {
-      const text = await response.text().catch(() => '');
+    const text = await response.text().catch(() => '');
+    let parsed: AirbillsApiResponse<T> | T;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
       throw new Error(`AirBills API error ${response.status}: ${text.slice(0, 200)}`);
     }
 
-    return response.json() as Promise<T>;
+    // Wrapped response: { status, message, data }
+    if (parsed && typeof parsed === 'object' && 'status' in parsed && 'message' in parsed) {
+      const wrapped = parsed as AirbillsApiResponse<T>;
+      const ok = wrapped.status === '00' || wrapped.status === '0' || wrapped.status === 'success';
+      if (!ok) {
+        throw new Error(`AirBills: ${wrapped.message || 'Request failed'} (status ${wrapped.status})`);
+      }
+      if (wrapped.data === null || wrapped.data === undefined) {
+        throw new Error(`AirBills: empty response — ${wrapped.message || 'no data'}`);
+      }
+      return wrapped.data;
+    }
+
+    if (!response.ok) {
+      throw new Error(`AirBills API error ${response.status}: ${text.slice(0, 200)}`);
+    }
+
+    return parsed as T;
   }
 
   async getServices(): Promise<AirbillsService[]> {
@@ -91,7 +121,18 @@ export class AirbillsClient {
   async createOrder(params: CreateOrderParams): Promise<AirbillsOrder> {
     return this.request<AirbillsOrder>('/orders', {
       method: 'POST',
-      body: JSON.stringify(params),
+      body: JSON.stringify({
+        service: params.service,
+        planId: params.planId,
+        recipient: params.recipient,
+        amount: params.amount,
+        currency: params.currency || 'NGN',
+        email: params.email,
+        webhookUrl: params.webhookUrl,
+        network: params.network,
+        provider: params.provider,
+        metadata: params.metadata,
+      }),
     });
   }
 
@@ -99,6 +140,7 @@ export class AirbillsClient {
     return this.request<AirbillsOrder>(`/orders/${orderId}`);
   }
 
+  /** Health check — throws if API key is invalid */
   async ping(): Promise<{ status: string }> {
     return this.request<{ status: string }>('/ping');
   }

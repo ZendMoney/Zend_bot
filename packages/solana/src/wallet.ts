@@ -73,11 +73,12 @@ export class WalletService {
       return cached.data;
     }
 
-    const [solBalance, usdtBalance, usdcBalance, auddBalance] = await Promise.all([
+    const [solBalance, usdtBalance, usdcBalance, auddBalance, nearBalance] = await Promise.all([
       this.getSolBalance(walletAddress),
       this.getTokenBalance(walletAddress, SOLANA_TOKENS.USDT.mint),
       this.getTokenBalance(walletAddress, SOLANA_TOKENS.USDC.mint),
       this.getTokenBalance(walletAddress, SOLANA_TOKENS.AUDD.mint),
+      this.getTokenBalance(walletAddress, SOLANA_TOKENS.NEAR.mint),
     ]);
 
     const result = [
@@ -85,6 +86,7 @@ export class WalletService {
       { ...SOLANA_TOKENS.USDT, amount: usdtBalance },
       { ...SOLANA_TOKENS.USDC, amount: usdcBalance },
       { ...SOLANA_TOKENS.AUDD, amount: auddBalance },
+      { ...SOLANA_TOKENS.NEAR, amount: nearBalance },
     ];
 
     this.balanceCache.set(walletAddress, { data: result, ts: Date.now() });

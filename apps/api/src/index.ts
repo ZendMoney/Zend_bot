@@ -5,6 +5,13 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { db, transactions, ambassadorApplications, deviceSuspensionRequests } from '@zend/db';
 import { eq } from 'drizzle-orm';
+import {
+  verifyPajWebhookSignature,
+  normalizePajWebhookEvent,
+  webhookEventKey,
+  isDuplicateWebhook,
+  markWebhookProcessed,
+} from '@zend/shared';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 config({ path: resolve(__dirname, '../../../.env') });
@@ -12,7 +19,6 @@ config({ path: resolve(__dirname, '../../../.env') });
 const app = new Hono();
 const PORT = parseInt(process.env.API_PORT || '3001');
 
-// ─── Helper: send Telegram notification ───
 async function notifyUser(userId: string, text: string) {
   const token = process.env.BOT_TOKEN;
   if (!token) return;
@@ -27,28 +33,36 @@ async function notifyUser(userId: string, text: string) {
   }
 }
 
-// Health check
 app.get('/health', (c) => c.json({ status: 'ok', time: new Date().toISOString() }));
 
-// ─── PAJ Webhooks ───
 app.post('/webhooks/paj', async (c) => {
   const signature = c.req.header('x-paj-signature');
   const body = await c.req.text();
 
-  // TODO: Verify PAJ webhook signature
-  // if (!verifyPAJSignature(body, signature)) return c.json({ error: 'Unauthorized' }, 401);
+  if (!verifyPajWebhookSignature(body, signature)) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
 
-  const event = JSON.parse(body);
+  const parsed = JSON.parse(body);
+  const event = normalizePajWebhookEvent(parsed);
+  if (!event) {
+    return c.json({ received: true, note: 'Unrecognized event' });
+  }
+
+  const idemKey = webhookEventKey({ type: event.type, reference: event.reference });
+  if (idemKey && isDuplicateWebhook(idemKey)) {
+    return c.json({ received: true, note: 'Duplicate' });
+  }
 
   console.log('📩 PAJ Webhook:', event.type, event.reference);
 
   switch (event.type) {
     case 'onramp.deposit.confirmed': {
-      // User sent NGN → PAJ detected → USDT credited
-      // Update transaction, notify user
       const txRows = await db.select().from(transactions)
         .where(eq(transactions.pajReference, event.reference))
         .limit(1);
+
+      if (txRows.length > 0 && txRows[0].status === 'completed') break;
 
       await db.update(transactions)
         .set({ status: 'completed', completedAt: new Date() })
@@ -73,10 +87,11 @@ app.post('/webhooks/paj', async (c) => {
     }
 
     case 'offramp.settlement.confirmed': {
-      // PAJ settled NGN to bank
       const txRows = await db.select().from(transactions)
         .where(eq(transactions.pajReference, event.reference))
         .limit(1);
+
+      if (txRows.length > 0 && txRows[0].status === 'completed') break;
 
       await db.update(transactions)
         .set({ status: 'completed', completedAt: new Date() })
@@ -101,17 +116,31 @@ app.post('/webhooks/paj', async (c) => {
     }
   }
 
+  if (idemKey) markWebhookProcessed(idemKey);
   return c.json({ received: true });
 });
 
-// ─── Chain Rails Webhooks (placeholder) ───
-app.post('/webhooks/chain-rails', async (c) => {
-  const body = await c.req.json();
-  console.log('📩 ChainRails Webhook:', body);
-  return c.json({ received: true });
-});
+import { getNearIntentsClient } from '@zend/near-intents-client';
 
-// ─── Landing page forms ───
+app.get('/near-intents/status', async (c) => {
+  const depositAddress = c.req.query('depositAddress');
+  if (!depositAddress) {
+    return c.json({ error: 'Missing depositAddress' }, 400);
+  }
+
+  const client = getNearIntentsClient();
+  if (!client) {
+    return c.json({ error: 'NEAR Intents not configured' }, 500);
+  }
+
+  try {
+    const status = await client.getStatus(depositAddress);
+    return c.json(status);
+  } catch (err: any) {
+    console.error('[API] NEAR Intents status error:', err.message);
+    return c.json({ error: err.message }, 500);
+  }
+});
 
 app.post('/api/ambassador', async (c) => {
   const body = await c.req.json();
@@ -163,7 +192,6 @@ app.post('/api/device-suspend', async (c) => {
   }
 });
 
-// Start server
 serve({
   fetch: app.fetch,
   port: PORT,

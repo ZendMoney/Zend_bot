@@ -9,7 +9,7 @@
  *
  * Required env:
  *   PAJ_BUSINESS_API_KEY = your business API key from PAJ dashboard
- *   PAJ_ENVIRONMENT = Production | Staging | Local
+ *   PAJ_ENVIRONMENT = production | staging | local
  *
  * Base URLs:
  *   Staging:    https://api-staging.paj.cash
@@ -60,7 +60,13 @@ import {
 
 // ─── Init ───
 // Eager init: runs when module is first imported (after .env is loaded!)
-const _env = (process.env.PAJ_ENVIRONMENT as Environment) || Environment.Staging;
+const _envRaw = process.env.PAJ_ENVIRONMENT?.toLowerCase() || 'staging';
+const _env =
+  _envRaw === 'production'
+    ? Environment.Production
+    : _envRaw === 'local'
+    ? Environment.Local
+    : Environment.Staging;
 initializeSDK(_env);
 const _apiKey = process.env.PAJ_BUSINESS_API_KEY || '';
 console.log('[PAJ] Initialized:', _env, 'Key:', _apiKey ? 'SET' : 'NOT SET');

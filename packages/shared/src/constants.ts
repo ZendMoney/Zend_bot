@@ -60,6 +60,12 @@ export const SOLANA_TOKENS = {
     decimals: 6,
     name: 'Australian Digital Dollar',
   },
+  NEAR: {
+    mint: '3ZLekZYq2qkZiSpnSvabjit34tUkjSwD1JFuW9as9wBG',
+    symbol: 'NEAR',
+    decimals: 9,
+    name: 'NEAR',
+  },
 } as const;
 
 // Conversation States
@@ -90,6 +96,8 @@ export enum ConversationState {
   AWAITING_BANK_ACCOUNT_NAME = 'awaiting_bank_account_name',
   AWAITING_ONRAMP_AMOUNT = 'awaiting_onramp_amount',
   AWAITING_BRIDGE_AMOUNT = 'awaiting_bridge_amount',
+  AWAITING_WITHDRAW_RECIPIENT = 'awaiting_withdraw_recipient',
+  AWAITING_WITHDRAW_AMOUNT = 'awaiting_withdraw_amount',
   // Bill payments
   BILL_SELECT_TYPE = 'bill_select_type',
   BILL_SELECT_NETWORK = 'bill_select_network',

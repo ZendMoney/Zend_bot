@@ -1,16 +1,9 @@
 /**
  * AirBills Payment Service
  * Integrates AirBills (Solana-native Nigerian bill payments) into Zend.
- *
- * Flow:
- * 1. Create AirBills order (recipient, amount, service)
- * 2. Check user USDT balance
- * 3. Send USDT from user wallet → AirBills payment address
- * 4. Poll AirBills until complete/failed
- * 5. Save record + return result
  */
 
-import { Keypair, PublicKey, SystemProgram } from '@solana/web3.js';
+import { Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { db, billPayments, users } from '@zend/db';
 import { eq } from 'drizzle-orm';
@@ -19,12 +12,29 @@ import { SOLANA_TOKENS } from '@zend/shared';
 import type { BillPaymentResult } from '../bills/types.js';
 import { AirbillsClient } from '@zend/airbills-client';
 import { decryptPrivateKey } from '../../utils/wallet.js';
+import { MIN_SOL_FOR_GAS } from '../../utils/fees.js';
 
 const SOLANA_RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_KEY || '';
 const walletService = new WalletService(SOLANA_RPC);
 
 function generateReference(): string {
   return `ZND-AB-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+}
+
+async function ensureGasForPayment(walletAddress: string): Promise<void> {
+  const hasGas = await walletService.hasEnoughSolForGas(walletAddress, MIN_SOL_FOR_GAS);
+  if (hasGas) return;
+  if (!DEV_WALLET_SECRET) {
+    throw new Error('Insufficient SOL for gas. Add a small amount of SOL to your wallet or contact support.');
+  }
+  const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
+  const devBalance = await walletService.getSolBalance(devKeypair.publicKey.toBase58());
+  if (devBalance < MIN_SOL_FOR_GAS * 2) {
+    throw new Error('Gas station is temporarily unavailable. Please try again shortly.');
+  }
+  await walletService.sendSol(devKeypair, walletAddress, MIN_SOL_FOR_GAS);
+  console.log('[AirBills] Funded SOL for gas:', walletAddress);
 }
 
 interface AirbillsPaymentOptions {
@@ -32,26 +42,23 @@ interface AirbillsPaymentOptions {
   service: string;
   recipient: string;
   amountNgn: number;
-  metadata?: Record<string, any>;
+  network?: string;
+  provider?: string;
+  planId?: string;
 }
 
-/**
- * Core payment flow — used by all bill types.
- */
 async function executeAirbillsPayment(
   client: AirbillsClient,
   opts: AirbillsPaymentOptions
 ): Promise<BillPaymentResult> {
-  const { userId, service, recipient, amountNgn, metadata } = opts;
+  const { userId, service, recipient, amountNgn, network, provider, planId } = opts;
 
-  // 1. Fetch user
   const userRows = await db.select().from(users).where(eq(users.id, userId)).limit(1);
   if (!userRows.length || !userRows[0].walletEncryptedKey) {
     return { success: false, reference: '', message: 'User wallet not found.' };
   }
   const user = userRows[0];
 
-  // 2. Create AirBills order
   let order;
   try {
     const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || '';
@@ -64,25 +71,36 @@ async function executeAirbillsPayment(
       currency: 'NGN',
       email: user.email || undefined,
       webhookUrl,
+      network,
+      provider,
+      planId,
+      metadata: { network, provider, source: 'zend-bot' },
     });
   } catch (err: any) {
     console.error('[AirBills] createOrder failed:', err);
-    return { success: false, reference: '', message: `AirBills error: ${err.message || 'Could not create order'}` };
+    const msg = err.message?.includes('Forbidden')
+      ? 'AirBills API key is invalid or expired. Contact support.'
+      : (err.message || 'Could not create order');
+    return { success: false, reference: '', message: msg };
   }
 
   const ref = generateReference();
 
-  // 3. Check USDT balance
   const usdtBalance = await walletService.getTokenBalance(user.walletAddress, SOLANA_TOKENS.USDT.mint);
   if (usdtBalance < order.amountCrypto) {
     return {
       success: false,
       reference: ref,
-      message: `Insufficient USDT balance. You have ${usdtBalance.toFixed(2)} USDT but need ${order.amountCrypto.toFixed(4)} USDT.`,
+      message: `Insufficient USDT. You have ${usdtBalance.toFixed(2)} USDT but need ${order.amountCrypto.toFixed(4)} USDT.`,
     };
   }
 
-  // 4. Send USDT to AirBills payment address
+  try {
+    await ensureGasForPayment(user.walletAddress);
+  } catch (gasErr: any) {
+    return { success: false, reference: ref, message: gasErr.message };
+  }
+
   let solanaTxHash: string | undefined;
   try {
     const secretKey = await decryptPrivateKey(user.walletEncryptedKey);
@@ -101,21 +119,19 @@ async function executeAirbillsPayment(
     return { success: false, reference: ref, message: `Payment failed: ${err.message || 'Could not send USDT'}` };
   }
 
-  // 5. Save pending record
   await db.insert(billPayments).values({
     userId,
     type: service as any,
-    provider: 'airbills',
+    provider: network || provider || 'airbills',
     recipient,
     amountNgn: String(amountNgn),
     amountUsdt: String(order.amountCrypto),
     status: 'pending',
     reference: ref,
     externalReference: order.id,
-    metadata: { order, solanaTxHash },
+    metadata: { order, solanaTxHash, network, provider },
   });
 
-  // 6. Poll for completion
   let finalOrder = order;
   let attempts = 0;
   const maxAttempts = 30;
@@ -151,7 +167,7 @@ async function executeAirbillsPayment(
         return {
           success: false,
           reference: ref,
-          message: 'AirBills could not fulfil the order. Your USDT will be refunded.',
+          message: 'AirBills could not fulfil the order. Contact support for a refund.',
           raw: finalOrder,
         };
       }
@@ -160,17 +176,14 @@ async function executeAirbillsPayment(
     }
   }
 
-  // Timeout — still pending, webhook will handle completion
   return {
     success: true,
     reference: ref,
     externalReference: order.id,
-    message: `Payment sent. Your ${service} order is processing and will be delivered shortly.`,
+    message: `Payment sent. Your ${service} order is processing — you'll be notified when complete.`,
     raw: finalOrder,
   };
 }
-
-// ─── Public API ───
 
 export async function purchaseAirtime(
   client: AirbillsClient,
@@ -184,7 +197,7 @@ export async function purchaseAirtime(
     service: 'airtime',
     recipient: phone,
     amountNgn,
-    metadata: { network },
+    network,
   });
 }
 
@@ -193,14 +206,16 @@ export async function purchaseData(
   userId: string,
   phone: string,
   amountNgn: number,
-  network: string
+  network: string,
+  planId?: string
 ): Promise<BillPaymentResult> {
   return executeAirbillsPayment(client, {
     userId,
     service: 'data',
     recipient: phone,
     amountNgn,
-    metadata: { network },
+    network,
+    planId,
   });
 }
 
@@ -216,7 +231,7 @@ export async function purchaseElectricity(
     service: 'electricity',
     recipient: meterNumber,
     amountNgn,
-    metadata: { disco },
+    provider: disco,
   });
 }
 
@@ -232,6 +247,17 @@ export async function purchaseCable(
     service: 'cable',
     recipient: smartCardNumber,
     amountNgn,
-    metadata: { provider },
+    provider,
   });
+}
+
+/** Startup health check */
+export async function checkAirbillsHealth(client: AirbillsClient): Promise<boolean> {
+  try {
+    await client.ping();
+    return true;
+  } catch (err: any) {
+    console.warn('[AirBills] Health check failed:', err.message);
+    return false;
+  }
 }

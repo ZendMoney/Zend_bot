@@ -186,7 +186,9 @@ export interface UserSession {
     chainKey: string;
     sourceChain: string;
     token: string;
-    tokenIn: string;
+    assetId: string;
+    destinationAsset: string;
+    destinationSymbol: string;
   };
   lastActivity: Date;
 }
@@ -195,6 +197,54 @@ export interface UserSession {
 export interface ZendContext {
   user?: User;
   session: UserSession;
+}
+
+// NEAR Intents
+export interface NearIntentsQuote {
+  quoteId: string;
+  depositAddress: string;
+  refundTo: string;
+  originAsset: {
+    assetId: string;
+    symbol: string;
+    name: string;
+    decimals: number;
+    blockchain: string;
+  };
+  destinationAsset: {
+    assetId: string;
+    symbol: string;
+    name: string;
+    decimals: number;
+    blockchain: string;
+  };
+  amountIn: string;
+  amountOut: string;
+  fee: string;
+  slippageTolerance: number;
+  deadline: string;
+  status: 'PENDING' | 'EXPIRED' | 'EXECUTED';
+}
+
+export interface NearIntentsStatus {
+  depositAddress: string;
+  status:
+    | 'PENDING_DEPOSIT'
+    | 'KNOWN_DEPOSIT_TX'
+    | 'PROCESSING'
+    | 'SUCCESS'
+    | 'INCOMPLETE_DEPOSIT'
+    | 'REFUNDED'
+    | 'FAILED';
+  originAsset: NearIntentsQuote['originAsset'];
+  destinationAsset: NearIntentsQuote['destinationAsset'];
+  amountIn?: string;
+  amountOut?: string;
+  txHash?: string;
+  destinationTxHash?: string;
+  refundTxHash?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 // Jupiter Swap

@@ -88,8 +88,11 @@ export const transactions = pgTable('transactions', {
   pajReference: varchar('paj_reference', { length: 50 }),
   pajPoolAddress: varchar('paj_pool_address', { length: 44 }),
   
-  // ChainRails
+  // ChainRails (deprecated — hidden in favor of NEAR Intents)
   chainrailsIntentAddress: varchar('chainrails_intent_address', { length: 100 }),
+  
+  // NEAR Intents
+  nearIntentDepositAddress: varchar('near_intent_deposit_address', { length: 100 }),
   
   // Metadata
   metadata: jsonb('metadata'),

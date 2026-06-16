@@ -1,0 +1,1 @@
+ALTER TABLE "transactions" ADD COLUMN "near_intent_deposit_address" varchar(100);
