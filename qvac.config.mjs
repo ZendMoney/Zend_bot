@@ -7,4 +7,7 @@ export default {
   cacheDirectory: path.isAbsolute(cacheDirectory)
     ? cacheDirectory
     : path.resolve(cacheDirectory),
+  // Reduce sdk:server noise on Railway (progress still logged by our throttled helper)
+  loggerLevel: 'warn',
+  loggerConsoleOutput: true,
 };

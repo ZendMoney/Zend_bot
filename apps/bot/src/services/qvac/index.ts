@@ -16,6 +16,7 @@ import {
   type CompletionRun,
   type OCRTextBlock,
 } from '@qvac/sdk';
+import { createThrottledProgressLogger } from '../../utils/qvac-progress.js';
 
 // Model constants are exported at runtime from the main SDK entry,
 // but TypeScript's NodeNext resolution cannot trace through barrel files.
@@ -66,11 +67,7 @@ async function loadModelOnce(key: keyof typeof MODELS, modelType: string, modelC
       modelSrc: descriptor,
       modelType: modelType as any,
       modelConfig,
-      onProgress: (progress: { percentage?: number; loaded?: number; total?: number }) => {
-        if (progress.percentage !== undefined) {
-          console.log(`[QVAC] ${descriptor.name}: ${progress.percentage.toFixed(1)}%`);
-        }
-      },
+      onProgress: createThrottledProgressLogger(descriptor.name, 10),
     });
 
     loadedModels.set(key, modelId);

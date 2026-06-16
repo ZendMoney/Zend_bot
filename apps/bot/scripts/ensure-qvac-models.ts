@@ -11,6 +11,7 @@ import fs from 'fs';
 import path from 'path';
 import { loadModel, unloadModel } from '@qvac/sdk';
 import * as qvacSdk from '@qvac/sdk';
+import { createThrottledProgressLogger } from '../src/utils/qvac-progress.js';
 
 const registry = qvacSdk as any;
 const USE_LIGHT = process.env.QVAC_USE_LIGHT_MODELS === 'true';
@@ -84,11 +85,7 @@ async function downloadAll(): Promise<void> {
         modelSrc: model.descriptor,
         modelType: model.type as any,
         modelConfig: model.config,
-        onProgress: (progress: { percentage?: number }) => {
-          if (progress.percentage !== undefined) {
-            process.stdout.write(`   ${progress.percentage.toFixed(1)}%\r`);
-          }
-        },
+        onProgress: createThrottledProgressLogger(model.name, 25),
       });
       console.log(`   ✅ ${model.name} → ${modelId}`);
       await unloadModel({ modelId });
