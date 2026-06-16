@@ -243,7 +243,10 @@ function detectIntent(text: string): ParsedCommand['intent'] {
   if (/\b(send|transfer|pay)\b/.test(lower) && extractWalletAddress(text)) {
     return 'send';
   }
-  if (/\b(add|deposit|fund)\b.*\b(naira|ngn|money)\b/.test(lower)) {
+  if (/\b(add|deposit|fund|receive|get)\b.*\b(naira|ngn)\b/.test(lower)) {
+    return 'add_naira';
+  }
+  if (/\bwant to receive\b/.test(lower) && /\b(naira|ngn|\d)/.test(lower)) {
     return 'add_naira';
   }
   if (/\b(cash out|withdraw|off.?ramp)\b/.test(lower)) {
@@ -382,8 +385,11 @@ export async function parseWithQVAC(text: string): Promise<ParsedCommand> {
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
 
+    let intent = parsed.intent || 'unknown';
+    if (intent === 'receive') intent = 'add_naira';
+
     return {
-      intent: parsed.intent || 'unknown',
+      intent,
       amount: parsed.amount ? Number(parsed.amount) : undefined,
       currency: parsed.currency || 'NGN',
       fromToken: parsed.fromToken || extractFromToken(text),
@@ -405,7 +411,8 @@ export function looksLikePaymentCommand(text: string): boolean {
   const lower = text.toLowerCase();
   if (/\d{10}/.test(text)) return true;
   if (/\b\d+\s*k\b/i.test(text)) return true;
-  if (/\b(send|transfer|pay|add naira|cash out|withdraw|balance|swap|receive|deposit|bridge)\b/i.test(lower)) return true;
+  if (/\b(send|transfer|pay|add naira|cash out|withdraw|balance|swap|deposit|bridge)\b/i.test(lower)) return true;
+  if (/\b(receive|get|add)\b.*\b(naira|ngn|\d)/i.test(lower)) return true;
   if (/\b(gtb|gtbank|uba|access|zenith|opay|kuda|moniepoint|palmpay|first bank|fcmb|wema)\b/i.test(lower)) return true;
   return false;
 }
@@ -559,7 +566,7 @@ export async function chatWithAI(text: string, features?: BotFeature[]): Promise
   const systemPrompt = features?.length
     ? buildChatSystemPrompt(features)
     : CHAT_SYSTEM_PROMPT;
-  const reply = await callQVAC(systemPrompt, text, 0.7, 400);
+  const reply = await callQVAC(systemPrompt, text, 0.7, 200);
   if (!reply) return null;
   return { reply: reply.trim() };
 }
