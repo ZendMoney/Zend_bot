@@ -400,21 +400,44 @@ export async function parseWithQVAC(text: string): Promise<ParsedCommand> {
   }
 }
 
+/** Skip slow LLM parsing for casual chat — reserve QVAC for payment-like text. */
+export function looksLikePaymentCommand(text: string): boolean {
+  const lower = text.toLowerCase();
+  if (/\d{10}/.test(text)) return true;
+  if (/\b\d+\s*k\b/i.test(text)) return true;
+  if (/\b(send|transfer|pay|add naira|cash out|withdraw|balance|swap|receive|deposit|bridge)\b/i.test(lower)) return true;
+  if (/\b(gtb|gtbank|uba|access|zenith|opay|kuda|moniepoint|palmpay|first bank|fcmb|wema)\b/i.test(lower)) return true;
+  return false;
+}
+
+/** Fast path for greetings — no LLM needed. */
+export function isCasualGreeting(text: string): boolean {
+  const t = text.trim().toLowerCase().replace(/[!?.]+$/g, '');
+  return /^(hi|hello|hey|holla|howdy|sup|yo|good morning|good afternoon|good evening)$/.test(t)
+    || /^how far$/.test(t)
+    || /^how you dey$/.test(t)
+    || /^wetin dey$/.test(t);
+}
+
 /**
- * Main parse function - tries local first, falls back to QVAC LLM
+ * Main parse function - tries local first, falls back to QVAC LLM for payment-like text only
  */
 export async function parseCommand(text: string, useAI = false): Promise<ParsedCommand> {
   if (useAI) {
     return parseWithQVAC(text);
   }
-  
+
   const local = parseLocal(text);
-  
-  if (local.intent === 'unknown') {
-    return parseWithQVAC(text);
+
+  if (local.intent !== 'unknown') {
+    return local;
   }
-  
-  return local;
+
+  if (!looksLikePaymentCommand(text)) {
+    return local;
+  }
+
+  return parseWithQVAC(text);
 }
 
 // ─── Menu Flow AI Parser ───
@@ -532,8 +555,11 @@ export async function chatWithKimi(text: string, features?: BotFeature[]): Promi
   return { reply: reply.trim() };
 }
 
-export async function chatWithAI(text: string): Promise<ChatReply | null> {
-  const reply = await callQVAC(CHAT_SYSTEM_PROMPT, text, 0.7, 400);
+export async function chatWithAI(text: string, features?: BotFeature[]): Promise<ChatReply | null> {
+  const systemPrompt = features?.length
+    ? buildChatSystemPrompt(features)
+    : CHAT_SYSTEM_PROMPT;
+  const reply = await callQVAC(systemPrompt, text, 0.7, 400);
   if (!reply) return null;
   return { reply: reply.trim() };
 }

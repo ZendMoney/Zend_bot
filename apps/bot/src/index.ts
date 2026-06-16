@@ -21,7 +21,7 @@ import { eq, sql, and, desc } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
 import { AirbillsClient } from '@zend/airbills-client';
 import {
-  parseCommand, transcribeVoice, chatWithAI, chatWithKimi,
+  parseCommand, transcribeVoice, chatWithAI, chatWithKimi, isCasualGreeting,
   analyzeVoiceWithAI, analyzeVoiceWithKimi, parseMenuInputWithAI,
   parseReceiptWithQVAC, askTransactionQuestion, indexTransaction,
   parseBulkSendWithAI, type ParsedCommand,
@@ -3640,6 +3640,18 @@ bot.on(message('text'), async (ctx, next) => {
 
   // ─── NLP: Parse natural language when IDLE ───
   if (session.state === ConversationState.IDLE) {
+    // ─── Instant greetings (no slow LLM) ───
+    if (isCasualGreeting(text)) {
+      const name = ctx.from?.first_name || 'there';
+      await ctx.reply(
+        `Hey ${name}! 👋 No wahala — I'm here.\n\n` +
+        `Try *💰 Balance*, *📤 Send*, or say:\n` +
+        `"Send 500 to 08123456789 Opay"`,
+        { parse_mode: 'Markdown', ...mainMenu }
+      );
+      return;
+    }
+
     // ─── Semantic Transaction Search (QVAC Embeddings) ───
     const historyQueryPatterns = /\b(how much did i send|how much did i|did i send|transactions? with|payments? to|money i sent|what did i pay|show me my|search my)\b/i;
     if (historyQueryPatterns.test(text)) {
@@ -3922,16 +3934,19 @@ bot.on(message('text'), async (ctx, next) => {
       }
 
       default: {
-        // Try conversational AI for unknown intents
         const features = await getBotFeatures();
-        const aiReply = await chatWithKimi(text, features);
-        if (aiReply) {
-          await ctx.reply(aiReply.reply, mainMenu);
+        const loading = await showLoading(ctx, 'Thinking...');
+        const aiReply = (await chatWithAI(text, features)) ?? (await chatWithKimi(text, features));
+        if (aiReply?.reply) {
+          await finishLoading(ctx, loading.message_id, aiReply.reply);
+          await ctx.reply('Menu:', mainMenu);
         } else {
-          await ctx.reply(
-            `I didn't understand that. Try using the menu below or type a command like "Send 50k to Tunde GTB 0123456789".`,
-            mainMenu
+          await finishLoading(
+            ctx,
+            loading.message_id,
+            `I didn't catch that. Try the menu below or say something like:\n"Send 500 to 08123456789 Opay"`
           );
+          await ctx.reply('Menu:', mainMenu);
         }
       }
     }
