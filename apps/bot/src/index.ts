@@ -104,6 +104,20 @@ const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_K
 const DEV_WALLET_LOW_BALANCE_THRESHOLD = 0.05; // alert if below ~$8–10 worth of SOL
 const DEV_WALLET_CRITICAL_THRESHOLD = 0.01; // critical alert if below this
 
+/** Public HTTPS base URL for PAJ/AirBills callbacks (not used for Telegram delivery). */
+function getPublicBaseUrl(): string | undefined {
+  const explicit = process.env.WEBHOOK_BASE_URL?.trim();
+  if (explicit) return explicit.replace(/\/$/, '');
+  const railway = process.env.RAILWAY_PUBLIC_DOMAIN?.trim();
+  if (railway) return `https://${railway.replace(/\/$/, '')}`;
+  return undefined;
+}
+
+function getPajWebhookUrl(): string {
+  const base = getPublicBaseUrl();
+  return base ? `${base}/webhooks/paj` : 'https://example.com/webhook';
+}
+
 /** Check whether a user has never completed a transaction (new user). */
 async function isNewUser(userId: string): Promise<boolean> {
   try {
@@ -4692,9 +4706,7 @@ async function showVirtualAccount(
   // Check if we have a cached virtual account to reuse (max 24h old)
   let virtualAccount: any = user[0]?.virtualAccount;
   const VA_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
-  const webhookUrl = process.env.WEBHOOK_BASE_URL
-    ? `${process.env.WEBHOOK_BASE_URL.replace(/\/$/, '')}/webhooks/paj`
-    : 'https://example.com/webhook';
+  const webhookUrl = getPajWebhookUrl();
 
   // Always generate a fresh virtual account — PAJ accounts are one-time use
   const loadingVA = await showLoading(ctx, 'Creating your virtual bank account...');
@@ -4948,9 +4960,7 @@ async function executeSendCore(
       const pajBank = bestMatch.bank;
       console.log(`[PAJ] Send bank matched: ${ourBank?.name} → ${pajBank.name} (score: ${bestMatch.score})`);
 
-      const webhookUrl = process.env.WEBHOOK_BASE_URL
-        ? `${process.env.WEBHOOK_BASE_URL.replace(/\/$/, '')}/webhooks/paj`
-        : 'https://example.com/webhook';
+      const webhookUrl = getPajWebhookUrl();
       const order = await pajClient.createOfframp({
         bank: pajBank.id,
         accountNumber: finalAccountNumber,
@@ -5656,9 +5666,7 @@ async function showReceive(ctx: ZendContext, userId: string) {
           recipient: walletAddress,
           mint: SOLANA_TOKENS.USDT.mint,
           chain: Chain.SOLANA,
-          webhookURL: process.env.WEBHOOK_BASE_URL
-            ? `${process.env.WEBHOOK_BASE_URL.replace(/\/$/, '')}/webhooks/paj`
-            : 'https://example.com/webhook',
+          webhookURL: getPajWebhookUrl(),
         }, user[0].pajSessionToken!);
 
         virtualAccount = {
@@ -8316,17 +8324,16 @@ async function main() {
   // Start webhook server (runs alongside bot)
   startWebhookServer(bot);
 
-  // Launch bot — webhooks in production, polling for local dev only
-  const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || process.env.RAILWAY_PUBLIC_DOMAIN;
-  const isRailway = !!process.env.RAILWAY_PUBLIC_DOMAIN;
+  // Launch bot — polling by default (reliable on Railway). Telegram webhooks opt-in only.
+  const publicBaseUrl = getPublicBaseUrl();
+  const useTelegramWebhook = process.env.TELEGRAM_USE_WEBHOOK === 'true';
   let isWebhookMode = false;
 
-  // Always clear any existing webhook first to prevent 429 conflicts
   async function clearWebhook(retries = 3): Promise<boolean> {
     for (let i = 0; i < retries; i++) {
       try {
         await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-        console.log('[Bot] Webhook cleared successfully');
+        console.log('[Bot] Telegram webhook cleared');
         return true;
       } catch (err: any) {
         console.warn(`[Bot] Failed to clear webhook (attempt ${i + 1}/${retries}):`, err.message);
@@ -8336,23 +8343,28 @@ async function main() {
     return false;
   }
 
-  if (webhookBaseUrl) {
-    const telegramWebhookUrl = `${webhookBaseUrl.replace(/\/$/, '')}/webhook/telegram`;
+  if (useTelegramWebhook && publicBaseUrl) {
+    const telegramWebhookUrl = `${publicBaseUrl}/webhook/telegram`;
     try {
       await bot.telegram.setWebhook(telegramWebhookUrl, { drop_pending_updates: true });
-      console.log('🤖 Zend bot running in webhook mode');
+      console.log('🤖 Zend bot running in Telegram webhook mode');
       console.log(`   Webhook URL: ${telegramWebhookUrl}`);
       isWebhookMode = true;
     } catch (webhookErr: any) {
-      console.error('[Bot] Failed to set webhook:', webhookErr.message);
+      console.error('[Bot] Failed to set Telegram webhook:', webhookErr.message);
       console.log('🤖 Falling back to polling mode...');
       await clearWebhook();
-      bot.launch({ dropPendingUpdates: true });
+      await bot.launch({ dropPendingUpdates: true });
+      console.log('🤖 Zend bot running in polling mode (webhook fallback)');
     }
   } else {
-    console.log('🤖 Bot running in polling mode (local dev)...');
     await clearWebhook();
-    bot.launch({ dropPendingUpdates: true });
+    await bot.launch({ dropPendingUpdates: true });
+    console.log('🤖 Zend bot running in polling mode');
+    if (!useTelegramWebhook) {
+      console.log('   PAJ/AirBills HTTP webhooks still active on the same server');
+      console.log('   (Set TELEGRAM_USE_WEBHOOK=true only if Telegram can reach your domain)');
+    }
   }
 
   // Start scheduled transfer executor (every 60 seconds)
