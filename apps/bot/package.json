@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@qvac/sdk": "workspace:*",
+    "@qvac/sdk": "^0.12.0",
     "@zend/near-intents-client": "workspace:*",
     "@zend/db": "workspace:*",
     "@zend/paj-client": "workspace:*",

@@ -31,7 +31,6 @@ COPY packages/solana/package.json packages/solana/package.json
 COPY packages/paj-client/package.json packages/paj-client/package.json
 COPY packages/chainrails-client/package.json packages/chainrails-client/package.json
 COPY packages/nlu/package.json packages/nlu/package.json
-COPY packages/qvac-sdk/package.json packages/qvac-sdk/package.json
 COPY packages/airbills-client/package.json packages/airbills-client/package.json
 COPY packages/near-intents-client/package.json packages/near-intents-client/package.json
 
