@@ -724,6 +724,20 @@ const adminMenu = Markup.keyboard([
   ['🔙 Back to Menu'],
 ]).resize();
 
+/** Reply-keyboard labels delegated to bot.hears() — must not be swallowed by the text handler */
+const REPLY_KEYBOARD_BUTTONS = new Set([
+  // Main menu
+  '💰 Balance', '📤 Send', '📥 Receive', '🔄 Swap', '💳 Bills', '📋 History',
+  '⚙️ Settings', '📦 Bulk Send', '📅 Schedule', '📖 How to Use', '✨ Features',
+  '📝 Feedback', '❓ Help', '💵 Add Naira', '💴 Cash Out',
+  // Bills submenu
+  '📱 Airtime', '🌐 Data', '⚡ Electricity', '📺 Cable TV',
+  // Admin submenu
+  '📊 Stats', '👤 Users', '💸 Transactions', '🏦 Bank Accounts', '📅 Scheduled', '🤖 QVAC Status',
+  // Shared
+  '🔙 Back to Menu',
+]);
+
 // Escape Telegram legacy Markdown special chars in user-generated / AI text
 // Also strips HTML-like tags to prevent XSS/formatting injection
 function escapeTelegramMarkdown(text: string | undefined | null, maxLength = 200): string {
@@ -2375,9 +2389,8 @@ bot.on(message('text'), async (ctx, next) => {
   const text = ctx.message.text;
   const session = getSession(userId);
 
-  // ─── Pass menu buttons to bot.hears() handlers ───
-  const menuButtons = ['💰 Balance', '📤 Send', '📥 Receive', '🔄 Swap', '💳 Bills', '📋 History', '⚙️ Settings', '📦 Bulk Send', '📅 Schedule', '📖 How to Use', '✨ Features', '📝 Feedback', '❓ Help'];
-  if (menuButtons.includes(text)) {
+  // ─── Pass reply-keyboard buttons to bot.hears() handlers ───
+  if (REPLY_KEYBOARD_BUTTONS.has(text)) {
     return next();
   }
 
