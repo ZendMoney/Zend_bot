@@ -1,11 +1,6 @@
-// ─── Load .env FIRST — before any imports that need env vars ───
-import { config } from 'dotenv';
-import { resolve, dirname } from 'path';
-import { fileURLToPath } from 'url';
-import { createServer } from 'http';
-const __dirname = dirname(fileURLToPath(import.meta.url));
-config({ path: resolve(__dirname, '../../../.env') });
+import './env.js';
 
+import { createServer } from 'http';
 import { Telegraf, Markup, Context } from 'telegraf';
 import { Keypair, PublicKey, SystemProgram, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import {
@@ -18,8 +13,6 @@ import { message } from 'telegraf/filters';
 import { db, checkConnection } from '@zend/db';
 import { users, transactions, savedBankAccounts, scheduledTransfers, ambassadorApplications, deviceSuspensionRequests, botFeatures, billPayments, feedback } from '@zend/db';
 import { eq, sql, and, desc } from 'drizzle-orm';
-import { WalletService } from '@zend/solana';
-import { AirbillsClient } from '@zend/airbills-client';
 import {
   parseCommand, transcribeVoice, chatWithAI, chatWithKimi, isCasualGreeting,
   analyzeVoiceWithAI, analyzeVoiceWithKimi, parseMenuInputWithAI,
@@ -27,7 +20,6 @@ import {
   parseBulkSendWithAI, type ParsedCommand,
 } from './services/nlp.js';
 import { initQVAC, getQVACStatus } from './services/qvac/index.js';
-import type { PAJClient } from '@zend/paj-client';
 import {
   ConversationState,
   SOLANA_TOKENS,
@@ -37,14 +29,7 @@ import {
 } from '@zend/shared';
 
 import crypto from 'crypto';
-import { rateLimitMiddleware } from './middleware/rateLimit.js';
-import { sessionMiddleware } from './middleware/session.js';
-import {
-  autoDeleteMiddleware,
-  registerUserMessageTracking,
-  startAutoDeleteCleanup,
-  PIN_TTL_MS,
-} from './middleware/auto-delete.js';
+import { PIN_TTL_MS } from './middleware/auto-delete.js';
 import { getSession, setSession, initSessionStore } from './session/store.js';
 import type { ZendContext, ZendSession } from './session/types.js';
 import { checkSendBalance } from './utils/send-balance.js';
@@ -73,50 +58,31 @@ import {
 } from './utils/fees.js';
 import { getSolPriceInUsdt } from './utils/sol-price.js';
 import { AUDD_ENABLED, isAuddSwapPair } from './utils/flags.js';
-
-const BOT_TOKEN = process.env.BOT_TOKEN!;
-const SOLANA_RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-
-// Lazy-load PAJ client to ensure .env is loaded first
-let _pajClient: PAJClient | null = null;
-async function getPAJClient(): Promise<PAJClient | null> {
-  if (_pajClient) return _pajClient;
-  const { createPAJClient } = await import('@zend/paj-client');
-  _pajClient = createPAJClient();
-  return _pajClient;
-}
-
-// Re-export enums from paj_ramp via paj-client for static use
-const _pajEnums = await import('@zend/paj-client');
-const Currency = _pajEnums.Currency;
-const Chain = _pajEnums.Chain;
-
-// ─── Services ───
-const walletService = new WalletService(SOLANA_RPC);
-// AirBills — Nigerian bill payments via Solana
-const airbillsClient = process.env.AIRBILLS_API_KEY
-  ? new AirbillsClient(process.env.AIRBILLS_API_KEY, process.env.AIRBILLS_BASE_URL)
-  : null;
-
-// Dev wallet for gas sponsorship (supports ZEND_DEV_WALLET_SECRET or PV_KEY)
-const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_KEY || '';
+import {
+  SOLANA_RPC,
+  Currency,
+  Chain,
+  walletService,
+  airbillsClient,
+  getPAJClient,
+  DEV_WALLET_SECRET,
+  getPublicBaseUrl,
+  getPajWebhookUrl,
+} from './deps.js';
+import { bot } from './bot.js';
+import {
+  mainMenu,
+  cancelKeyboard,
+  billsMenu,
+  billsBackKeyboard,
+  adminMenu,
+  REPLY_KEYBOARD_BUTTONS,
+} from './keyboards/index.js';
+import { md, escapeTelegramMarkdown } from './lib/telegram.js';
+import { isGroupChat, getBotUsername, promptPrivateChat } from './lib/group.js';
 
 const DEV_WALLET_LOW_BALANCE_THRESHOLD = 0.05; // alert if below ~$8–10 worth of SOL
 const DEV_WALLET_CRITICAL_THRESHOLD = 0.01; // critical alert if below this
-
-/** Public HTTPS base URL for PAJ/AirBills callbacks (not used for Telegram delivery). */
-function getPublicBaseUrl(): string | undefined {
-  const explicit = process.env.WEBHOOK_BASE_URL?.trim();
-  if (explicit) return explicit.replace(/\/$/, '');
-  const railway = process.env.RAILWAY_PUBLIC_DOMAIN?.trim();
-  if (railway) return `https://${railway.replace(/\/$/, '')}`;
-  return undefined;
-}
-
-function getPajWebhookUrl(): string {
-  const base = getPublicBaseUrl();
-  return base ? `${base}/webhooks/paj` : 'https://example.com/webhook';
-}
 
 /** Check whether a user has never completed a transaction (new user). */
 async function isNewUser(userId: string): Promise<boolean> {
@@ -295,15 +261,6 @@ async function fundSolIfNeeded(
 }
 
 // ─── Helpers ───
-// Escape Telegram Markdown v1 special chars in user-generated text
-function md(text: string | undefined | null): string {
-  if (!text) return '';
-  return text
-    .replace(/_/g, '＿')
-    .replace(/\*/g, '•')
-    .replace(/`/g, "'");
-}
-
 function generateTxId(): string {
   return 'ZND-' + Math.random().toString(36).substring(2, 7).toUpperCase();
 }
@@ -697,145 +654,6 @@ async function verifyBankAccount(
     }
     return { verified: false, error: err.message || 'Could not verify account' };
   }
-}
-
-// ─── Keyboards ───
-const mainMenu = Markup.keyboard([
-  ['💰 Balance', '🔄 Swap'],
-  ['📥 Receive', '💳 Bills', '📋 History'],
-  ['⚙️ Settings', '📖 How to Use', '✨ Features'],
-  ['📝 Feedback', '❓ Help'],
-]).resize();
-
-const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
-
-const billsMenu = Markup.keyboard([
-  ['📱 Airtime', '🌐 Data'],
-  ['⚡ Electricity', '📺 Cable TV'],
-  ['🔙 Back to Menu'],
-]).resize();
-
-const billsBackKeyboard = Markup.keyboard([['🔙 Back to Menu']]).resize();
-
-const adminMenu = Markup.keyboard([
-  ['📊 Stats', '👤 Users'],
-  ['💸 Transactions', '🏦 Bank Accounts'],
-  ['📅 Scheduled', '🤖 QVAC Status'],
-  ['🔙 Back to Menu'],
-]).resize();
-
-/** Reply-keyboard labels delegated to bot.hears() — must not be swallowed by the text handler */
-const REPLY_KEYBOARD_BUTTONS = new Set([
-  // Main menu
-  '💰 Balance', '📤 Send', '📥 Receive', '🔄 Swap', '💳 Bills', '📋 History',
-  '⚙️ Settings', '📦 Bulk Send', '📅 Schedule', '📖 How to Use', '✨ Features',
-  '📝 Feedback', '❓ Help', '💵 Add Naira', '💴 Cash Out',
-  // Bills submenu
-  '📱 Airtime', '🌐 Data', '⚡ Electricity', '📺 Cable TV',
-  // Admin submenu
-  '📊 Stats', '👤 Users', '💸 Transactions', '🏦 Bank Accounts', '📅 Scheduled', '🤖 QVAC Status',
-  // Shared
-  '🔙 Back to Menu',
-]);
-
-// Escape Telegram legacy Markdown special chars in user-generated / AI text
-// Also strips HTML-like tags to prevent XSS/formatting injection
-function escapeTelegramMarkdown(text: string | undefined | null, maxLength = 200): string {
-  if (!text) return '';
-  let s = String(text);
-  // Strip HTML-like tags entirely
-  s = s.replace(/<[^>]*>/g, '');
-  // Escape Telegram Markdown v1 special chars
-  s = s.replace(/([_*\[\`])/g, '\\$1');
-  // Truncate to prevent MESSAGE_TOO_LONG
-  if (s.length > maxLength) {
-    s = s.slice(0, maxLength - 1) + '…';
-  }
-  return s;
-}
-
-// ─── Bot ───
-const bot = new Telegraf<ZendContext>(BOT_TOKEN);
-
-// Rate limiting — MUST be first
-bot.use(rateLimitMiddleware);
-
-bot.use(sessionMiddleware);
-bot.use(autoDeleteMiddleware((userId) =>
-  userId ? getSession(userId).state : ConversationState.IDLE
-));
-registerUserMessageTracking(bot, (userId) => getSession(userId).state);
-startAutoDeleteCleanup(bot);
-
-// ═════════════════════════════════════════════════════════════════════════════
-// GROUP CHAT: reply only when tagged
-// ═════════════════════════════════════════════════════════════════════════════
-
-bot.use(async (ctx, next) => {
-  const chatType = ctx.chat?.type;
-  if (chatType === 'group' || chatType === 'supergroup') {
-    const msg = ctx.message;
-    if (!msg || !('text' in msg)) {
-      return; // ignore non-text updates in groups
-    }
-
-    const text = msg.text;
-    const username = ctx.botInfo?.username;
-
-    // Check @mention
-    const isMentioned = username ? text.includes(`@${username}`) : false;
-    // Check reply to bot
-    const isReplyToBot = msg.reply_to_message?.from?.id === ctx.botInfo?.id;
-
-    if (!isMentioned && !isReplyToBot) {
-      return; // silently ignore in groups when not tagged
-    }
-
-    // Strip mention so handlers match correctly (e.g. "@Bot Balance" → "Balance")
-    if (username && isMentioned) {
-      msg.text = text.replace(new RegExp(`\\s?@${username}\\b`, 'g'), '').trim();
-    }
-  }
-  await next();
-});
-
-// ─── Strip reply keyboards in groups (keep inline keyboards) ───
-bot.use(async (ctx, next) => {
-  if (isGroupChat(ctx)) {
-    const originalReply = ctx.reply.bind(ctx);
-    ctx.reply = async (text: any, extra?: any) => {
-      if (extra && extra.reply_markup && 'keyboard' in extra.reply_markup) {
-        const { reply_markup, ...cleaned } = extra;
-        return originalReply(text, cleaned);
-      }
-      return originalReply(text, extra);
-    };
-  }
-  await next();
-});
-
-// ═════════════════════════════════════════════════════════════════════════════
-// GROUP CHAT HELPERS
-// ═════════════════════════════════════════════════════════════════════════════
-
-function isGroupChat(ctx: ZendContext): boolean {
-  return ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup';
-}
-
-function getBotUsername(ctx: ZendContext): string {
-  return ctx.botInfo?.username || 'zend_money_bot';
-}
-
-async function promptPrivateChat(ctx: ZendContext, action: string) {
-  const name = ctx.from?.first_name || 'there';
-  const username = getBotUsername(ctx);
-  await ctx.reply(
-    `📩 ${name}, please use me in private chat to ${action}.\n\n` +
-    `Sensitive actions are only available in DMs for security.`,
-    Markup.inlineKeyboard([
-      [Markup.button.url('💬 Open Private Chat', `https://t.me/${username}`)],
-    ])
-  );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
