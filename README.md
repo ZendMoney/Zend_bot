@@ -1,4 +1,4 @@
-# Zend Bot
+# ZendPay Bot
 
 Telegram-native crypto wallet for Nigerians powered by PAJ Protocol and **QVAC local AI**.
 
@@ -43,9 +43,9 @@ Telegram-native crypto wallet for Nigerians powered by PAJ Protocol and **QVAC l
 - **Sovereign AI** — All AI runs on-device via QVAC. Zero cloud API calls. Full privacy.
 
 ### Group Chat & Community
-- **Group Mentions** — Tag the bot (`@ZendBot`) or reply to use features in groups
+- **Group Mentions** — Tag the bot (`@ZendPayBot`) or reply to use features in groups
 - **Private Actions** — Sensitive flows (send, swap, export) automatically redirect to DM
-- **Community Link** — Direct access to Zend community from main menu
+- **Community Link** — Direct access to ZendPay community from main menu
 
 ### Admin Dashboard
 - **`/admin`** — Admin panel with stats, user lookup, transaction monitoring
@@ -69,7 +69,7 @@ Telegram-native crypto wallet for Nigerians powered by PAJ Protocol and **QVAC l
 
 ## QVAC Integration
 
-Zend integrates **5 QVAC capabilities** across core user flows:
+ZendPay integrates **5 QVAC capabilities** across core user flows:
 
 | QVAC Module | Feature | User Value |
 |-------------|---------|------------|
@@ -86,9 +86,9 @@ Cloud AI (OpenAI, Anthropic, Kimi) cannot serve the median Nigerian user:
 - **Data is expensive** — Every API call = 5-50KB HTTPS payload. Local inference = zero data cost.
 - **Internet is intermittent** — API timeout = failed transaction. QVAC works offline.
 - **Financial privacy** — Bank details never leave the device. No foreign servers.
-- **Cost sustainability** — API fees would make Zend unaffordable for low-income users.
+- **Cost sustainability** — API fees would make ZendPay unaffordable for low-income users.
 
-QVAC makes Zend the **first African crypto wallet with fully sovereign AI**.
+QVAC makes ZendPay the **first African crypto wallet with fully sovereign AI**.
 
 ### Architecture
 
@@ -109,7 +109,7 @@ All models load once and stay in memory. No network calls during inference.
 
 ### How to Access QVAC
 
-QVAC is built into Zend — no separate setup needed for users. For developers and admins:
+QVAC is built into ZendPay — no separate setup needed for users. For developers and admins:
 
 1. **Check QVAC Status**: Send `/admin` → tap **`🤖 QVAC Status`** to see which models are loaded
 2. **Pre-load models**: Run the download script before starting the bot
@@ -257,4 +257,4 @@ docker run --env-file .env -p 3000:3000 zend-bot
 
 ## License
 
-Private — For Zend Money use only.
+Private — For ZendPay use only.

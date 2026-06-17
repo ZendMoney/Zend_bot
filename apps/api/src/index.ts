@@ -72,7 +72,7 @@ app.post('/webhooks/paj', async (c) => {
         await notifyUser(
           txRows[0].userId,
           `🎉 *Naira Deposit Received!*\n\n` +
-          `Your bank transfer has been confirmed and Dollars (USDT) have been credited to your Zend account.\n\n` +
+          `Your bank transfer has been confirmed and Dollars (USDT) have been credited to your ZendPay account.\n\n` +
           `Reference: \`${event.reference}\``
         );
       }

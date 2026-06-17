@@ -18,7 +18,7 @@ export async function doExportKey(ctx: ZendContext, userId: string) {
     const msg = await ctx.reply(
       `🔑 *Secret Recovery Code*\n\n` +
       `⚠️ *SECURITY WARNING*\n` +
-      `Never share this with anyone. Zend will NEVER ask for it.\n\n` +
+      `Never share this with anyone. ZendPay will NEVER ask for it.\n\n` +
       `*Your Secret Code:*\n\n` +
       `${bs58.encode(secretKey)}\n\n` +
       `Copy this and store it in a password manager or write it down.\n` +

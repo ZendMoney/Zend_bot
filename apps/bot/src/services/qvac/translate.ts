@@ -1,7 +1,7 @@
 /**
  * QVAC Translation Service
  * Offline neural machine translation for African languages.
- * Enables users to interact with Zend in Hausa, Yoruba, Igbo, Pidgin, etc.
+ * Enables users to interact with ZendPay in Hausa, Yoruba, Igbo, Pidgin, etc.
  */
 
 import { translate, getTranslationModelId } from './index.js';

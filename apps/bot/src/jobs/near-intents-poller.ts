@@ -43,7 +43,7 @@ export async function pollNearIntentTransactions(botInstance: Telegraf<any>): Pr
         if (txStatus === 'completed') {
           const msg = isWithdraw
             ? `✅ *Withdrawal Complete!*\n\nYour cross-chain withdrawal has been delivered.\nReference: \`${tx.id}\``
-            : `✅ *Deposit Received!*\n\nFunds have arrived in your Zend account.\nReference: \`${tx.id}\``;
+            : `✅ *Deposit Received!*\n\nFunds have arrived in your ZendPay account.\nReference: \`${tx.id}\``;
           await botInstance.telegram.sendMessage(tx.userId, msg, { parse_mode: 'Markdown', ...mainMenu });
         } else if (txStatus === 'failed' && isWithdraw) {
           await botInstance.telegram.sendMessage(

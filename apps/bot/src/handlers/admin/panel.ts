@@ -30,14 +30,14 @@ export function registerAdminPanelHandlers(ctx: HandlerContext): void {
     await ctx.reply('❌ You do not have permission to access the admin panel.');
     return;
   }
-  await ctx.reply('🛠 *Zend Admin Panel*\n\nChoose a section:', { parse_mode: 'Markdown', ...adminMainKeyboard });
+  await ctx.reply('🛠 *ZendPay Admin Panel*\n\nChoose a section:', { parse_mode: 'Markdown', ...adminMainKeyboard });
 });
 
 b.action('admin_back', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
   if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
-  await ctx.editMessageText('🛠 *Zend Admin Panel*\n\nChoose a section:', { parse_mode: 'Markdown', ...adminMainKeyboard });
+  await ctx.editMessageText('🛠 *ZendPay Admin Panel*\n\nChoose a section:', { parse_mode: 'Markdown', ...adminMainKeyboard });
   await ctx.answerCbQuery();
 });
 
@@ -63,7 +63,7 @@ b.action('admin_page:overview', async (ctx) => {
     `📋 Total Transactions: ${txCount[0]?.count || 0}\n` +
     `💰 Total NGN In: ₦${Number(totalNgnIn[0]?.sum || 0).toLocaleString()}\n` +
     `💸 Total NGN Out: ₦${Number(totalNgnOut[0]?.sum || 0).toLocaleString()}\n` +
-    `🪙 Zend Fees (USDT): $${Number(totalZendFee[0]?.sum || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}\n` +
+    `🪙 ZendPay Fees (USDT): $${Number(totalZendFee[0]?.sum || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}\n` +
     `✅ Active Features: ${activeFeatures.length}\n`;
 
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_back')]]) });
@@ -264,7 +264,7 @@ b.action('admin_page:fees', async (ctx) => {
 
   const text =
     `💰 *Fees & Revenue*\n\n` +
-    `🪙 Total Zend Fees: $${Number(totalZendFee[0]?.sum || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}\n` +
+    `🪙 Total ZendPay Fees: $${Number(totalZendFee[0]?.sum || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}\n` +
     `📐 Fee config: ${ZEND_FEE_NORMAL_BPS / 100}% (normal) / max(${ZEND_FEE_FUNDED_BPS / 100}%, gas+$flat) (sponsored)\n\n` +
     `📊 *Volume by Type:*\n` +
     `📤 Off-Ramp: ${offrampCount[0]?.count || 0} tx | ₦${Number(totalNgnOut[0]?.sum || 0).toLocaleString()}\n` +
@@ -530,7 +530,7 @@ b.action('admin_ambassador_leaderboard', async (ctx) => {
     return `${medal} *${escapeTelegramMarkdown(a.name)}* — ${a.active} active | ₦${a.volume.toLocaleString()}`;
   }).join('\n\n');
 
-  const text = `🏆 *ZendER Leaderboard* — Top ${board.length}\n\n${list || 'No confirmed ambassadors yet.'}`;
+  const text = `🏆 *ZendPayER Leaderboard* — Top ${board.length}\n\n${list || 'No confirmed ambassadors yet.'}`;
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_page:ambassador_refs')]]) });
   await ctx.answerCbQuery();
 });

@@ -1,7 +1,7 @@
 /**
  * NEAR Intents cross-chain deposit & withdrawal helpers.
- * Deposit:  external chain → user's Zend Solana wallet
- * Withdraw: user's Zend Solana wallet → external chain address
+ * Deposit:  external chain → user's ZendPay Solana wallet
+ * Withdraw: user's ZendPay Solana wallet → external chain address
  */
 
 import { Keypair } from '@solana/web3.js';
@@ -27,12 +27,12 @@ export const SOLANA_DEST_ASSETS: Record<string, string> = {
   USDC: SOLANA_ORIGIN_ASSETS.USDC,
 };
 
-/** Chains users can deposit FROM (external → Zend) */
+/** Chains users can deposit FROM (external → ZendPay) */
 export const DEPOSIT_CHAINS = [
   'ethereum', 'base', 'bsc', 'arbitrum', 'optimism', 'polygon', 'bitcoin', 'solana', 'near',
 ] as const;
 
-/** Chains users can withdraw TO (Zend → external) */
+/** Chains users can withdraw TO (ZendPay → external) */
 export const WITHDRAW_CHAINS = [
   'ethereum', 'base', 'bsc', 'arbitrum', 'optimism', 'polygon', 'bitcoin', 'near',
 ] as const;
@@ -125,7 +125,7 @@ export async function createWithdrawQuote(params: WithdrawQuoteParams): Promise<
   });
 }
 
-/** Send SPL tokens from user's Zend wallet to NEAR Intents deposit address */
+/** Send SPL tokens from user's ZendPay wallet to NEAR Intents deposit address */
 export async function fundNearIntentDeposit(
   walletEncryptedKey: string,
   sourceSymbol: 'USDT' | 'USDC',

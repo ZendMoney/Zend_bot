@@ -1,4 +1,4 @@
-# Zend Project Tracker
+# ZendPay Project Tracker
 
 > **Last Updated:** 2026-04-23  
 > **Current Phase:** Phase 1 — Bot Foundation (90% Complete)  
@@ -96,7 +96,7 @@ Overall: [████░░░░░░] 28%  (13/33 complete)
 | # | Blocker | Impact | Resolution |
 |---|---------|--------|------------|
 | 1 | **PAJ Production API key** | Cannot process real NGN | Request from PAJ team |
-| 2 | **Webhook URL (public)** | PAJ can't notify Zend of deposits/settlements | Deploy API to cloud (Render/Railway/GCP) |
+| 2 | **Webhook URL (public)** | PAJ can't notify ZendPay of deposits/settlements | Deploy API to cloud (Render/Railway/GCP) |
 | 3 | **Solana Mainnet RPC** | Devnet only — no real money | Switch RPC URL + fund fee payer (if using one) |
 | 4 | **User wallet key decryption** | Bot can't sign transactions yet | Implement KMS decryption in TransactionService |
 | 5 | **Production database** | Local PostgreSQL only | Migrate to managed DB (Supabase/Neon/RDS) |

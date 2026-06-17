@@ -95,16 +95,16 @@ export function formatSendFeeLabel(info: Pick<
   'zendFeeUsdt' | 'feeBps' | 'willFundSol' | 'gasCostUsdt' | 'extraFeeUsdt' | 'feeSol' | 'feeMode' | 'percentageFeeUsdt'
 >): string {
   if (!info.willFundSol) {
-    return `Zend fee (${(info.feeBps / 100).toFixed(2)}%): ~${info.zendFeeUsdt.toFixed(2)} USDT`;
+    return `ZendPay fee (${(info.feeBps / 100).toFixed(2)}%): ~${info.zendFeeUsdt.toFixed(2)} USDT`;
   }
   if (info.feeMode === 'gas_recovery' && info.gasCostUsdt != null && info.extraFeeUsdt != null) {
     const solPart = info.feeSol > 0 ? `~${info.feeSol.toFixed(4)} SOL (≈${info.gasCostUsdt.toFixed(2)} USDT)` : '';
     return `Gas sponsorship ${solPart} + ${info.extraFeeUsdt.toFixed(2)} USDT fee = ~${info.zendFeeUsdt.toFixed(2)} USDT`;
   }
   if (info.feeMode === 'percentage') {
-    return `Zend fee (${(info.feeBps / 100).toFixed(2)}%, gas sponsored): ~${info.zendFeeUsdt.toFixed(2)} USDT`;
+    return `ZendPay fee (${(info.feeBps / 100).toFixed(2)}%, gas sponsored): ~${info.zendFeeUsdt.toFixed(2)} USDT`;
   }
-  return `Zend fee (gas sponsored): ~${info.zendFeeUsdt.toFixed(2)} USDT`;
+  return `ZendPay fee (gas sponsored): ~${info.zendFeeUsdt.toFixed(2)} USDT`;
 }
 
 export async function calculateSendFee(

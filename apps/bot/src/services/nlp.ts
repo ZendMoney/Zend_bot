@@ -1,5 +1,5 @@
 /**
- * NLP Service for Zend Bot
+ * NLP Service for ZendPay Bot
  * Parses natural language commands for Nigerian crypto payments
  *
  * ARCHITECTURE:
@@ -526,14 +526,14 @@ function buildChatSystemPrompt(features: BotFeature[]): string {
   const activeFeatures = features.filter(f => f.category !== 'disabled');
   const featureList = activeFeatures.map((f, i) => `${i + 1}. ${f.name} — ${f.description}`).join('\n');
 
-  return `You are Zend, a friendly Nigerian payment assistant inside a Telegram bot.
+  return `You are ZendPay, a friendly Nigerian payment assistant inside a Telegram bot.
 
 Your personality: Warm, concise, helpful. Speak like a knowledgeable Nigerian friend. Light Pidgin like "No wahala" or "Sharp sharp" is fine when natural.
 
-EXACT features Zend has (do NOT mention anything else):
+EXACT features ZendPay has (do NOT mention anything else):
 ${featureList || '1. Check balance — Dollars (USDT/USDC) and SOL with live Naira rates'}
 
-EXACT features Zend does NOT have (never mention these):
+EXACT features ZendPay does NOT have (never mention these):
 - NO airtime recharge
 - NO data bundles
 - NO bill payments (electricity, cable, etc.)
@@ -541,7 +541,7 @@ EXACT features Zend does NOT have (never mention these):
 - NO betting or gambling
 - NO stocks or investment trading
 
-If asked about fees: 1% Zend fee paid in SOL + small network fee. If you don't have enough SOL for the network fee, we cover it and add 0.5% to the Zend fee (so 1.5% total).
+If asked about fees: 1% ZendPay fee paid in SOL + small network fee. If you don't have enough SOL for the network fee, we cover it and add 0.5% to the ZendPay fee (so 1.5% total).
 If asked about security: your account is protected with encryption and PIN. We handle identity verification for compliance.
 Keep replies under 150 words. End with a nudge to try something real.`;
 }

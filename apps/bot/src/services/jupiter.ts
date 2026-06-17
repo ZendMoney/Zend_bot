@@ -1,5 +1,5 @@
 /**
- * Jupiter Swap Service for Zend Bot
+ * Jupiter Swap Service for ZendPay Bot
  * Integrates Jupiter DEX aggregator for token swaps on Solana
  */
 
@@ -22,7 +22,7 @@ async function fetchJupiterQuote(
   url.searchParams.set('slippageBps', slippageBps.toString());
 
   const response = await fetch(url.toString(), {
-    headers: { 'User-Agent': 'ZendBot/1.0' },
+    headers: { 'User-Agent': 'ZendPayBot/1.0' },
   });
 
   if (!response.ok) {
@@ -129,7 +129,7 @@ export async function buildSwapTransaction(
     // Try v1 API first
     let response = await fetch(`${JUPITER_API_V1}/swap`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'ZendBot/1.0' },
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'ZendPayBot/1.0' },
       body: JSON.stringify(body),
     });
 
@@ -140,7 +140,7 @@ export async function buildSwapTransaction(
       // Fallback to v6
       response = await fetch(`${JUPITER_API_V6}/swap`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'User-Agent': 'ZendBot/1.0' },
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'ZendPayBot/1.0' },
         body: JSON.stringify(body),
       });
 

@@ -1,5 +1,5 @@
 /**
- * ChainRails Client for Zend
+ * ChainRails Client for ZendPay
  * Real API integration for cross-chain deposits
  * Docs: https://docs.chainrails.io
  */

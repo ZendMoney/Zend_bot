@@ -1,5 +1,5 @@
 /**
- * NEAR Intents 1Click API Client for Zend
+ * NEAR Intents 1Click API Client for ZendPay
  * Docs: https://docs.near-intents.org/integration/distribution-channels/1click-api
  */
 

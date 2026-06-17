@@ -1,6 +1,6 @@
 /**
  * AirBills Payment Service
- * Integrates AirBills (Solana-native Nigerian bill payments) into Zend.
+ * Integrates AirBills (Solana-native Nigerian bill payments) into ZendPay.
  */
 
 import { Keypair } from '@solana/web3.js';

@@ -154,7 +154,7 @@ export function startWebhookServer(botInstance: Telegraf<any>): Server {
                             await botInstance.telegram.sendMessage(
                               userId,
                               `🎉 *AUDD Deposit Complete!*\n\n` +
-                              `Your Naira bank transfer has been confirmed and AUDD has been credited to your Zend account.\n\n` +
+                              `Your Naira bank transfer has been confirmed and AUDD has been credited to your ZendPay account.\n\n` +
                               `Received: ~${auddOut.toFixed(2)} AUDD\n` +
                               `Reference: \`${event.reference}\``,
                               { parse_mode: 'Markdown' }
@@ -179,7 +179,7 @@ export function startWebhookServer(botInstance: Telegraf<any>): Server {
                   await botInstance.telegram.sendMessage(
                     userId,
                     `🎉 *Naira Deposit Received!*\n\n` +
-                    `Your bank transfer has been confirmed and Dollars (USDT) have been credited to your Zend account.\n\n` +
+                    `Your bank transfer has been confirmed and Dollars (USDT) have been credited to your ZendPay account.\n\n` +
                     `Reference: \`${event.reference}\``,
                     { parse_mode: 'Markdown' }
                   );
@@ -325,7 +325,7 @@ export function startWebhookServer(botInstance: Telegraf<any>): Server {
                   `${amount || ''} ${token} delivered to the recipient address.\n\n` +
                   `Reference: \`${tx.id}\``
                 : `✅ *Deposit Received!*\n\n` +
-                  `${amount || ''} ${token} has arrived in your Zend account via NEAR Intents.\n\n` +
+                  `${amount || ''} ${token} has arrived in your ZendPay account via NEAR Intents.\n\n` +
                   `Reference: \`${tx.id}\``;
               await botInstance.telegram.sendMessage(userId, msg, { parse_mode: 'Markdown', ...mainMenu });
             } catch (notifyErr) {
@@ -335,7 +335,7 @@ export function startWebhookServer(botInstance: Telegraf<any>): Server {
             try {
               await botInstance.telegram.sendMessage(
                 tx.userId,
-                `❌ *Withdrawal Failed*\n\nReference: \`${tx.id}\`\nFunds should be refunded to your Zend wallet.`,
+                `❌ *Withdrawal Failed*\n\nReference: \`${tx.id}\`\nFunds should be refunded to your ZendPay wallet.`,
                 { parse_mode: 'Markdown', ...mainMenu }
               );
             } catch { /* non-critical */ }

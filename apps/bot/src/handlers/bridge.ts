@@ -36,7 +36,7 @@ export async function showBridgeMenu(ctx: ZendContext, userId: string) {
 
   await ctx.reply(
     `🌉 *Deposit from Other Apps*\n\n` +
-    `Send crypto from any wallet → receive Dollars in Zend via NEAR Intents.\n\n` +
+    `Send crypto from any wallet → receive Dollars in ZendPay via NEAR Intents.\n\n` +
     `Select the chain you're sending from:`,
     {
       parse_mode: 'Markdown',
@@ -117,7 +117,7 @@ export function registerBridgeHandlers({ bot: b }: HandlerContext): void {
     `🌉 *Deposit from Other Apps*\n\n` +
     `From: *${chainDisplay}*\n` +
     `Currency: *${token}*\n\n` +
-    `Receive in Zend as:`,
+    `Receive in ZendPay as:`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([

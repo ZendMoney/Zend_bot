@@ -66,7 +66,7 @@ export async function showReceive(ctx: ZendContext, userId: string) {
   if (hasVA) {
     msg += `*🇳🇬 Naira (Bank Transfer)*\n`;
     msg += `Send NGN to your virtual account:\n\n`;
-    msg += `🏦 *Bank:* ${virtualAccount.bankName || 'Zend Bank'}\n`;
+    msg += `🏦 *Bank:* ${virtualAccount.bankName || 'ZendPay Bank'}\n`;
     msg += `👤 *Name:* ${virtualAccount.accountName || user[0].firstName + ' ' + (user[0].lastName || '')}\n`;
     msg += `🔢 *Number:* \`${virtualAccount.accountNumber}\`\n\n`;
   } else {
@@ -76,7 +76,7 @@ export async function showReceive(ctx: ZendContext, userId: string) {
   }
 
   msg += `\n*🌉 From Other Apps*\n`;
-  msg += `Send Dollars from Binance, MetaMask, Trust Wallet, etc. → receive in your Zend account.\n\n`;
+  msg += `Send Dollars from Binance, MetaMask, Trust Wallet, etc. → receive in your ZendPay account.\n\n`;
 
   msg += `💡 *Crypto arrives instantly*\n`;
   msg += `⏱️ *Naira takes 2–5 minutes* after bank transfer`;

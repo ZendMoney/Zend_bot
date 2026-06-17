@@ -49,8 +49,8 @@ export async function buildTxnDetailText(txn: any): Promise<string> {
 
   text += `\n📊 *Fees:*\n`;
   if (txn.pajFeeBps) text += `   PAJ Fee: ${(txn.pajFeeBps / 100).toFixed(2)}%\n`;
-  if (txn.zendSpreadBps) text += `   Zend Spread: ${(txn.zendSpreadBps / 100).toFixed(2)}%\n`;
-  if (txn.zendFeeUsdt) text += `   Zend Fee: $${Number(txn.zendFeeUsdt).toLocaleString(undefined, { maximumFractionDigits: 6 })}\n`;
+  if (txn.zendSpreadBps) text += `   ZendPay Spread: ${(txn.zendSpreadBps / 100).toFixed(2)}%\n`;
+  if (txn.zendFeeUsdt) text += `   ZendPay Fee: $${Number(txn.zendFeeUsdt).toLocaleString(undefined, { maximumFractionDigits: 6 })}\n`;
 
   if (txn.recipientBankName || txn.recipientAccountNumber) {
     text += `\n🏦 *Recipient:*\n`;

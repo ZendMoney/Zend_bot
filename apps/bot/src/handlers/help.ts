@@ -10,19 +10,19 @@ import type { HandlerContext } from './types.js';
 export function registerHelpHandlers({ bot: b }: HandlerContext): void {
 b.hears('❓ Help', async (ctx) => {
   await ctx.reply(
-    `❓ *Zend Help*\n\n` +
+    `❓ *ZendPay Help*\n\n` +
     `Need support? Reach out anytime:\n\n` +
     `• 📖 Tap *How to Use* for a quick guide\n` +
-    `• ✨ Tap *Features* to see what Zend can do\n` +
+    `• ✨ Tap *Features* to see what ZendPay can do\n` +
     `• 📝 Tap *Feedback* to share ideas or report bugs\n\n` +
-    `👉 [Zend Community](https://t.me/zend_community)`,
+    `👉 [ZendPay Community](https://t.me/zend_community)`,
     { parse_mode: 'Markdown', link_preview_options: { is_disabled: true }, ...mainMenu }
   );
 });
 
 b.hears('📖 How to Use', async (ctx) => {
   await ctx.reply(
-    `📖 *How to Use Zend*\n\n` +
+    `📖 *How to Use ZendPay*\n\n` +
     `*1. Add Money*\n` +
     `Tap 💰 *Balance* → *Add Naira* → follow the bank transfer instructions. Your virtual account converts Naira to USDT instantly.\n\n` +
     `*2. Send to Any Nigerian Bank*\n` +
@@ -36,7 +36,7 @@ b.hears('📖 How to Use', async (ctx) => {
     `*6. Bulk / Scheduled Sends*\n` +
     `Tap 📦 *Bulk Send* to pay many people at once, or 📅 *Schedule* for recurring payments.\n\n` +
     `*Tips:*\n` +
-    `• Keep a tiny amount of SOL for network gas, or let Zend sponsor it for a small fee.\n` +
+    `• Keep a tiny amount of SOL for network gas, or let ZendPay sponsor it for a small fee.\n` +
     `• Set a transaction PIN in ⚙️ *Settings* for extra security.\n` +
     `• Voice commands work too — just send a voice note.`,
     { parse_mode: 'Markdown', ...mainMenu }
@@ -50,7 +50,7 @@ b.hears('✨ Features', async (ctx) => {
       await ctx.reply('✨ No features listed right now. Check back soon!', mainMenu);
       return;
     }
-    let text = '✨ *Zend Features*\n\n';
+    let text = '✨ *ZendPay Features*\n\n';
     const byCategory: Record<string, typeof features> = {};
     for (const f of features) {
       byCategory[f.category] = byCategory[f.category] || [];

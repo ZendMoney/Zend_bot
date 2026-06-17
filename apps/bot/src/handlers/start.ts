@@ -35,7 +35,7 @@ export function registerStartHandlers({ bot: b }: HandlerContext): void {
         await startOnboarding(ctx, userId);
         return;
       }
-      await ctx.reply(`👋 Welcome back, ${firstName}!\n\nYour Zend account is ready.`, mainMenu);
+      await ctx.reply(`👋 Welcome back, ${firstName}!\n\nYour ZendPay account is ready.`, mainMenu);
       return;
     }
 
@@ -77,7 +77,7 @@ export function registerStartHandlers({ bot: b }: HandlerContext): void {
     });
 
     await ctx.reply(
-      `🟣 *Welcome to Zend*\n\n` +
+      `🟣 *Welcome to ZendPay*\n\n` +
       `Your Dollar savings + Naira bank account — inside Telegram.\n\n` +
       `✅ Account created automatically\n` +
       `✅ No password to remember\n` +

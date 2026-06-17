@@ -29,7 +29,7 @@ export async function checkBalanceChanges(botInstance: Telegraf<any>): Promise<v
             await botInstance.telegram.sendMessage(
               user.id,
               `🎉 *Funds Received!*\n\n` +
-              `*+${solDiff.toFixed(6)} SOL* has arrived in your Zend wallet.\n\n` +
+              `*+${solDiff.toFixed(6)} SOL* has arrived in your ZendPay wallet.\n\n` +
               `New balance: *${current.sol.toFixed(6)} SOL*`,
               { parse_mode: 'Markdown' }
             );
@@ -38,7 +38,7 @@ export async function checkBalanceChanges(botInstance: Telegraf<any>): Promise<v
             await botInstance.telegram.sendMessage(
               user.id,
               `🎉 *Funds Received!*\n\n` +
-              `*+${usdtDiff.toFixed(2)} USDT* has arrived in your Zend wallet.\n\n` +
+              `*+${usdtDiff.toFixed(2)} USDT* has arrived in your ZendPay wallet.\n\n` +
               `New balance: *${current.usdt.toFixed(2)} USDT*`,
               { parse_mode: 'Markdown' }
             );
@@ -47,7 +47,7 @@ export async function checkBalanceChanges(botInstance: Telegraf<any>): Promise<v
             await botInstance.telegram.sendMessage(
               user.id,
               `🎉 *Funds Received!*\n\n` +
-              `*+${usdcDiff.toFixed(2)} USDC* has arrived in your Zend wallet.\n\n` +
+              `*+${usdcDiff.toFixed(2)} USDC* has arrived in your ZendPay wallet.\n\n` +
               `New balance: *${current.usdc.toFixed(2)} USDC*`,
               { parse_mode: 'Markdown' }
             );
@@ -57,7 +57,7 @@ export async function checkBalanceChanges(botInstance: Telegraf<any>): Promise<v
             await botInstance.telegram.sendMessage(
               user.id,
               `🎉 *Funds Received!*\n\n` +
-              `*+${auddDiff.toFixed(2)} AUDD* has arrived in your Zend wallet.\n\n` +
+              `*+${auddDiff.toFixed(2)} AUDD* has arrived in your ZendPay wallet.\n\n` +
               `New balance: *${current.audd.toFixed(2)} AUDD*`,
               { parse_mode: 'Markdown' }
             );
@@ -67,7 +67,7 @@ export async function checkBalanceChanges(botInstance: Telegraf<any>): Promise<v
             await botInstance.telegram.sendMessage(
               user.id,
               `🎉 *Funds Received!*\n\n` +
-              `*+${nearDiff.toFixed(4)} NEAR* has arrived in your Zend wallet.\n\n` +
+              `*+${nearDiff.toFixed(4)} NEAR* has arrived in your ZendPay wallet.\n\n` +
               `New balance: *${current.near.toFixed(4)} NEAR*`,
               { parse_mode: 'Markdown' }
             );

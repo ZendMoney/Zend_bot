@@ -86,7 +86,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
     if (userRow.length > 0 && !userRow[0].onboardingComplete) {
       await ctx.reply(
         `🔐 *Account Setup Required*\n\n` +
-        `Please complete identity verification and PIN setup before using Zend.`,
+        `Please complete identity verification and PIN setup before using ZendPay.`,
         { parse_mode: 'Markdown' }
       );
       await startOnboarding(ctx, userId);
@@ -292,7 +292,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       `Total NGN: ₦${totalNgn.toLocaleString()}\n` +
       `Rate: ₦${rate.toLocaleString()} / USDT\n` +
       `Transfer: ${totalUsdt.toFixed(2)} USDT\n` +
-      `Zend Fee: ${totalFeeUsdt.toFixed(2)} USDT (${feeRateText})\n` +
+      `ZendPay Fee: ${totalFeeUsdt.toFixed(2)} USDT (${feeRateText})\n` +
       `Grand Total: ${grandTotalUsdt.toFixed(2)} USDT\n\n` +
       `*Recipients:*\n`;
 
@@ -477,7 +477,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
         `${depositAddress}\n\n` +
         `⚠️ *Important:*\n` +
         `• Only send ${bd.token} on ${chainDisplay}\n` +
-        `• You'll receive ~${amountOutFormatted} ${bd.destinationSymbol} in your Zend account\n` +
+        `• You'll receive ~${amountOutFormatted} ${bd.destinationSymbol} in your ZendPay account\n` +
         feeLine +
         `• Expires: ${new Date(quote.quote.deadline).toLocaleString('en-NG')}\n\n` +
         `Reference: \`${txId}\``,
@@ -528,7 +528,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
 
     await ctx.reply(
       `📤 *Withdraw Preview*\n\n` +
-      `From: Zend *${wd.sourceSymbol}*\n` +
+      `From: ZendPay *${wd.sourceSymbol}*\n` +
       `To: *${formatChainName(wd.destChain)}* (${wd.destToken})\n` +
       `Recipient: \`${recipientAddress}\`\n\n` +
       `How much ${wd.sourceSymbol} do you want to send?\n` +
@@ -1163,7 +1163,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
     }
 
     const feeLine = session.pendingTransaction?.zendFeeUsdt
-      ? `Zend fee: ~${session.pendingTransaction.zendFeeUsdt.toFixed(2)} USDT\n`
+      ? `ZendPay fee: ~${session.pendingTransaction.zendFeeUsdt.toFixed(2)} USDT\n`
       : '';
 
     const menuFromMint = session.pendingTransaction?.fromMint || SOLANA_TOKENS.USDT.mint;

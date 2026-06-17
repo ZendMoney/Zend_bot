@@ -60,9 +60,9 @@ export function calculateCommissionNgn(volumeNgn: number, tier: string): number 
 
 export function formatAmbassadorTier(tier: string): string {
   const map: Record<string, string> = {
-    entry: '🥉 ZendER (Entry)',
-    pro: '🥈 ZendER Pro',
-    elite: '🥇 ZendER Elite',
+    entry: '🥉 ZendPayER (Entry)',
+    pro: '🥈 ZendPayER Pro',
+    elite: '🥇 ZendPayER Elite',
   };
   return map[tier] || tier;
 }

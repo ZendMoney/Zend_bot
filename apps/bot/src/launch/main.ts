@@ -51,7 +51,7 @@ export async function run(): Promise<void> {
     const telegramWebhookUrl = `${publicBaseUrl}/webhook/telegram`;
     try {
       await bot.telegram.setWebhook(telegramWebhookUrl, { drop_pending_updates: true });
-      console.log('🤖 Zend bot running in Telegram webhook mode');
+      console.log('🤖 ZendPay bot running in Telegram webhook mode');
       console.log(`   Webhook URL: ${telegramWebhookUrl}`);
       isWebhookMode = true;
     } catch (webhookErr: any) {
@@ -59,12 +59,12 @@ export async function run(): Promise<void> {
       console.log('🤖 Falling back to polling mode...');
       await clearWebhook();
       await bot.launch({ dropPendingUpdates: true });
-      console.log('🤖 Zend bot running in polling mode (webhook fallback)');
+      console.log('🤖 ZendPay bot running in polling mode (webhook fallback)');
     }
   } else {
     await clearWebhook();
     await bot.launch({ dropPendingUpdates: true });
-    console.log('🤖 Zend bot running in polling mode');
+    console.log('🤖 ZendPay bot running in polling mode');
     if (!useTelegramWebhook) {
       console.log('   PAJ/AirBills HTTP webhooks still active on the same server');
       console.log('   (Set TELEGRAM_USE_WEBHOOK=true only if Telegram can reach your domain)');

@@ -177,5 +177,5 @@ export const PAJ_MAX_DEPOSIT_NGN = 10_000_000; // ₦10M max per deposit
 // Auto-save rates (in basis points)
 export const AUTO_SAVE_RATES = [100, 200, 300, 500, 1000] as const; // 1%, 2%, 3%, 5%, 10%
 
-// Zend spread (your margin on top of PAJ)
+// ZendPay spread (your margin on top of PAJ)
 export const ZEND_SPREAD_BPS = 50; // 0.5% - adjust as needed

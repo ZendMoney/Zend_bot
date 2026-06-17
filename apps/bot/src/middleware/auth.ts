@@ -20,7 +20,7 @@ export const authMiddleware: MiddlewareFn<any> = async (ctx, next) => {
 
   if (user.length === 0) {
     await ctx.reply(
-      '👋 Welcome! Please run /start to create your Zend wallet.',
+      '👋 Welcome! Please run /start to create your ZendPay wallet.',
       { parse_mode: 'Markdown' }
     );
     return;

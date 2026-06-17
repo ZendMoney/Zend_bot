@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * QVAC Model Downloader
- * Pre-downloads all AI models needed by Zend for local inference.
+ * Pre-downloads all AI models needed by ZendPay for local inference.
  *
  * Usage:
  *   npx tsx apps/bot/scripts/download-qvac-models.ts
@@ -28,7 +28,7 @@ const MODELS = [
 ];
 
 async function downloadAll() {
-  console.log('📥 Zend QVAC Model Downloader\n');
+  console.log('📥 ZendPay QVAC Model Downloader\n');
 
   for (const model of MODELS) {
     console.log(`⬇️  Downloading ${model.name}...`);

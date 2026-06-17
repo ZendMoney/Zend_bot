@@ -31,12 +31,12 @@ export function calculatePajFee(ngnAmount: number, feeBps: number): number {
   return Math.floor(ngnAmount * (feeBps / 10000));
 }
 
-// Calculate Zend spread
+// Calculate ZendPay spread
 export function calculateZendSpread(ngnAmount: number, spreadBps: number): number {
   return Math.floor(ngnAmount * (spreadBps / 10000));
 }
 
-// Calculate total cost (PAJ fee + Zend spread)
+// Calculate total cost (PAJ fee + ZendPay spread)
 export function calculateTotalFees(ngnAmount: number, pajFeeBps: number, zendSpreadBps: number): number {
   return calculatePajFee(ngnAmount, pajFeeBps) + calculateZendSpread(ngnAmount, zendSpreadBps);
 }
@@ -98,7 +98,7 @@ export function normalizeBank(input: string): { code: string; name: string } | n
   return bankMap[cleaned] || null;
 }
 
-// Generate Zend reference ID
+// Generate ZendPay reference ID
 export function generateReference(): string {
   const random = Math.floor(Math.random() * 90000) + 10000;
   return `ZND-${random}`;

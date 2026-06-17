@@ -28,8 +28,8 @@ export function registerMyrefHandlers({ bot: b }: HandlerContext): void {
 
     if (ambRows.length === 0) {
       await ctx.reply(
-        `🧑‍🎓 *ZendER Programme*\n\n` +
-        `You are not registered as a Zend ambassador.\n\n` +
+        `🧑‍🎓 *ZendPayER Programme*\n\n` +
+        `You are not registered as a ZendPay ambassador.\n\n` +
         `Apply at: https://zend-simple-payments-production.up.railway.app/ambassador`,
         { parse_mode: 'Markdown' }
       );
@@ -40,7 +40,7 @@ export function registerMyrefHandlers({ bot: b }: HandlerContext): void {
 
     if (amb.status === 'pending') {
       await ctx.reply(
-        `⏳ *ZendER Application Pending*\n\n` +
+        `⏳ *ZendPayER Application Pending*\n\n` +
         `Hi ${escapeTelegramMarkdown(amb.name)}, your application is being reviewed.\n\n` +
         `Complete your starter tasks and the team will confirm you soon.`,
         { parse_mode: 'Markdown' }
@@ -50,7 +50,7 @@ export function registerMyrefHandlers({ bot: b }: HandlerContext): void {
 
     if (amb.status === 'removed') {
       await ctx.reply(
-        `❌ *ZendER Status Removed*\n\n` +
+        `❌ *ZendPayER Status Removed*\n\n` +
         `Your ambassador access has been revoked. Contact the programme manager for more info.`,
         { parse_mode: 'Markdown' }
       );
@@ -75,7 +75,7 @@ export function registerMyrefHandlers({ bot: b }: HandlerContext): void {
     const toNext = computedTier === 'entry' ? Math.max(0, 75 - activeCount) : computedTier === 'pro' ? Math.max(0, 300 - activeCount) : 0;
 
     let text =
-      `🎯 *Your ZendER Dashboard*\n\n` +
+      `🎯 *Your ZendPayER Dashboard*\n\n` +
       `*Name:* ${escapeTelegramMarkdown(amb.name)}\n` +
       `*Tier:* ${formatAmbassadorTier(computedTier)}\n` +
       `*Commission Rate:* ${(rate / 100).toFixed(2)}%\n\n`;

@@ -1,4 +1,4 @@
-# Zend Bot with QVAC Local AI
+# ZendPay Bot with QVAC Local AI
 # Railway deployment using Docker for full system library control
 
 FROM node:22-slim

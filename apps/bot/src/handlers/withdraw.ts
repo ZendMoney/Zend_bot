@@ -41,7 +41,7 @@ export async function showWithdrawMenu(ctx: ZendContext, userId: string) {
 
   await ctx.reply(
     `📤 *Send to Other Apps*\n\n` +
-    `Send Dollars from Zend to Binance, MetaMask, Trust Wallet, etc.\n\n` +
+    `Send Dollars from ZendPay to Binance, MetaMask, Trust Wallet, etc.\n\n` +
     `Select destination chain:`,
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }
   );
@@ -110,7 +110,7 @@ export function registerWithdrawHandlers({ bot: b }: HandlerContext): void {
   await ctx.editMessageText(
     `📤 *Send to ${formatChainName(chainKey)}*\n\n` +
     `Recipient receives: *${destToken}*\n\n` +
-    `Pay from your Zend balance:`,
+    `Pay from your ZendPay balance:`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
