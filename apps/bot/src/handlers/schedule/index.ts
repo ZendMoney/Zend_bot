@@ -2,14 +2,14 @@ import { Markup } from 'telegraf';
 import { db, users, savedBankAccounts, scheduledTransfers } from '@zend/db';
 import { eq, and } from 'drizzle-orm';
 import { ConversationState, NIGERIAN_BANKS } from '@zend/shared';
-import { mainMenu, cancelKeyboard } from '../keyboards/index.js';
-import { md } from '../lib/telegram.js';
-import { formatNgn } from '../lib/format.js';
-import { isGroupChat, promptPrivateChat } from '../lib/group.js';
-import { getSession, setSession } from '../session/store.js';
-import { verifyBankAccount } from '../services/paj.js';
-import type { ZendContext } from '../session/types.js';
-import type { HandlerContext } from './types.js';
+import { mainMenu, cancelKeyboard } from '../../keyboards/index.js';
+import { md } from '../../lib/telegram.js';
+import { formatNgn } from '../../lib/format.js';
+import { isGroupChat, promptPrivateChat } from '../../lib/group.js';
+import { getSession, setSession } from '../../session/store.js';
+import { verifyBankAccount } from '../../services/paj.js';
+import type { ZendContext } from '../../session/types.js';
+import type { HandlerContext } from '../types.js';
 
 export async function showScheduleMenu(ctx: ZendContext, userId: string) {
   const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
