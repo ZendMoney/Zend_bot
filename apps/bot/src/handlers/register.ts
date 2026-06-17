@@ -1,6 +1,8 @@
 import type { HandlerContext } from './types.js';
 import { registerBalanceHandlers } from './balance.js';
 import { registerStartHandlers } from './start.js';
+import { registerMyrefHandlers } from './myref.js';
+import { registerAdminPanelHandlers } from './admin/panel.js';
 import { registerSettingsHandlers } from './settings.js';
 import { registerHelpHandlers } from './help.js';
 import { registerBillsHandlers } from './bills.js';
@@ -17,6 +19,8 @@ import { registerTextRouter } from './text/router.js';
 export function registerPreTextHandlers(ctx: HandlerContext): void {
   registerBalanceHandlers(ctx);
   registerStartHandlers(ctx);
+  registerMyrefHandlers(ctx);
+  registerAdminPanelHandlers(ctx);
 }
 
 /** Text state machine — must run after pre-text hears, before post-text hears. */
