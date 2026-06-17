@@ -4,7 +4,10 @@ import { eq, and, sql } from 'drizzle-orm';
 import { mainMenu } from '../keyboards/index.js';
 import { formatNgn } from '../lib/format.js';
 import { md } from '../lib/telegram.js';
-import { getLaunchRuntime } from '../launch/runtime.js';
+import { calculateSendFee } from '../services/gas.js';
+import { getPAJRates } from '../services/paj.js';
+import { executeSendCore } from '../services/send.js';
+import { checkMilestones } from '../services/milestones.js';
 
 let _scheduledRunning = false;
 
@@ -14,8 +17,6 @@ export async function runScheduledTransfers(bot: Telegraf<any>): Promise<void> {
     return;
   }
   _scheduledRunning = true;
-
-  const { getPAJRates, calculateSendFee, executeSendCore, checkMilestones } = getLaunchRuntime();
 
   try {
     const now = new Date();
