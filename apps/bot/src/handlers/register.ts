@@ -3,6 +3,9 @@ import { registerBalanceHandlers } from './balance.js';
 import { registerStartHandlers } from './start.js';
 import { registerMyrefHandlers } from './myref.js';
 import { registerAdminPanelHandlers } from './admin/panel.js';
+import { registerWalletHandlers } from './wallet.js';
+import { registerVoiceHandlers } from './voice.js';
+import { registerPhotoHandlers } from './photo.js';
 import { registerSettingsHandlers } from './settings.js';
 import { registerHelpHandlers } from './help.js';
 import { registerBillsHandlers } from './bills.js';
@@ -13,6 +16,9 @@ import { registerReceiveHandlers } from './receive.js';
 import { registerHistoryHandlers } from './history.js';
 import { registerBulkSendHandlers } from './bulk-send.js';
 import { registerOnrampHandlers } from './onramp.js';
+import { registerScheduleHandlers } from './schedule/index.js';
+import { registerBridgeHandlers } from './bridge.js';
+import { registerWithdrawHandlers } from './withdraw.js';
 import { registerTextRouter } from './text/router.js';
 
 /** Handlers that must register before the text router (keyboard pass-through). */
@@ -42,6 +48,12 @@ export function registerPostTextHandlers(ctx: HandlerContext): void {
 
 export function registerAllHandlers(ctx: HandlerContext): void {
   registerPreTextHandlers(ctx);
+  registerWalletHandlers(ctx);
+  registerVoiceHandlers(ctx);
+  registerPhotoHandlers(ctx);
   registerTextRouter(ctx);
+  registerScheduleHandlers(ctx);
+  registerBridgeHandlers(ctx);
+  registerWithdrawHandlers(ctx);
   registerPostTextHandlers(ctx);
 }
