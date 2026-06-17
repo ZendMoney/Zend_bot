@@ -703,8 +703,8 @@ async function verifyBankAccount(
 const mainMenu = Markup.keyboard([
   ['💰 Balance', '🔄 Swap'],
   ['📥 Receive', '💳 Bills', '📋 History'],
-  ['📖 How to Use', '✨ Features', '📝 Feedback'],
-  ['❓ Help'],
+  ['⚙️ Settings', '📖 How to Use', '✨ Features'],
+  ['📝 Feedback', '❓ Help'],
 ]).resize();
 
 const cancelKeyboard = Markup.keyboard([['❌ Cancel']]).resize();
@@ -1175,17 +1175,21 @@ async function startOnboarding(ctx: ZendContext, userId: string) {
 // /ADMIN — Admin Dashboard
 // ═════════════════════════════════════════════════════════════════════════════
 
-/** Numeric Telegram user IDs only — usernames are not accepted */
 const ADMIN_TELEGRAM_IDS = (process.env.ADMIN_TELEGRAM_IDS || process.env.ADMIN_TELEGRAM_ID || '')
   .split(',')
-  .map(s => s.trim())
-  .filter(s => /^\d+$/.test(s));
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
 
-async function checkAdmin(userId: string): Promise<boolean> {
+async function checkAdmin(userId: string, username?: string): Promise<boolean> {
   if (isSuperAdmin(userId)) return true;
-  if (ADMIN_TELEGRAM_IDS.includes(userId)) return true;
-  const u = await db.select({ isAdmin: users.isAdmin }).from(users).where(eq(users.id, userId)).limit(1);
-  return u.length > 0 && u[0].isAdmin === true;
+  if (ADMIN_TELEGRAM_IDS.length > 0) {
+    if (ADMIN_TELEGRAM_IDS.includes(userId)) return true;
+    if (username && ADMIN_TELEGRAM_IDS.includes(username.toLowerCase())) return true;
+  }
+  const u = await db.select({ isAdmin: users.isAdmin, telegramUsername: users.telegramUsername }).from(users).where(eq(users.id, userId)).limit(1);
+  if (u.length > 0 && u[0].isAdmin) return true;
+  if (u.length > 0 && u[0].telegramUsername && ADMIN_TELEGRAM_IDS.includes(u[0].telegramUsername.toLowerCase())) return true;
+  return false;
 }
 
 // ─── Admin Navigation ───
@@ -1200,7 +1204,7 @@ const adminMainKeyboard = Markup.inlineKeyboard([
 bot.command('admin', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) {
+  if (!(await checkAdmin(userId, username))) {
     await ctx.reply('❌ You do not have permission to access the admin panel.');
     return;
   }
@@ -1210,7 +1214,7 @@ bot.command('admin', async (ctx) => {
 bot.action('admin_back', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
   await ctx.editMessageText('🛠 *Zend Admin Panel*\n\nChoose a section:', { parse_mode: 'Markdown', ...adminMainKeyboard });
   await ctx.answerCbQuery();
 });
@@ -1219,7 +1223,7 @@ bot.action('admin_back', async (ctx) => {
 bot.action('admin_page:overview', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const userCount = await db.select({ count: sql`count(*)` }).from(users);
   const txCount = await db.select({ count: sql`count(*)` }).from(transactions);
@@ -1250,7 +1254,7 @@ const USERS_PER_PAGE = 20;
 bot.action('admin_page:users', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const total = await db.select({ count: sql`count(*)` }).from(users);
   const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
@@ -1286,7 +1290,7 @@ bot.action('admin_page:users', async (ctx) => {
 bot.action(/admin_users_page:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const page = parseInt(ctx.match[1], 10);
   const offset = page * USERS_PER_PAGE;
@@ -1320,7 +1324,7 @@ const AMBS_PER_PAGE = 10;
 bot.action('admin_page:ambassadors', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const total = await db.select({ count: sql`count(*)` }).from(ambassadorApplications);
   const apps = await db.select().from(ambassadorApplications).orderBy(sql`${ambassadorApplications.createdAt} desc`).limit(AMBS_PER_PAGE);
@@ -1343,7 +1347,7 @@ bot.action('admin_page:ambassadors', async (ctx) => {
 bot.action(/admin_ambassadors_page:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const page = parseInt(ctx.match[1], 10);
   const offset = page * AMBS_PER_PAGE;
@@ -1373,7 +1377,7 @@ const SUSP_PER_PAGE = 20;
 bot.action('admin_page:suspensions', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const total = await db.select({ count: sql`count(*)` }).from(deviceSuspensionRequests);
   const reqs = await db.select().from(deviceSuspensionRequests).orderBy(sql`${deviceSuspensionRequests.createdAt} desc`).limit(SUSP_PER_PAGE);
@@ -1395,7 +1399,7 @@ bot.action('admin_page:suspensions', async (ctx) => {
 bot.action(/admin_suspensions_page:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const page = parseInt(ctx.match[1], 10);
   const offset = page * SUSP_PER_PAGE;
@@ -1424,7 +1428,7 @@ bot.action(/admin_suspensions_page:(\d+)/, async (ctx) => {
 bot.action('admin_page:fees', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const totalZendFee = await db.select({ sum: sql`coalesce(sum(zend_fee_usdt), 0)` }).from(transactions).where(eq(transactions.status, 'completed'));
   const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_send'));
@@ -1454,7 +1458,7 @@ bot.action('admin_page:fees', async (ctx) => {
 bot.action('admin_page:features', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const features = await db.select().from(botFeatures).orderBy(botFeatures.sortOrder);
   const buttons = features.map(f => [
@@ -1472,7 +1476,7 @@ bot.action('admin_page:features', async (ctx) => {
 bot.action(/admin_toggle_feature:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const featureId = parseInt(ctx.match[1], 10);
   const feature = await db.select().from(botFeatures).where(eq(botFeatures.id, featureId)).limit(1);
@@ -1503,7 +1507,7 @@ const FEEDBACK_PER_PAGE = 10;
 bot.action('admin_page:feedback', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const total = await db.select({ count: sql`count(*)` }).from(feedback);
   const openCount = await db.select({ count: sql`count(*)` }).from(feedback).where(eq(feedback.status, 'open'));
@@ -1533,7 +1537,7 @@ bot.action('admin_page:feedback', async (ctx) => {
 bot.action(/admin_feedback_detail:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const feedbackId = parseInt(ctx.match[1], 10);
   const rows = await db.select().from(feedback).where(eq(feedback.id, feedbackId)).limit(1);
@@ -1565,7 +1569,7 @@ bot.action(/admin_feedback_detail:(\d+)/, async (ctx) => {
 bot.action(/admin_feedback_resolve:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const feedbackId = parseInt(ctx.match[1], 10);
   await db.update(feedback).set({ status: 'resolved', resolvedAt: new Date() }).where(eq(feedback.id, feedbackId));
@@ -1576,7 +1580,7 @@ bot.action(/admin_feedback_resolve:(\d+)/, async (ctx) => {
 bot.action(/admin_feedback_progress:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const feedbackId = parseInt(ctx.match[1], 10);
   await db.update(feedback).set({ status: 'in_progress' }).where(eq(feedback.id, feedbackId));
@@ -1591,7 +1595,7 @@ const REFS_PER_PAGE = 15;
 bot.action('admin_page:ambassador_refs', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const total = await db.select({ count: sql`count(*)` }).from(ambassadorApplications);
   const ambassadors = await db.select().from(ambassadorApplications).orderBy(desc(ambassadorApplications.createdAt)).limit(REFS_PER_PAGE);
@@ -1637,7 +1641,7 @@ bot.action('admin_page:ambassador_refs', async (ctx) => {
 bot.action(/admin_ref_page:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const page = parseInt(ctx.match[1], 10);
   const offset = page * REFS_PER_PAGE;
@@ -1686,7 +1690,7 @@ bot.action(/admin_ref_page:(\d+)/, async (ctx) => {
 bot.action('admin_ambassador_leaderboard', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const ambassadors = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.status, 'confirmed'));
 
@@ -1712,7 +1716,7 @@ bot.action('admin_ambassador_leaderboard', async (ctx) => {
 bot.action(/admin_ambassador_detail:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const ambId = parseInt(ctx.match[1], 10);
   const ambRows = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.id, ambId)).limit(1);
@@ -1764,7 +1768,7 @@ bot.action(/admin_ambassador_detail:(\d+)/, async (ctx) => {
 bot.action(/admin_confirm_ambassador:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const ambId = parseInt(ctx.match[1], 10);
   await db.update(ambassadorApplications)
@@ -1778,7 +1782,7 @@ bot.action(/admin_confirm_ambassador:(\d+)/, async (ctx) => {
 bot.action(/admin_remove_ambassador:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const ambId = parseInt(ctx.match[1], 10);
   await db.update(ambassadorApplications)
@@ -1792,7 +1796,7 @@ bot.action(/admin_remove_ambassador:(\d+)/, async (ctx) => {
 bot.action(/admin_set_ambassador_code:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const ambId = parseInt(ctx.match[1], 10);
   const ambRows = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.id, ambId)).limit(1);
@@ -1813,7 +1817,7 @@ bot.action(/admin_set_ambassador_code:(\d+)/, async (ctx) => {
 bot.action(/admin_ambassador_signups:(\d+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const ambId = parseInt(ctx.match[1], 10);
   const ambRows = await db.select().from(ambassadorApplications).where(eq(ambassadorApplications.id, ambId)).limit(1);
@@ -1871,7 +1875,7 @@ const adminSearchKeyboard = Markup.inlineKeyboard([
 bot.action('admin_page:search', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
   await ctx.editMessageText('🔍 *Search*\n\nWhat do you want to look up?', { parse_mode: 'Markdown', ...adminSearchKeyboard });
   await ctx.answerCbQuery();
 });
@@ -1879,7 +1883,7 @@ bot.action('admin_page:search', async (ctx) => {
 bot.action('admin_search:txn', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
   setSession(userId, { state: ConversationState.AWAITING_ADMIN_TXN_SEARCH });
   await ctx.editMessageText('🔎 *Search Transaction*\n\nEnter the transaction ID (e.g., `ZND-12345`):', { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'admin_cancel_search')]]) });
   await ctx.answerCbQuery();
@@ -1888,7 +1892,7 @@ bot.action('admin_search:txn', async (ctx) => {
 bot.action('admin_search:user', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
   setSession(userId, { state: ConversationState.AWAITING_ADMIN_USER_SEARCH });
   await ctx.editMessageText('👤 *Search User*\n\nEnter a Telegram user ID or @username:', { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'admin_cancel_search')]]) });
   await ctx.answerCbQuery();
@@ -2028,7 +2032,7 @@ async function buildUserDetailText(userRow: any): Promise<string> {
 bot.action(/admin_txn:(.+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const txnId = ctx.match[1];
   const txnRows = await db.select().from(transactions).where(eq(transactions.id, txnId)).limit(1);
@@ -2050,7 +2054,7 @@ bot.action(/admin_txn:(.+)/, async (ctx) => {
 bot.action(/admin_user:(.+)/, async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
-  if (!(await checkAdmin(userId))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
+  if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const targetId = ctx.match[1];
   const userRows = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
