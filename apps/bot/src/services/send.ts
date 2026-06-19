@@ -13,7 +13,7 @@ import { generateTxId } from '../lib/ids.js';
 import { getAuddPriceInUsdt } from './pricing.js';
 import { indexTransaction } from './nlp.js';
 import { decryptPrivateKey } from '../utils/wallet.js';
-import { getSwapQuote, buildSwapTransaction } from './jupiter.js';
+import { ensureUsdtBalance } from './stablecoin.js';
 import { fundSolIfNeeded, gasFundingErrorToUserMessage } from './gas.js';
 import {
   clearPajSession,
@@ -120,7 +120,7 @@ export async function executeSendCore(
       offRampRef = order.id;
       console.log('[PAJ] Off-ramp order created:', order.id, 'deposit address:', order.address, 'amount:', order.amount);
 
-      let tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, pajMint);
+      const feeUsdtAmount = txData.zendFeeUsdt || 0;
 
       // Auto-swap AUDD → USDT via local pool (hidden from user)
       if (userFromMint === SOLANA_TOKENS.AUDD.mint) {
@@ -163,48 +163,19 @@ export async function executeSendCore(
           toMint: SOLANA_TOKENS.USDT.mint, toAmount: usdtNeeded.toString(),
           solanaTxHash: swapTxHash,
         });
-        tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
-      }
-
-      // Auto-swap USDC → USDT if needed
-      if (tokenBalance < order.amount) {
-        const usdcBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDC.mint);
-        if (usdcBalance >= order.amount) {
-          const swapAmountUsdc = Math.min(usdcBalance, order.amount * 1.03);
-          const swapAmountBase = Math.round(swapAmountUsdc * Math.pow(10, SOLANA_TOKENS.USDC.decimals));
-          const quote = await getSwapQuote(SOLANA_TOKENS.USDC.mint, SOLANA_TOKENS.USDT.mint, swapAmountBase, 100);
-          if (!quote) {
-            throw new Error('Exchange not available right now. Please deposit Dollars (USDT).');
-          }
-          const outAmountUsdt = Number(quote.outAmount) / Math.pow(10, SOLANA_TOKENS.USDT.decimals);
-          if (outAmountUsdt < order.amount) {
-            throw new Error(`Conversion would only give ${outAmountUsdt.toFixed(2)} Dollars. Deposit more USDT.`);
-          }
-          const serializedTx = await buildSwapTransaction(quote, user[0].walletAddress, true);
-          if (!serializedTx) throw new Error('Failed to build swap transaction.');
-          const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
-          const keypair = Keypair.fromSecretKey(secretKey);
-          const swapTxHash = await walletService.signAndSendSerialized(keypair, serializedTx);
-          console.log('[Jupiter] Auto-swap USDC→USDT:', swapTxHash);
-          const swapTxId = generateTxId();
-          await db.insert(transactions).values({
-            id: swapTxId, userId, type: 'swap', status: 'completed',
-            fromMint: SOLANA_TOKENS.USDC.mint, fromAmount: swapAmountUsdc.toString(),
-            toMint: SOLANA_TOKENS.USDT.mint, toAmount: outAmountUsdt.toString(),
-            solanaTxHash: swapTxHash,
-          });
-          await indexTransaction(userId, swapTxId, `Swapped ${swapAmountUsdc.toFixed(2)} USDC to ${outAmountUsdt.toFixed(2)} USDT`, {
-            fromAmount: swapAmountUsdc,
-            toAmount: outAmountUsdt,
-            fromToken: 'USDC',
-            toToken: 'USDT',
-          });
-          tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, SOLANA_TOKENS.USDT.mint);
-        }
       }
 
       const feeWallet = process.env.ZEND_FEE_WALLET;
-      const feeUsdt = txData.zendFeeUsdt || 0;
+      const feeUsdt = feeUsdtAmount;
+      const totalUsdtNeeded = order.amount + feeUsdt;
+
+      let tokenBalance = await ensureUsdtBalance(
+        userId,
+        user[0].walletAddress,
+        user[0].walletEncryptedKey,
+        totalUsdtNeeded,
+        'bank transfer'
+      );
 
       // Gas sponsorship: top up exact shortfall (including ATA rent if needed)
       const { funded, gasSponsored, shortfall, error: fundError } = await fundSolIfNeeded(
@@ -217,12 +188,6 @@ export async function executeSendCore(
       if (shortfall && !funded) {
         const userMsg = gasFundingErrorToUserMessage(fundError, shortfall);
         throw new Error(userMsg);
-      }
-
-      // Check token balance covers transfer + fee
-      const totalUsdtNeeded = order.amount + feeUsdt;
-      if (tokenBalance < totalUsdtNeeded) {
-        throw new Error(`Insufficient ${userFromSymbol} balance. You have: ${tokenBalance.toFixed(2)}, need: ${totalUsdtNeeded.toFixed(2)} for the transfer and fee.`);
       }
 
       // Build USDT fee transfer instruction to bundle with main send

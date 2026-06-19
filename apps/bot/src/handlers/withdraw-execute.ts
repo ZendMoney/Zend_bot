@@ -6,6 +6,7 @@ import { mainMenu } from '../keyboards/index.js';
 import { getSession, setSession } from '../session/store.js';
 import { indexTransaction } from '../services/nlp.js';
 import { fundNearIntentDeposit, formatChainName } from '../services/near-intents-flow.js';
+import { ensureUsdtBalance } from '../services/stablecoin.js';
 import { ConversationState } from '@zend/shared';
 import type { ZendContext } from '../session/types.js';
 
@@ -25,11 +26,19 @@ export async function executeNearIntentWithdraw(ctx: ZendContext, userId: string
   }
 
   try {
-    await ctx.reply('⏳ Sending tokens via NEAR Intents...');
+    await ctx.reply('⏳ Preparing USDT and sending via NEAR Intents...');
+
+    await ensureUsdtBalance(
+      userId,
+      user[0].walletAddress,
+      user[0].walletEncryptedKey,
+      wd.amount,
+      'cross-chain send'
+    );
 
     const solanaTxHash = await fundNearIntentDeposit(
       user[0].walletEncryptedKey,
-      wd.sourceSymbol,
+      'USDT',
       wd.amount,
       wd.depositAddress,
       SOLANA_RPC

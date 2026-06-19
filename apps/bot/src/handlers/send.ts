@@ -16,6 +16,7 @@ import {
 } from '../utils/fees.js';
 import { AUDD_ENABLED } from '../utils/flags.js';
 import { calculateSendFee } from '../services/gas.js';
+import { getStablecoinBalances } from '../services/stablecoin.js';
 import { getPAJRates, verifyBankAccount } from '../services/paj.js';
 import { executeSendCore } from '../services/send.js';
 import { checkMilestones } from '../services/milestones.js';
@@ -116,9 +117,14 @@ export async function prepareSendConfirmation(
   recipientName?: string,
   fromMint?: string
 ) {
-  const selectedMint = fromMint || SOLANA_TOKENS.USDT.mint;
+  const selectedMint =
+    fromMint === SOLANA_TOKENS.AUDD.mint ? SOLANA_TOKENS.AUDD.mint : SOLANA_TOKENS.USDT.mint;
   const selectedToken = Object.values(SOLANA_TOKENS).find(t => t.mint === selectedMint) || SOLANA_TOKENS.USDT;
   const selectedSymbol = selectedToken.symbol;
+  const autoSwapNote =
+    selectedMint === SOLANA_TOKENS.USDT.mint
+      ? '\n_Paid in USDT — we auto-convert USDC if needed._\n'
+      : '';
   const pajClient = await getPAJClient();
   let rate = 1550;
   try {
@@ -144,7 +150,10 @@ export async function prepareSendConfirmation(
   const usdtNeeded = transferUsdt + zendFeeUsdt;
 
   if (user[0]?.walletAddress) {
-    const tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, selectedMint);
+    const isAudd = selectedMint === SOLANA_TOKENS.AUDD.mint;
+    const tokenBalance = isAudd
+      ? await walletService.getTokenBalance(user[0].walletAddress, selectedMint)
+      : (await getStablecoinBalances(user[0].walletAddress)).total;
     const solBalance = await walletService.getSolBalance(user[0].walletAddress);
     const balanceCheck = checkSendBalance({
       tokenBalance,
@@ -152,7 +161,7 @@ export async function prepareSendConfirmation(
       transferUsdt,
       zendFeeUsdt,
       willFundSol,
-      isAudd: selectedMint === SOLANA_TOKENS.AUDD.mint,
+      isAudd,
     });
 
     if (!balanceCheck.ok) {
@@ -170,8 +179,8 @@ export async function prepareSendConfirmation(
           `❌ *Insufficient Balance*\n\n` +
           `You want to send ${formatNgn(amountNgn)}\n` +
           `You need: *${balanceCheck.usdtNeeded.toFixed(2)} ${selectedSymbol}* (incl. ${zendFeeUsdt.toFixed(2)} fee)\n` +
-          `You have: *${tokenBalance.toFixed(2)} ${selectedSymbol}*\n` +
-          `Short by: *${balanceCheck.shortfall!.toFixed(2)} ${selectedSymbol}*\n\n` +
+          `You have: *${tokenBalance.toFixed(2)} ${isAudd ? selectedSymbol : 'USDT/USDC'}*\n` +
+          `Short by: *${balanceCheck.shortfall!.toFixed(2)} ${isAudd ? selectedSymbol : 'USDT'}*\n\n` +
           `Add more Dollars to your wallet or send a smaller amount.`,
           { parse_mode: 'Markdown', ...mainMenu }
         );
@@ -212,7 +221,7 @@ export async function prepareSendConfirmation(
     zendFeeUsdt,
     feeSol,
     ngnRate: rate,
-    fromMint: selectedMint,
+    fromMint: selectedMint, // bank sends settle via USDT (USDC auto-swapped)
     recipientName: verifiedName,
     recipientAccountName: verifiedName,
     recipientBankName: bankName,
@@ -238,7 +247,7 @@ export async function prepareSendConfirmation(
     `Account: \`${recipientAccountNumber}\`\n` +
     `Amount: ${formatNgn(amountNgn)}\n` +
     `${formatSendFeeLabel({ zendFeeUsdt, feeBps, willFundSol, gasCostUsdt: feeInfo.gasCostUsdt, extraFeeUsdt: feeInfo.extraFeeUsdt, feeSol, feeMode: feeInfo.feeMode, percentageFeeUsdt: feeInfo.percentageFeeUsdt })}\n` +
-    `You pay: *${usdtNeeded.toFixed(2)} ${selectedSymbol}*\n` +
+    `You pay: *${usdtNeeded.toFixed(2)} ${selectedSymbol}*${autoSwapNote}` +
     `Rate: ${formatNgn(rate)} per Dollar\n\n` +
     `Confirm?`;
 
@@ -274,6 +283,7 @@ async function startBankSend(ctx: ZendContext, userId: string) {
   });
   await ctx.reply(
     `📤 *Send to Nigerian Bank*\n\n` +
+    `Paid from your Dollar balance (USDT or USDC — we auto-convert if needed).\n\n` +
     `How much do you want to send? (in Naira)\n\n` +
     `Examples: 50000, 100000, 5000`,
     { parse_mode: 'Markdown', ...cancelKeyboard }

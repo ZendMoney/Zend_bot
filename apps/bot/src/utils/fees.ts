@@ -99,7 +99,10 @@ export function formatSendFeeLabel(info: Pick<
   }
   if (info.feeMode === 'gas_recovery' && info.gasCostUsdt != null && info.extraFeeUsdt != null) {
     const solPart = info.feeSol > 0 ? `~${info.feeSol.toFixed(4)} SOL (≈${info.gasCostUsdt.toFixed(2)} USDT)` : '';
-    return `Gas sponsorship ${solPart} + ${info.extraFeeUsdt.toFixed(2)} USDT fee = ~${info.zendFeeUsdt.toFixed(2)} USDT`;
+    return (
+      `Network fee (we top up your SOL): ${solPart} + ${info.extraFeeUsdt.toFixed(2)} USDT service fee ` +
+      `= ~${info.zendFeeUsdt.toFixed(2)} USDT total`
+    );
   }
   if (info.feeMode === 'percentage') {
     return `ZendPay fee (${(info.feeBps / 100).toFixed(2)}%, gas sponsored): ~${info.zendFeeUsdt.toFixed(2)} USDT`;

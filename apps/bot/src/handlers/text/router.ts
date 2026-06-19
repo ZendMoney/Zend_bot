@@ -20,6 +20,7 @@ import {
   parseBulkSendWithAI,
 } from '../../services/nlp.js';
 import { getPAJClient, walletService, airbillsClient } from '../../deps.js';
+import { getStablecoinBalances } from '../../services/stablecoin.js';
 import { getDataPlans, type DataPlan } from '../../services/bills/index.js';
 import { getDataPlansForNetwork } from '../../services/airbills/plans.js';
 import { mainMenu, cancelKeyboard, REPLY_KEYBOARD_BUTTONS } from '../../keyboards/index.js';
@@ -532,10 +533,10 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
 
     await ctx.reply(
       `📤 *Withdraw Preview*\n\n` +
-      `From: ZendPay *${wd.sourceSymbol}*\n` +
+      `From: ZendPay *USDT* (USDC auto-converts)\n` +
       `To: *${formatChainName(wd.destChain)}* (${wd.destToken})\n` +
       `Recipient: \`${recipientAddress}\`\n\n` +
-      `How much ${wd.sourceSymbol} do you want to send?\n` +
+      `How much USDT do you want to send?\n` +
       `Example: 10, 25, 50`,
       { parse_mode: 'Markdown', ...cancelKeyboard }
     );
@@ -563,13 +564,12 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       return;
     }
 
-    const balance = await walletService.getTokenBalance(
-      user[0].walletAddress,
-      SOLANA_TOKENS[wd.sourceSymbol].mint
-    );
-    if (balance < amount) {
+    const stable = await getStablecoinBalances(user[0].walletAddress);
+    if (stable.total < amount) {
       await ctx.reply(
-        `❌ Insufficient balance.\nYou have ${balance.toFixed(2)} ${wd.sourceSymbol}, need ${amount}.`,
+        `❌ Insufficient balance.\n` +
+        `You have ${stable.usdt.toFixed(2)} USDT + ${stable.usdc.toFixed(2)} USDC ` +
+        `(${stable.total.toFixed(2)} total), need ${amount} USDT.`,
         cancelKeyboard
       );
       return;
@@ -579,7 +579,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       await ctx.reply('⏳ Getting quote from NEAR Intents...');
 
       const quote = await createWithdrawQuote({
-        sourceSymbol: wd.sourceSymbol,
+        sourceSymbol: 'USDT',
         amount,
         destChain: wd.destChain,
         destToken: wd.destToken,
@@ -599,7 +599,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
         status: 'pending',
         nearIntentDepositAddress: depositAddress,
         fromAmount: amount.toString(),
-        fromMint: SOLANA_ORIGIN_ASSETS[wd.sourceSymbol],
+        fromMint: SOLANA_ORIGIN_ASSETS.USDT,
         toMint: wd.destAssetId,
         recipientWalletAddress: wd.recipientAddress,
         metadata: { direction: 'withdraw', destChain: wd.destChain, destToken: wd.destToken },
@@ -618,7 +618,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
 
       await ctx.reply(
         `📤 *Confirm Withdrawal*\n\n` +
-        `Send: *${amount} ${wd.sourceSymbol}*\n` +
+        `Send: *${amount} USDT*\n` +
         `To: *${formatChainName(wd.destChain)}*\n` +
         `Recipient: \`${wd.recipientAddress}\`\n` +
         `They receive: ~${amountOutFormatted} ${wd.destToken}\n` +

@@ -103,47 +103,22 @@ export function registerWithdrawHandlers({ bot: b }: HandlerContext): void {
   }
 
   setSession(userId, {
-    state: ConversationState.IDLE,
+    state: ConversationState.AWAITING_WITHDRAW_RECIPIENT,
     withdrawData: { destChain: chainKey, destToken, destAssetId, sourceSymbol: 'USDT' },
   });
 
   await ctx.editMessageText(
     `📤 *Send to ${formatChainName(chainKey)}*\n\n` +
-    `Recipient receives: *${destToken}*\n\n` +
-    `Pay from your ZendPay balance:`,
+    `Recipient receives: *${destToken}*\n` +
+    `Paid from your Dollar balance (USDT — USDC auto-converts if needed).\n\n` +
+    `Enter the recipient's wallet address on ${formatChainName(chainKey)}:`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
-        [Markup.button.callback('USDT', `withdraw_source:USDT`)],
-        [Markup.button.callback('USDC', `withdraw_source:USDC`)],
         [Markup.button.callback('← Back', `withdraw_chain:${chainKey}`)],
         [Markup.button.callback('❌ Cancel', 'cancel_withdraw')],
       ]),
     }
-  );
-});
-
-  b.action(/withdraw_source:(USDT|USDC)/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const userId = ctx.from!.id.toString();
-  const sourceSymbol = ctx.match[1] as 'USDT' | 'USDC';
-  const session = getSession(userId);
-  if (!session.withdrawData) {
-    await ctx.editMessageText('❌ Session expired. Please start over.');
-    return;
-  }
-
-  setSession(userId, {
-    ...session,
-    state: ConversationState.AWAITING_WITHDRAW_RECIPIENT,
-    withdrawData: { ...session.withdrawData, sourceSymbol },
-  });
-
-  await ctx.editMessageText(
-    `📤 *Send ${sourceSymbol} → ${session.withdrawData.destToken}*\n` +
-    `To: *${formatChainName(session.withdrawData.destChain)}*\n\n` +
-    `Enter the recipient's wallet address on ${formatChainName(session.withdrawData.destChain)}:`,
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'cancel_withdraw')]]) }
   );
 });
 
