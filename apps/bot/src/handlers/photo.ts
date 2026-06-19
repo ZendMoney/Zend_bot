@@ -3,10 +3,10 @@ import { message } from 'telegraf/filters';
 import { db, users } from '@zend/db';
 import { eq } from 'drizzle-orm';
 import { parseReceiptWithQVAC } from '../services/nlp.js';
-import { ConversationState, NIGERIAN_BANKS } from '@zend/shared';
+import { NIGERIAN_BANKS } from '@zend/shared';
 import { mainMenu } from '../keyboards/index.js';
 import { showLoading, finishLoading } from '../lib/loading.js';
-import { getSession, setSession } from '../session/store.js';
+import { prepareSendConfirmation } from './send.js';
 import type { HandlerContext } from './types.js';
 
 export function registerPhotoHandlers({ bot: b }: HandlerContext): void {
@@ -56,23 +56,14 @@ export function registerPhotoHandlers({ bot: b }: HandlerContext): void {
       );
 
       if (bank) {
-        setSession(userId, {
-          state: ConversationState.AWAITING_CONFIRMATION,
-          pendingTransaction: {
-            amountNgn: receipt.amount,
-            recipientAccountNumber: receipt.accountNumber,
-            recipientBankCode: bank.code,
-            recipientBankName: bank.name,
-            recipientName: receipt.recipientName || 'Recipient',
-          },
-        });
-
-        await ctx.reply(
-          `Send ₦${receipt.amount.toLocaleString()} to ${receipt.recipientName || 'Recipient'} at ${bank.name}?`,
-          Markup.inlineKeyboard([
-            [Markup.button.callback('✅ Confirm', 'confirm_send')],
-            [Markup.button.callback('❌ Cancel', 'cancel_send')],
-          ])
+        await prepareSendConfirmation(
+          ctx,
+          userId,
+          receipt.amount,
+          receipt.accountNumber,
+          bank.code,
+          bank.name,
+          receipt.recipientName || undefined,
         );
         return;
       }

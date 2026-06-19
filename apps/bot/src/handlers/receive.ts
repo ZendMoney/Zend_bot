@@ -92,7 +92,6 @@ export async function showReceive(ctx: ZendContext, userId: string) {
     kbRows.push([Markup.button.callback('🇦🇺 Add AUDD', 'add_aud_start')]);
   }
   kbRows.push([Markup.button.callback('🌉 Receive from Other Apps', 'bridge_start')]);
-  kbRows.push([Markup.button.callback('📤 Send to Other Apps', 'withdraw_start')]);
 
   await ctx.reply(msg, {
     parse_mode: 'Markdown',

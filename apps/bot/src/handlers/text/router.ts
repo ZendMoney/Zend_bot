@@ -19,7 +19,9 @@ import {
   indexTransaction,
   parseBulkSendWithAI,
 } from '../../services/nlp.js';
-import { getPAJClient, walletService } from '../../deps.js';
+import { getPAJClient, walletService, airbillsClient } from '../../deps.js';
+import { getDataPlans, type DataPlan } from '../../services/bills/index.js';
+import { getDataPlansForNetwork } from '../../services/airbills/plans.js';
 import { getNearIntentsClient } from '@zend/near-intents-client';
 import { mainMenu, cancelKeyboard, REPLY_KEYBOARD_BUTTONS } from '../../keyboards/index.js';
 import { md, escapeTelegramMarkdown } from '../../lib/telegram.js';
@@ -1214,12 +1216,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       try {
         let rows: ReturnType<typeof Markup.button.callback>[][] = [];
         if (airbillsClient) {
-          let plans: Array<{ id: string; name: string; amount: number }> = [];
-          try {
-            plans = await airbillsClient.getPlans(session.billData.network!);
-          } catch {
-            plans = await airbillsClient.getPlans('data');
-          }
+          const plans = await getDataPlansForNetwork(airbillsClient, session.billData.network!);
           if (plans.length === 0) {
             await finishLoading(ctx, loading.message_id, '❌ No data plans found for this network.');
             setSession(userId, { state: ConversationState.IDLE });
@@ -1298,6 +1295,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       `${bill.provider ? `Provider: ${bill.provider.toUpperCase()}\n` : ''}` +
       `${bill.phone ? `Phone: ${bill.phone}\n` : ''}` +
       `${bill.meterNumber ? `Meter: ${bill.meterNumber}\n` : ''}` +
+      `${(bill as any).customerName ? `Customer: ${(bill as any).customerName}\n` : ''}` +
       `${bill.smartCardNumber ? `Smart Card: ${bill.smartCardNumber}\n` : ''}` +
       `Amount: ₦${amount.toLocaleString()}\n` +
       `≈ ${usdtAmount.toFixed(4)} USDT\n\n` +
@@ -1320,6 +1318,28 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       return;
     }
     session.billData = { ...session.billData, meterNumber: meter };
+
+    if (airbillsClient && session.billData?.disco) {
+      const verifyMsg = await showLoading(ctx, 'Verifying meter number...');
+      try {
+        const validation = await airbillsClient.validateRecipient(session.billData.disco, meter);
+        if (validation.valid && validation.name) {
+          session.billData = { ...session.billData, meterNumber: meter, customerName: validation.name };
+          await finishLoading(
+            ctx,
+            verifyMsg.message_id,
+            `✅ *Meter Verified*\n\nCustomer: ${md(validation.name)}\nMeter: \`${meter}\``,
+            'Markdown'
+          );
+        } else {
+          await finishLoading(ctx, verifyMsg.message_id, '⚠️ Could not verify meter name. Double-check the number, then enter amount.');
+        }
+      } catch (err: any) {
+        console.error('[Bills] Meter validation failed:', err.message);
+        await finishLoading(ctx, verifyMsg.message_id, '⚠️ Meter lookup unavailable. Enter amount to continue.');
+      }
+    }
+
     session.state = ConversationState.BILL_ENTER_AMOUNT;
     setSession(userId, session);
     await ctx.reply('💵 Enter amount in Naira (e.g., 1000, 5000):', cancelKeyboard);
@@ -1333,7 +1353,28 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       return;
     }
     session.billData = { ...session.billData, smartCardNumber: card };
-    // For cable, we'd fetch bouquets here. For MVP, ask amount directly.
+
+    if (airbillsClient && session.billData?.provider) {
+      const verifyMsg = await showLoading(ctx, 'Verifying smart card...');
+      try {
+        const validation = await airbillsClient.validateRecipient(session.billData.provider, card);
+        if (validation.valid && validation.name) {
+          session.billData = { ...session.billData, smartCardNumber: card, customerName: validation.name };
+          await finishLoading(
+            ctx,
+            verifyMsg.message_id,
+            `✅ *Smart Card Verified*\n\nCustomer: ${md(validation.name)}\nCard: \`${card}\``,
+            'Markdown'
+          );
+        } else {
+          await finishLoading(ctx, verifyMsg.message_id, '⚠️ Could not verify subscriber name. Double-check the card number.');
+        }
+      } catch (err: any) {
+        console.error('[Bills] Smart card validation failed:', err.message);
+        await finishLoading(ctx, verifyMsg.message_id, '⚠️ Lookup unavailable. Enter amount to continue.');
+      }
+    }
+
     session.state = ConversationState.BILL_ENTER_AMOUNT;
     setSession(userId, session);
     await ctx.reply('💵 Enter subscription amount in Naira:', cancelKeyboard);
@@ -1781,15 +1822,34 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
 
   // ─── SCHEDULE: AWAITING_SCHEDULE_RECIPIENT ───
   if (session.state === ConversationState.AWAITING_SCHEDULE_RECIPIENT) {
-    // Parse "BANK_NAME ACCOUNT_NUMBER" or "BANK_NAME • ACCOUNT_NUMBER"
+    // Parse "BANK_NAME ACCOUNT_NUMBER", "Name Bank Account", or "GTB • 0123456789"
     const cleanText = text.replace(/[•,]/g, ' ').trim();
-    const parts = cleanText.split(/\s+/);
-    if (parts.length < 2) {
-      await ctx.reply('❌ Please enter bank name and account number.\nExample: GTB 0123456789', cancelKeyboard);
+    let accountNumber = '';
+    let bankQuery = '';
+    let recipientName: string | undefined;
+
+    const acctMatch = cleanText.match(/(\d{10})\s*$/);
+    if (acctMatch) {
+      accountNumber = acctMatch[1];
+      const beforeAcct = cleanText.slice(0, acctMatch.index).trim();
+      const aiParsed = await parseMenuInputWithAI(beforeAcct || cleanText);
+      if (aiParsed?.success && aiParsed.bankCode && aiParsed.accountNumber) {
+        accountNumber = aiParsed.accountNumber;
+        bankQuery = aiParsed.bankCode.toLowerCase();
+        recipientName = aiParsed.recipientName || undefined;
+      } else {
+        const parts = beforeAcct.split(/\s+/).filter(Boolean);
+        if (parts.length >= 1) {
+          bankQuery = parts[parts.length - 1].toLowerCase();
+          if (parts.length > 1) recipientName = parts.slice(0, -1).join(' ');
+        }
+      }
+    }
+
+    if (!accountNumber) {
+      await ctx.reply('❌ Please enter bank name and account number.\nExample: GTB 0123456789 or Tunde GTB 0123456789', cancelKeyboard);
       return;
     }
-    const accountNumber = parts[parts.length - 1].replace(/\D/g, '');
-    const bankQuery = parts.slice(0, parts.length - 1).join(' ').toLowerCase();
 
     if (!/^\d{10}$/.test(accountNumber)) {
       await ctx.reply('❌ Account number must be 10 digits.', cancelKeyboard);
@@ -1798,9 +1858,10 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
 
     // Find bank
     const bank = NIGERIAN_BANKS.find(b =>
-      b.name.toLowerCase().includes(bankQuery) ||
       b.code.toLowerCase() === bankQuery ||
-      bankQuery.includes(b.name.toLowerCase().split(' ')[0])
+      b.name.toLowerCase().includes(bankQuery) ||
+      bankQuery.includes(b.name.toLowerCase().split(' ')[0]) ||
+      bankQuery.includes(b.code.toLowerCase())
     );
     if (!bank) {
       const bankButtons = NIGERIAN_BANKS.map(b => Markup.button.callback(b.name, `schedule_bank:${b.code}`));
@@ -1820,7 +1881,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
     }
 
     // Try to verify account name via PAJ if linked
-    let accountName = 'Unknown';
+    let accountName = recipientName || 'Unknown';
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     if (user[0]?.pajSessionToken) {
       try {
@@ -1898,8 +1959,32 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
 
   // ─── SCHEDULE: AWAITING_SCHEDULE_FREQUENCY ───
   if (session.state === ConversationState.AWAITING_SCHEDULE_FREQUENCY) {
-    // User should have clicked a frequency button
-    await ctx.reply('❌ Please select a frequency from the buttons above.', cancelKeyboard);
+    const freqMap: Record<string, 'once' | 'daily' | 'weekly' | 'monthly'> = {
+      once: 'once', 'one time': 'once', 'one-time': 'once',
+      daily: 'daily', day: 'daily',
+      weekly: 'weekly', week: 'weekly',
+      monthly: 'monthly', month: 'monthly',
+    };
+    const freq = freqMap[text.trim().toLowerCase()];
+    if (!freq || !session.scheduleData) {
+      await ctx.reply(
+        '❌ Please pick a frequency from the buttons above, or type: *once*, *daily*, *weekly*, or *monthly*.',
+        { parse_mode: 'Markdown', ...cancelKeyboard }
+      );
+      return;
+    }
+
+    session.scheduleData.frequency = freq;
+    session.state = ConversationState.AWAITING_SCHEDULE_START;
+    setSession(userId, session);
+
+    await ctx.reply(
+      `📅 *Schedule Transfer*\n\n` +
+      `Frequency: *${freq}*\n\n` +
+      `When should the first transfer happen?\n` +
+      `Enter a date (YYYY-MM-DD) or type *now* to start immediately.`,
+      { parse_mode: 'Markdown', ...cancelKeyboard }
+    );
     return;
   }
 

@@ -2,7 +2,7 @@ import { Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { db, users } from '@zend/db';
 import { eq } from 'drizzle-orm';
-import { transcribeVoice, analyzeVoiceWithAI } from '../services/nlp.js';
+import { transcribeVoice, analyzeVoiceWithAI, parseCommand } from '../services/nlp.js';
 import { ConversationState, NIGERIAN_BANKS, PAJ_MIN_DEPOSIT_NGN, PAJ_MAX_DEPOSIT_NGN } from '@zend/shared';
 import { getPAJClient } from '../deps.js';
 import { mainMenu, cancelKeyboard } from '../keyboards/index.js';
@@ -55,6 +55,36 @@ export function registerVoiceHandlers({ bot: b }: HandlerContext): void {
     const analysis = await analyzeVoiceWithAI(text);
 
     if (!analysis) {
+      const cmd = parseCommand(text);
+      if (cmd.intent === 'send' || cmd.intent === 'cash_out') {
+        await finishLoading(ctx, loadingVoice.message_id, `📝 *You said:* "${text}"`, 'Markdown');
+        if (cmd.amount && cmd.accountNumber && cmd.bankCode) {
+          const bank = NIGERIAN_BANKS.find(b => b.code === cmd.bankCode);
+          if (bank) {
+            await prepareSendConfirmation(
+              ctx, userId, cmd.amount, cmd.accountNumber, bank.code, bank.name,
+              cmd.recipientName || undefined,
+            );
+            return;
+          }
+        }
+        if (cmd.amount) {
+          setSession(userId, {
+            state: ConversationState.AWAITING_SEND_RECIPIENT,
+            pendingTransaction: { amountNgn: cmd.amount, recipientName: cmd.recipientName },
+          });
+          await ctx.reply(
+            `Send ${formatNgn(cmd.amount)} — please provide recipient details:\n"Name BankCode AccountNumber"\nExample: "Tunde GTB 0123456789"`,
+            { parse_mode: 'Markdown', ...cancelKeyboard }
+          );
+          return;
+        }
+      }
+      if (cmd.intent === 'balance') {
+        await finishLoading(ctx, loadingVoice.message_id, `📝 *You said:* "${text}"`, 'Markdown');
+        await handleBalance(ctx, userId);
+        return;
+      }
       await finishLoading(ctx, loadingVoice.message_id, `📝 *You said:* "${text}"\n\nI understood you, but I need a bit more info. Can you type it out?`, 'Markdown');
       await ctx.reply('Menu:', mainMenu);
       return;
@@ -197,10 +227,13 @@ export function registerVoiceHandlers({ bot: b }: HandlerContext): void {
 
   } catch (err: any) {
     console.error('[Voice] Error:', err.message || err);
+    const hint = err.message?.includes('QVAC') || err.message?.includes('Whisper')
+      ? 'Voice AI is temporarily unavailable. Type your command instead, e.g. "Send 5000 to GTB 0123456789".'
+      : 'Could not process voice note. Please type your command or use the menu below.';
     try {
-      await finishLoading(ctx, loadingVoice.message_id, '❌ Could not process voice note. Please type your command or use the menu below.');
+      await finishLoading(ctx, loadingVoice.message_id, `❌ ${hint}`);
     } catch {
-      await ctx.reply('❌ Could not process voice note. Please type your command or use the menu below.', mainMenu);
+      await ctx.reply(`❌ ${hint}`, mainMenu);
     }
     await ctx.reply('Menu:', mainMenu);
   }

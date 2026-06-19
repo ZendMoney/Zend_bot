@@ -595,7 +595,11 @@ export interface VoiceAnalysis {
  * Analyze transcribed voice text with QVAC — returns confirmation message + extracted data
  */
 export async function analyzeVoiceWithAI(text: string): Promise<VoiceAnalysis | null> {
-  const content = await callQVAC(VOICE_CONFIRM_PROMPT, `User's voice note: "${text}"`, 0.3, 600);
+  let content = await callQVAC(VOICE_CONFIRM_PROMPT, `User's voice note: "${text}"`, 0.3, 600);
+  if (!content) {
+    console.warn('[Voice] QVAC analysis unavailable — trying Kimi fallback');
+    content = await callKimi(VOICE_CONFIRM_PROMPT, `User's voice note: "${text}"`, 0.3, 600);
+  }
   if (!content) return null;
 
   try {
@@ -736,7 +740,7 @@ export async function parseReceiptWithQVAC(imageBuffer: Buffer): Promise<ParsedR
 
   // Stage 2: LLM parses OCR text
   const prompt = `OCR text from receipt:\n${rawText}\n\nExtract payment details as JSON.`;
-  const content = await callQVACLLM({
+  let content = await callQVACLLM({
     systemPrompt: RECEIPT_PARSER_PROMPT,
     userPrompt: prompt,
     temperature: 0.1,
@@ -745,7 +749,11 @@ export async function parseReceiptWithQVAC(imageBuffer: Buffer): Promise<ParsedR
   });
 
   if (!content) {
-    // Fallback to regex parser
+    console.warn('[Receipt] QVAC LLM unavailable — trying Kimi fallback');
+    content = await callKimi(RECEIPT_PARSER_PROMPT, prompt, 0.1, 300);
+  }
+
+  if (!content) {
     return parseReceiptImage(imageBuffer).catch(() => null);
   }
 

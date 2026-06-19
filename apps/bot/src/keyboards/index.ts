@@ -1,8 +1,9 @@
 import { Markup } from 'telegraf';
 
 export const mainMenu = Markup.keyboard([
-  ['💰 Balance', '🔄 Swap'],
+  ['💰 Balance', '📤 Send', '🔄 Swap'],
   ['📥 Receive', '💳 Bills', '📋 History'],
+  ['📦 Bulk Send', '📅 Schedule'],
   ['⚙️ Settings', '📖 How to Use', '✨ Features'],
   ['📝 Feedback', '❓ Help'],
 ]).resize();

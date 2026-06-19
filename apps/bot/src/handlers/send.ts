@@ -251,6 +251,35 @@ export async function prepareSendConfirmation(
   });
 }
 
+async function startBankSend(ctx: ZendContext, userId: string) {
+  if (AUDD_ENABLED) {
+    await ctx.reply(
+      `📤 *Send to Nigerian Bank*\n\n` +
+      `Send from which balance?`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('USDT', 'send_token:USDT')],
+          [Markup.button.callback('AUDD', 'send_token:AUDD')],
+          [Markup.button.callback('❌ Cancel', 'cancel_send')],
+        ]),
+      }
+    );
+    return;
+  }
+
+  setSession(userId, {
+    state: ConversationState.AWAITING_SEND_AMOUNT,
+    pendingTransaction: { fromMint: SOLANA_TOKENS.USDT.mint },
+  });
+  await ctx.reply(
+    `📤 *Send to Nigerian Bank*\n\n` +
+    `How much do you want to send? (in Naira)\n\n` +
+    `Examples: 50000, 100000, 5000`,
+    { parse_mode: 'Markdown', ...cancelKeyboard }
+  );
+}
+
 export function registerSendHandlers({ bot: b }: HandlerContext): void {
   b.hears('📤 Send', async (ctx) => {
     const userId = ctx.from.id.toString();
@@ -266,32 +295,28 @@ export function registerSendHandlers({ bot: b }: HandlerContext): void {
       return;
     }
 
-    if (AUDD_ENABLED) {
-      await ctx.reply(
-        `📤 *Send Money*\n\n` +
-        `Send from which balance?`,
-        {
-          parse_mode: 'Markdown',
-          ...Markup.inlineKeyboard([
-            [Markup.button.callback('USDT', 'send_token:USDT')],
-            [Markup.button.callback('AUDD', 'send_token:AUDD')],
-            [Markup.button.callback('❌ Cancel', 'cancel_send')],
-          ]),
-        }
-      );
-      return;
-    }
-
-    setSession(userId, {
-      state: ConversationState.AWAITING_SEND_AMOUNT,
-      pendingTransaction: { fromMint: SOLANA_TOKENS.USDT.mint },
-    });
     await ctx.reply(
       `📤 *Send Money*\n\n` +
-      `How much do you want to send? (in Naira)\n\n` +
-      `Examples: 50000, 100000, 5000`,
-      { parse_mode: 'Markdown', ...cancelKeyboard }
+      `Where are you sending?`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('🏦 Nigerian Bank', 'send_bank_start')],
+          [Markup.button.callback('📤 Other Apps (Binance, MetaMask…)', 'withdraw_start')],
+          [Markup.button.callback('❌ Cancel', 'cancel_send')],
+        ]),
+      }
     );
+  });
+
+  b.action('send_bank_start', async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from!.id.toString();
+    if (isGroupChat(ctx)) {
+      await promptPrivateChat(ctx, 'send money');
+      return;
+    }
+    await startBankSend(ctx, userId);
   });
 
   b.action(/send_token:([A-Z]+)/, async (ctx) => {
