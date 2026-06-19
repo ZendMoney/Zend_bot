@@ -19,6 +19,11 @@ describe('formatNearIntentsError', () => {
   it('handles timeouts', () => {
     expect(formatNearIntentsError(new Error('Whisper transcription timed out after 60000ms'))).toContain('too long');
   });
+
+  it('handles varchar overflow', () => {
+    const err = new Error('PostgresError: value too long for type character varying(44)');
+    expect(formatNearIntentsError(err)).toContain('database');
+  });
 });
 
 describe('formatVoiceError', () => {

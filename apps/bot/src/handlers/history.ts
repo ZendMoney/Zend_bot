@@ -31,11 +31,21 @@ export async function buildHistoryMessage(userId: string): Promise<string | null
     const typeEmoji = tx.type === 'ngn_send' ? '📤' : tx.type === 'ngn_receive' ? '📥' : tx.type === 'swap' ? '🔄' : tx.type === 'scheduled' ? '📅' : '💱';
     const typeLabel = tx.type === 'ngn_send' ? 'Send' : tx.type === 'ngn_receive' ? 'Deposit' : tx.type === 'swap' ? 'Convert' : tx.type === 'scheduled' ? 'Scheduled' : tx.type;
 
+    const meta = tx.metadata as Record<string, string> | null;
+    const tokenLabel =
+      meta?.sourceToken ||
+      meta?.destinationSymbol ||
+      (tx.fromMint === SOLANA_TOKENS.USDT.mint ? 'USDT'
+        : tx.fromMint === SOLANA_TOKENS.USDC.mint ? 'USDC'
+        : tx.fromMint === SOLANA_TOKENS.SOL.mint ? 'SOL'
+        : meta?.nearIntents ? 'crypto' : '');
     const amountLine = tx.ngnAmount
       ? `${formatNgn(Number(tx.ngnAmount))}`
-      : tx.fromAmount && tx.fromMint
-        ? `${Number(tx.fromAmount).toFixed(2)} ${tx.fromMint === SOLANA_TOKENS.USDT.mint ? 'USDT' : tx.fromMint === SOLANA_TOKENS.USDC.mint ? 'USDC' : 'SOL'}`
-        : '';
+      : tx.fromAmount && tokenLabel
+        ? `${Number(tx.fromAmount).toFixed(2)} ${tokenLabel}`
+        : tx.fromAmount
+          ? `${Number(tx.fromAmount).toFixed(2)}`
+          : '';
 
     const date = tx.createdAt.toLocaleDateString('en-NG', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 

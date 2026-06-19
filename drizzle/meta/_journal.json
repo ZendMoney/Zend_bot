@@ -92,6 +92,13 @@
       "when": 1780998738926,
       "tag": "0012_add_near_intent_deposit_address",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1781005000000,
+      "tag": "0013_widen_mint_columns",
+      "breakpoints": true
     }
   ]
 }

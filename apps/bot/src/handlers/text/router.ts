@@ -455,6 +455,13 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
         fromAmount: amount.toString(),
         fromMint: bd.assetId,
         toMint: bd.destinationAsset,
+        metadata: {
+          nearIntents: true,
+          direction: 'deposit',
+          sourceChain: bd.sourceChain,
+          sourceToken: bd.token,
+          destinationSymbol: bd.destinationSymbol,
+        },
       });
 
       const chainDisplay = CHAIN_DISPLAY_NAMES[bd.sourceChain] || bd.sourceChain;

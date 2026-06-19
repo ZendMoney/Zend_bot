@@ -35,6 +35,10 @@ function parseNearIntentsBody(raw: string): string | null {
 export function formatNearIntentsError(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
 
+  if (/value too long for type character varying/i.test(raw)) {
+    return 'Could not save your deposit — our database needs an update. Please contact support.';
+  }
+
   if (/not configured/i.test(raw)) {
     return 'Cross-chain deposits are not set up yet. Use 📥 Receive for direct deposits.';
   }

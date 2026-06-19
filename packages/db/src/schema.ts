@@ -64,9 +64,9 @@ export const transactions = pgTable('transactions', {
   status: varchar('status', { length: 20 }).notNull(),
   
   // Crypto side
-  fromMint: varchar('from_mint', { length: 44 }),
+  fromMint: varchar('from_mint', { length: 128 }),
   fromAmount: decimal('from_amount', { precision: 30, scale: 9 }),
-  toMint: varchar('to_mint', { length: 44 }),
+  toMint: varchar('to_mint', { length: 128 }),
   toAmount: decimal('to_amount', { precision: 30, scale: 9 }),
   solanaTxHash: varchar('solana_tx_hash', { length: 88 }),
   
@@ -82,7 +82,7 @@ export const transactions = pgTable('transactions', {
   recipientBankName: varchar('recipient_bank_name', { length: 100 }),
   recipientAccountNumber: varchar('recipient_account_number', { length: 20 }),
   recipientAccountName: varchar('recipient_account_name', { length: 100 }),
-  recipientWalletAddress: varchar('recipient_wallet_address', { length: 44 }),
+  recipientWalletAddress: varchar('recipient_wallet_address', { length: 100 }),
   
   // PAJ
   pajReference: varchar('paj_reference', { length: 50 }),
