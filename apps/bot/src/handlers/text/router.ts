@@ -22,7 +22,6 @@ import {
 import { getPAJClient, walletService, airbillsClient } from '../../deps.js';
 import { getDataPlans, type DataPlan } from '../../services/bills/index.js';
 import { getDataPlansForNetwork } from '../../services/airbills/plans.js';
-import { getNearIntentsClient } from '@zend/near-intents-client';
 import { mainMenu, cancelKeyboard, REPLY_KEYBOARD_BUTTONS } from '../../keyboards/index.js';
 import { md, escapeTelegramMarkdown } from '../../lib/telegram.js';
 import { formatNgn, formatBalance } from '../../lib/format.js';
@@ -45,11 +44,9 @@ import {
   verifyBankAccount,
 } from '../../services/paj.js';
 import { generateTxId } from '../../lib/ids.js';
+import { CHAIN_DISPLAY_NAMES } from '@zend/near-intents-client';
 import {
-  CHAIN_DISPLAY_NAMES,
-  TOKEN_DECIMALS as NEAR_INTENTS_DECIMALS,
-} from '@zend/near-intents-client';
-import {
+  createDepositQuote,
   createWithdrawQuote,
   formatChainName,
   validateChainAddress,
@@ -413,19 +410,9 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       return;
     }
 
-    const amount = parseFloat(text.trim());
+    const amount = parseFloat(text.trim().replace(/,/g, ''));
     if (isNaN(amount) || amount <= 0) {
       await ctx.reply('❌ Please enter a valid amount. Example: 10, 50, 100', cancelKeyboard);
-      return;
-    }
-
-    const decimals = NEAR_INTENTS_DECIMALS[bd.sourceChain]?.[bd.token] || 6;
-    const baseAmount = Math.floor(amount * Math.pow(10, decimals)).toString();
-
-    const nearIntents = getNearIntentsClient();
-    if (!nearIntents) {
-      await ctx.reply('❌ NEAR Intents not configured.', mainMenu);
-      setSession(userId, { state: ConversationState.IDLE });
       return;
     }
 
@@ -439,11 +426,14 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
     try {
       await ctx.reply('⏳ Generating deposit address via NEAR Intents...');
 
-      const quote = await nearIntents.getQuote({
-        originAsset: bd.assetId,
+      const quote = await createDepositQuote({
+        sourceChain: bd.sourceChain,
+        sourceToken: bd.token,
+        sourceAssetId: bd.assetId,
         destinationAsset: bd.destinationAsset,
-        amount: baseAmount,
-        recipient: user[0].walletAddress,
+        destinationSymbol: bd.destinationSymbol,
+        amount,
+        recipientWallet: user[0].walletAddress,
       });
 
       const depositAddress = quote.quote.depositAddress;

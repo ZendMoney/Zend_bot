@@ -136,6 +136,8 @@ export const CHAIN_DISPLAY_NAMES: Record<string, string> = {
 };
 
 // Decimals for base-unit conversion per chain
+export { toBaseUnits } from './units.js';
+
 export const TOKEN_DECIMALS: Record<string, Record<string, number>> = {
   ethereum: { USDT: 6, USDC: 6, ETH: 18, DAI: 18, WBTC: 8 },
   base: { USDT: 6, USDC: 6, ETH: 18, WETH: 18 },
@@ -260,6 +262,36 @@ export async function getNearIntentsTokens(): Promise<NearIntentsToken[]> {
 export async function getTokensByBlockchain(blockchain: string): Promise<NearIntentsToken[]> {
   const tokens = await getNearIntentsTokens();
   return tokens.filter((t) => t.blockchain.toLowerCase() === blockchain.toLowerCase());
+}
+
+/** Resolve token decimals — static table first, then live /tokens API. */
+export async function resolveTokenDecimals(
+  chainKey: string,
+  tokenSymbol: string,
+  assetId?: string
+): Promise<number> {
+  const staticDec = TOKEN_DECIMALS[chainKey]?.[tokenSymbol];
+  if (staticDec != null) return staticDec;
+
+  try {
+    const tokens = await getNearIntentsTokens();
+    if (assetId) {
+      const byContract = tokens.find(
+        (t) => (t as { assetId?: string }).assetId === assetId
+      );
+      if (byContract?.decimals != null) return byContract.decimals;
+    }
+    const byChain = tokens.find(
+      (t) =>
+        t.blockchain?.toLowerCase() === chainKey.toLowerCase() &&
+        t.symbol?.toUpperCase() === tokenSymbol.toUpperCase()
+    );
+    if (byChain?.decimals != null) return byChain.decimals;
+  } catch (err) {
+    console.warn('[NearIntents] Could not resolve decimals from API:', err);
+  }
+
+  return 6;
 }
 
 // Singleton instance

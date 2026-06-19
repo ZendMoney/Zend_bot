@@ -9,7 +9,8 @@ import {
   getNearIntentsClient,
   NEAR_INTENTS_ASSETS,
   CHAIN_DISPLAY_NAMES,
-  TOKEN_DECIMALS,
+  toBaseUnits,
+  resolveTokenDecimals,
   type NearIntentsQuote,
 } from '@zend/near-intents-client';
 import { SOLANA_TOKENS } from '@zend/shared';
@@ -76,8 +77,19 @@ export async function createDepositQuote(params: DepositQuoteParams): Promise<Ne
   const client = getNearIntentsClient();
   if (!client) throw new Error('NEAR Intents not configured');
 
-  const decimals = TOKEN_DECIMALS[params.sourceChain]?.[params.sourceToken] || 6;
-  const baseAmount = Math.floor(params.amount * Math.pow(10, decimals)).toString();
+  const decimals = await resolveTokenDecimals(
+    params.sourceChain,
+    params.sourceToken,
+    params.sourceAssetId
+  );
+  const baseAmount = toBaseUnits(params.amount, decimals);
+  if (baseAmount === '0') {
+    throw new Error('Amount is too small for this token.');
+  }
+
+  console.log(
+    `[NearIntents] Deposit quote: ${params.amount} ${params.sourceToken} (${params.sourceChain}) → ${baseAmount} base units (${decimals} decimals)`
+  );
 
   const refundTo = process.env.NEAR_INTENTS_REFUND_ADDRESS || 'zend-refund.near';
 
@@ -111,7 +123,10 @@ export async function createWithdrawQuote(params: WithdrawQuoteParams): Promise<
   if (!originAsset) throw new Error(`Unsupported source token: ${params.sourceSymbol}`);
 
   const decimals = SOLANA_TOKENS[params.sourceSymbol].decimals;
-  const baseAmount = Math.floor(params.amount * Math.pow(10, decimals)).toString();
+  const baseAmount = toBaseUnits(params.amount, decimals);
+  if (baseAmount === '0') {
+    throw new Error('Amount is too small.');
+  }
 
   return client.getQuote({
     originAsset,
