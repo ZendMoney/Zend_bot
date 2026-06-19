@@ -163,3 +163,17 @@ export async function fundNearIntentDeposit(
 export function formatChainName(chainKey: string): string {
   return CHAIN_DISPLAY_NAMES[chainKey] || chainKey;
 }
+
+/** Shown when entering the bridge deposit flow. */
+export const NEAR_INTENTS_EXACT_AMOUNT_BRIEF =
+  '⚠️ You must send the *exact* quoted amount. Sending more or less can lock your funds in the bridge.';
+
+/** Prominent warning on the deposit-address screen. */
+export function formatExactAmountDepositWarning(amount: string, token: string, chainDisplay: string): string {
+  return (
+    `🚨 *CRITICAL — Send EXACTLY ${amount} ${token}*\n` +
+    `Send *only* on *${chainDisplay}*. Do *not* send more or less than this amount.\n\n` +
+    `Wrong amounts can lock your funds in NEAR Intents. Recovery may take time or need support.\n` +
+    `Need a different amount? Cancel and start a new quote.`
+  );
+}

@@ -3,7 +3,7 @@ import { getNearIntentsClient, NEAR_INTENTS_ASSETS, CHAIN_DISPLAY_NAMES } from '
 import { ConversationState } from '@zend/shared';
 import { mainMenu } from '../keyboards/index.js';
 import { setSession } from '../session/store.js';
-import { DEPOSIT_CHAINS, SOLANA_DEST_ASSETS } from '../services/near-intents-flow.js';
+import { DEPOSIT_CHAINS, SOLANA_DEST_ASSETS, NEAR_INTENTS_EXACT_AMOUNT_BRIEF } from '../services/near-intents-flow.js';
 import type { ZendContext } from '../session/types.js';
 import type { HandlerContext } from './types.js';
 
@@ -37,6 +37,7 @@ export async function showBridgeMenu(ctx: ZendContext, userId: string) {
   await ctx.reply(
     `🌉 *Deposit from Other Apps*\n\n` +
     `Send crypto from any wallet → receive Dollars in ZendPay via NEAR Intents.\n\n` +
+    `${NEAR_INTENTS_EXACT_AMOUNT_BRIEF}\n\n` +
     `Select the chain you're sending from:`,
     {
       parse_mode: 'Markdown',
@@ -160,6 +161,7 @@ export function registerBridgeHandlers({ bot: b }: HandlerContext): void {
     `Currency: *${token}*\n` +
     `Receive as: *${destSymbol}*\n\n` +
     `How much ${token} do you want to deposit?\n\n` +
+    `${NEAR_INTENTS_EXACT_AMOUNT_BRIEF}\n\n` +
     `Examples:\n` +
     `• 10\n` +
     `• 50\n` +

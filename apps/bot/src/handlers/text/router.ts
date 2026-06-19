@@ -48,6 +48,7 @@ import { generateTxId } from '../../lib/ids.js';
 import { CHAIN_DISPLAY_NAMES, resolveTokenDecimals } from '@zend/near-intents-client';
 import {
   createDepositQuote,
+  formatExactAmountDepositWarning,
   createWithdrawQuote,
   formatChainName,
   validateChainAddress,
@@ -439,6 +440,8 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
 
       const depositAddress = quote.quote.depositAddress;
       const amountOutFormatted = quote.quote.amountOutFormatted;
+      const exactAmount = quote.quote.amountInFormatted || amount.toString();
+      const chainDisplay = CHAIN_DISPLAY_NAMES[bd.sourceChain] || bd.sourceChain;
       const feeLine = quote.quote.withdrawFee
         ? `• Est. network fee: ~${quote.quote.withdrawFee}\n`
         : '';
@@ -464,7 +467,6 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
         },
       });
 
-      const chainDisplay = CHAIN_DISPLAY_NAMES[bd.sourceChain] || bd.sourceChain;
       await indexTransaction(userId, txId, `Deposit from ${chainDisplay} via NEAR Intents`, {
         amount,
         chain: chainDisplay,
@@ -473,14 +475,13 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
 
       await ctx.reply(
         `🌉 *Deposit ${bd.token} from ${chainDisplay}*\n\n` +
-        `Send *${amount} ${bd.token}* to this address:\n\n` +
-        `${depositAddress}\n\n` +
-        `⚠️ *Important:*\n` +
-        `• Only send ${bd.token} on ${chainDisplay}\n` +
-        `• You'll receive ~${amountOutFormatted} ${bd.destinationSymbol} in your ZendPay account\n` +
+        `${formatExactAmountDepositWarning(exactAmount, bd.token, chainDisplay)}\n\n` +
+        `📬 *Deposit address:*\n${depositAddress}\n\n` +
+        `📋 *After you send:*\n` +
+        `• You'll receive ~${amountOutFormatted} ${bd.destinationSymbol} in ZendPay\n` +
         feeLine +
-        `• Expires: ${new Date(quote.quote.deadline).toLocaleString('en-NG')}\n\n` +
-        `Reference: \`${txId}\``,
+        `• Quote expires: ${new Date(quote.quote.deadline).toLocaleString('en-NG')}\n` +
+        `• Reference: \`${txId}\``,
         { parse_mode: 'Markdown', ...mainMenu }
       );
       await ctx.reply('📋 Tap to copy the address:', Markup.inlineKeyboard([
