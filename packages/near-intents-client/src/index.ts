@@ -135,6 +135,19 @@ export const CHAIN_DISPLAY_NAMES: Record<string, string> = {
   near: 'NEAR',
 };
 
+/** Map ZendPay chain keys to 1Click API `blockchain` values from /v0/tokens */
+export const CHAIN_TO_API_BLOCKCHAIN: Record<string, string> = {
+  ethereum: 'eth',
+  base: 'base',
+  bsc: 'bsc',
+  arbitrum: 'arb',
+  optimism: 'op',
+  polygon: 'pol',
+  solana: 'sol',
+  bitcoin: 'btc',
+  near: 'near',
+};
+
 // Decimals for base-unit conversion per chain
 export { toBaseUnits } from './units.js';
 
@@ -258,10 +271,27 @@ export async function getNearIntentsTokens(): Promise<NearIntentsToken[]> {
   }
 }
 
-/** Get tokens filtered by blockchain */
-export async function getTokensByBlockchain(blockchain: string): Promise<NearIntentsToken[]> {
+/** Get tokens filtered by ZendPay chain key or raw API blockchain name */
+export async function getTokensByBlockchain(chainKey: string): Promise<NearIntentsToken[]> {
   const tokens = await getNearIntentsTokens();
-  return tokens.filter((t) => t.blockchain.toLowerCase() === blockchain.toLowerCase());
+  const apiChain =
+    CHAIN_TO_API_BLOCKCHAIN[chainKey]?.toLowerCase() || chainKey.toLowerCase();
+  return tokens.filter((t) => t.blockchain.toLowerCase() === apiChain);
+}
+
+/** Resolve assetId from live /tokens, falling back to NEAR_INTENTS_ASSETS */
+export async function resolveAssetId(chainKey: string, symbol: string): Promise<string | undefined> {
+  const staticId = NEAR_INTENTS_ASSETS[chainKey]?.[symbol];
+  if (staticId) return staticId;
+
+  try {
+    const tokens = await getTokensByBlockchain(chainKey);
+    const match = tokens.find((t) => t.symbol?.toUpperCase() === symbol.toUpperCase());
+    return match?.assetId;
+  } catch (err) {
+    console.warn('[NearIntents] Could not resolve assetId from API:', err);
+    return undefined;
+  }
 }
 
 /** Resolve token decimals — static table first, then live /tokens API. */
@@ -281,9 +311,11 @@ export async function resolveTokenDecimals(
       );
       if (byContract?.decimals != null) return byContract.decimals;
     }
+    const apiChain =
+      CHAIN_TO_API_BLOCKCHAIN[chainKey]?.toLowerCase() || chainKey.toLowerCase();
     const byChain = tokens.find(
       (t) =>
-        t.blockchain?.toLowerCase() === chainKey.toLowerCase() &&
+        t.blockchain?.toLowerCase() === apiChain &&
         t.symbol?.toUpperCase() === tokenSymbol.toUpperCase()
     );
     if (byChain?.decimals != null) return byChain.decimals;

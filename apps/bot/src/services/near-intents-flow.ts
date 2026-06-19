@@ -91,6 +91,9 @@ export async function createDepositQuote(params: DepositQuoteParams): Promise<Ne
     `[NearIntents] Deposit quote: ${params.amount} ${params.sourceToken} (${params.sourceChain}) → ${baseAmount} base units (${decimals} decimals)`
   );
 
+  // Refunds go to a NEAR Intents account (NEAR_INTENTS_REFUND_ADDRESS).
+  // ORIGIN_CHAIN requires an address on the deposit chain (e.g. 0x… for Ethereum),
+  // which would fail for our shared zend-refund.near account.
   const refundTo = process.env.NEAR_INTENTS_REFUND_ADDRESS || 'zend-refund.near';
 
   return client.getQuote({
@@ -99,7 +102,7 @@ export async function createDepositQuote(params: DepositQuoteParams): Promise<Ne
     amount: baseAmount,
     recipient: params.recipientWallet,
     refundTo,
-    refundType: 'ORIGIN_CHAIN',
+    refundType: 'INTENTS',
     depositType: 'ORIGIN_CHAIN',
     recipientType: 'DESTINATION_CHAIN',
   });
