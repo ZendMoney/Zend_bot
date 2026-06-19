@@ -45,7 +45,7 @@ import {
   verifyBankAccount,
 } from '../../services/paj.js';
 import { generateTxId } from '../../lib/ids.js';
-import { CHAIN_DISPLAY_NAMES } from '@zend/near-intents-client';
+import { CHAIN_DISPLAY_NAMES, resolveTokenDecimals } from '@zend/near-intents-client';
 import {
   createDepositQuote,
   createWithdrawQuote,
@@ -489,9 +489,13 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
     } catch (err: any) {
       console.error('[Bridge] Failed:', err);
       setSession(userId, { state: ConversationState.IDLE });
+      let decimals: number | undefined;
+      try {
+        decimals = await resolveTokenDecimals(bd.sourceChain, bd.token, bd.assetId);
+      } catch { /* use generic min-amount message */ }
       await ctx.reply(
         `❌ *Deposit Error*\n\n` +
-        `${formatNearIntentsError(err)}\n\n` +
+        `${formatNearIntentsError(err, { symbol: bd.token, decimals })}\n\n` +
         `Tap *📤 Send → Other Apps* to try again, or use *📥 Receive* for a direct deposit.`,
         { parse_mode: 'Markdown', ...mainMenu }
       );

@@ -17,3 +17,21 @@ export function toBaseUnits(humanAmount: string | number, decimals: number): str
 
   return BigInt(digits).toString();
 }
+
+/** Convert base-unit integer string back to a human-readable decimal (no scientific notation). */
+export function fromBaseUnits(baseUnits: string, decimals: number): string {
+  const raw = baseUnits.trim();
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`Invalid base units: ${baseUnits}`);
+  }
+  if (decimals === 0) return raw.replace(/^0+/, '') || '0';
+
+  const value = BigInt(raw);
+  const divisor = 10n ** BigInt(decimals);
+  const whole = value / divisor;
+  const frac = value % divisor;
+  if (frac === 0n) return whole.toString();
+
+  const fracStr = frac.toString().padStart(decimals, '0').replace(/0+$/, '');
+  return `${whole}.${fracStr}`;
+}

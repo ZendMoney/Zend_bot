@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { toBaseUnits } from '@zend/near-intents-client';
+import { toBaseUnits, fromBaseUnits } from '@zend/near-intents-client';
+import { normalizeVoiceTranscript } from './nlp.js';
+import { formatNearIntentsError } from '../utils/api-errors.js';
 
 describe('toBaseUnits', () => {
   it('converts USDT (6 decimals)', () => {
@@ -19,5 +21,30 @@ describe('toBaseUnits', () => {
 
   it('rejects invalid amounts', () => {
     expect(() => toBaseUnits('abc', 6)).toThrow();
+  });
+});
+
+describe('fromBaseUnits', () => {
+  it('converts NEAR yocto back to human', () => {
+    expect(fromBaseUnits('80654506743476286791266', 24)).toBe('0.080654506743476286791266');
+    expect(fromBaseUnits('1000000000000000000000000', 24)).toBe('1');
+  });
+});
+
+describe('normalizeVoiceTranscript', () => {
+  it('fixes "1 key" → "1k"', () => {
+    expect(normalizeVoiceTranscript('Hi, send, 1 key to 7082406410.')).toBe(
+      'Hi, send, 1k to 7082406410.'
+    );
+  });
+});
+
+describe('formatNearIntentsError min amount', () => {
+  it('shows human minimum for NEAR', () => {
+    const err = new Error(
+      'NearIntents 400: {"message":"Amount is too low for bridge, try at least 80654506743476286791266"}'
+    );
+    const msg = formatNearIntentsError(err, { symbol: 'NEAR', decimals: 24 });
+    expect(msg).toMatch(/~0\.08\d+ NEAR/);
   });
 });

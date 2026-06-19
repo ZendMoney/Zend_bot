@@ -32,7 +32,7 @@ export { translateText, detectLanguage, translateForProcessing, getLangName, typ
 // ─── Types ───
 
 export interface ParsedCommand {
-  intent: 'send' | 'add_naira' | 'cash_out' | 'balance' | 'bridge' | 'unknown';
+  intent: 'send' | 'add_naira' | 'cash_out' | 'balance' | 'bridge' | 'receive' | 'history' | 'swap' | 'settings' | 'unknown';
   amount?: number;
   currency?: 'NGN' | 'USDT' | 'SOL';
   fromToken?: 'USDT' | 'USDC' | 'SOL';
@@ -255,8 +255,20 @@ function detectIntent(text: string): ParsedCommand['intent'] {
   if (/\b(balance|how much|what.*have)\b/.test(lower)) {
     return 'balance';
   }
-  if (/\b(bridge|cross.chain|deposit from|receive from)\b/.test(lower)) {
+  if (/\b(bridge|cross.chain|deposit from|receive from|other apps)\b/.test(lower)) {
     return 'bridge';
+  }
+  if (/\b(history|transactions|statement|past payments)\b/.test(lower)) {
+    return 'history';
+  }
+  if (/\b(swap|convert|exchange)\b/.test(lower) && !/\bnaira\b/.test(lower)) {
+    return 'swap';
+  }
+  if (/\b(settings|change pin|my pin)\b/.test(lower)) {
+    return 'settings';
+  }
+  if (/\b(receive|my address|wallet address|deposit address)\b/.test(lower) && !/\b(naira|ngn)\b/.test(lower)) {
+    return 'receive';
   }
 
   return 'unknown';
@@ -394,7 +406,7 @@ function extractJsonObject(content: string): Record<string, unknown> | null {
  * Falls back to local parser if QVAC is unavailable.
  */
 export async function parseWithQVAC(text: string): Promise<ParsedCommand> {
-  const content = await callQVAC(COMMAND_PARSER_PROMPT, text, 0.1, 500, true);
+  const content = await callQVAC(COMMAND_PARSER_PROMPT, text, 0.1, 280, true);
   if (!content) {
     console.log('[NLP] QVAC LLM unavailable, falling back to local parser');
     return parseLocal(text);
@@ -593,8 +605,25 @@ export async function chatWithAI(text: string, features?: BotFeature[]): Promise
 
 // ─── Voice Transcription (QVAC Whisper) ───
 
+/** Fix common Whisper mis-hearings before command parsing. */
+export function normalizeVoiceTranscript(text: string): string {
+  return text
+    .replace(/\b(\d+)\s*keys?\b/gi, '$1k')
+    .replace(/\bone\s+keys?\b/gi, '1k')
+    .replace(/\ba\s+keys?\b/gi, '1k')
+    .replace(/\bthousand\b/gi, 'k')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export async function transcribeVoice(audioBuffer: Buffer): Promise<string> {
   return transcribeWithQVAC(audioBuffer);
+}
+
+/** Parse voice transcript: local regex first, QVAC LLM only when needed. */
+export async function parseVoiceCommand(text: string): Promise<ParsedCommand> {
+  const normalized = normalizeVoiceTranscript(text);
+  return parseCommand(normalized);
 }
 
 // ─── Voice Confirmation AI ───

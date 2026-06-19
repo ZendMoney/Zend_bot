@@ -9,6 +9,13 @@ describe('formatNearIntentsError', () => {
     expect(formatNearIntentsError(err)).toContain('support');
   });
 
+  it('shows human minimum when decimals provided', () => {
+    const err = new Error(
+      'NearIntents 400: {"message":"Amount is too low for bridge, try at least 80654506743476286791266"}'
+    );
+    expect(formatNearIntentsError(err, { symbol: 'NEAR', decimals: 24 })).toContain('NEAR');
+  });
+
   it('maps internal server errors', () => {
     const err = new Error(
       'NearIntents 400: {"message":"Internal server error","correlationId":"abc"}'

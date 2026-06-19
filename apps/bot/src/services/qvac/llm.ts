@@ -5,25 +5,13 @@
 
 import { completion, getLLMModelId } from './index.js';
 
-/** QVAC allows one completion per model — queue requests to avoid concurrency rejections. */
+/** QVAC allows one completion per model — strictly serialize requests. */
 let llmQueue: Promise<unknown> = Promise.resolve();
 
 function enqueueLLM<T>(fn: () => Promise<T>): Promise<T> {
   const run = llmQueue.then(fn, fn);
   llmQueue = run.catch(() => {});
   return run;
-}
-
-const LLM_TIMEOUT_MS = 45_000;
-
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`QVAC LLM timed out after ${ms}ms`)), ms);
-    promise.then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      (e) => { clearTimeout(timer); reject(e); }
-    );
-  });
 }
 
 export interface LLMOptions {
@@ -53,14 +41,12 @@ async function callQVACLLMUnqueued(options: LLMOptions): Promise<string | null> 
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const history = [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ];
-
       const run = completion({
         modelId,
-        history,
+        history: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
         stream: false,
         generationParams: {
           temp: temperature,
@@ -73,7 +59,9 @@ async function callQVACLLMUnqueued(options: LLMOptions): Promise<string | null> 
           : {}),
       });
 
-      const result = await withTimeout(run.final, LLM_TIMEOUT_MS);
+      // Must await the full run — abandoning via timeout leaves the model busy and
+      // causes "concurrency policy" rejections on the next request.
+      const result = await run.final;
       const text = result.contentText || result.raw?.fullText || '';
       return text.trim();
     } catch (err: any) {
@@ -81,7 +69,7 @@ async function callQVACLLMUnqueued(options: LLMOptions): Promise<string | null> 
       const busy = msg.includes('concurrency policy') || msg.includes('already running');
       console.error(`[QVAC LLM] Inference failed (attempt ${attempt}/3):`, msg);
       if (busy && attempt < 3) {
-        await new Promise((r) => setTimeout(r, 2000 * attempt));
+        await new Promise((r) => setTimeout(r, 4000 * attempt));
         continue;
       }
       return null;

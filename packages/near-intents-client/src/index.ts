@@ -149,7 +149,7 @@ export const CHAIN_TO_API_BLOCKCHAIN: Record<string, string> = {
 };
 
 // Decimals for base-unit conversion per chain
-export { toBaseUnits } from './units.js';
+export { toBaseUnits, fromBaseUnits } from './units.js';
 
 export const TOKEN_DECIMALS: Record<string, Record<string, number>> = {
   ethereum: { USDT: 6, USDC: 6, ETH: 18, DAI: 18, WBTC: 8 },

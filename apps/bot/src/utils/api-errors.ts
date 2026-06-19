@@ -1,4 +1,11 @@
+import { fromBaseUnits } from '@zend/near-intents-client';
+
 /** Turn raw API/transport errors into short, user-facing messages. */
+
+export interface NearIntentsErrorHint {
+  symbol?: string;
+  decimals?: number;
+}
 
 const NEAR_INTENTS_HINTS: Record<string, string> = {
   'refundto is not valid':
@@ -32,7 +39,7 @@ function parseNearIntentsBody(raw: string): string | null {
   }
 }
 
-export function formatNearIntentsError(err: unknown): string {
+export function formatNearIntentsError(err: unknown, hint?: NearIntentsErrorHint): string {
   const raw = err instanceof Error ? err.message : String(err);
 
   if (/value too long for type character varying/i.test(raw)) {
@@ -46,8 +53,24 @@ export function formatNearIntentsError(err: unknown): string {
   const apiMessage = parseNearIntentsBody(raw);
   if (apiMessage) {
     const lower = apiMessage.toLowerCase();
-    for (const [key, hint] of Object.entries(NEAR_INTENTS_HINTS)) {
-      if (lower.includes(key)) return hint;
+
+    const minMatch = apiMessage.match(/try at least (\d+)/i);
+    if (minMatch && hint?.decimals != null) {
+      try {
+        const minHuman = fromBaseUnits(minMatch[1], hint.decimals);
+        const minNum = Number(minHuman);
+        const display = Number.isFinite(minNum)
+          ? (minNum < 1 ? minNum.toPrecision(2) : minNum.toLocaleString(undefined, { maximumFractionDigits: 4 }))
+          : minHuman;
+        const sym = hint.symbol || 'token';
+        return `Amount is too low. Minimum deposit is ~${display} ${sym}.`;
+      } catch {
+        // fall through to generic hint
+      }
+    }
+
+    for (const [key, msg] of Object.entries(NEAR_INTENTS_HINTS)) {
+      if (lower.includes(key)) return msg;
     }
     if (apiMessage.length <= 120) return apiMessage;
     return 'Could not get a deposit quote. Please try again.';
