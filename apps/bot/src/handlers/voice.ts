@@ -16,6 +16,7 @@ import { showReceive } from './receive.js';
 import { showHistory } from './history.js';
 import { showSettings } from './settings.js';
 import { showSwapMenu } from './swap.js';
+import { formatVoiceError } from '../utils/api-errors.js';
 import type { HandlerContext } from './types.js';
 
 export function registerVoiceHandlers({ bot: b }: HandlerContext): void {
@@ -227,9 +228,7 @@ export function registerVoiceHandlers({ bot: b }: HandlerContext): void {
 
   } catch (err: any) {
     console.error('[Voice] Error:', err.message || err);
-    const hint = err.message?.includes('QVAC') || err.message?.includes('Whisper')
-      ? 'Voice AI is temporarily unavailable. Type your command instead, e.g. "Send 5000 to GTB 0123456789".'
-      : 'Could not process voice note. Please type your command or use the menu below.';
+    const hint = formatVoiceError(err);
     try {
       await finishLoading(ctx, loadingVoice.message_id, `❌ ${hint}`);
     } catch {

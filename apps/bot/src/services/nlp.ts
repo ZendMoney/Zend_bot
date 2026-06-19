@@ -357,14 +357,34 @@ export function parseLocal(text: string): ParsedCommand {
 
 // ─── QVAC Local LLM Fallback ───
 
-async function callQVAC(systemPrompt: string, userPrompt: string, temperature: number, maxTokens: number): Promise<string | null> {
+async function callQVAC(
+  systemPrompt: string,
+  userPrompt: string,
+  temperature: number,
+  maxTokens: number,
+  jsonMode = false
+): Promise<string | null> {
   return callQVACLLM({
     systemPrompt,
     userPrompt,
     temperature,
     maxTokens,
-    jsonMode: false,
+    jsonMode,
   });
+}
+
+function extractJsonObject(content: string): Record<string, unknown> | null {
+  const trimmed = content.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced?.[1]?.trim() || trimmed;
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start === -1 || end <= start) return null;
+  try {
+    return JSON.parse(candidate.slice(start, end + 1));
+  } catch {
+    return null;
+  }
 }
 
 // ─── Command Parser ───
@@ -374,7 +394,7 @@ async function callQVAC(systemPrompt: string, userPrompt: string, temperature: n
  * Falls back to local parser if QVAC is unavailable.
  */
 export async function parseWithQVAC(text: string): Promise<ParsedCommand> {
-  const content = await callQVAC(COMMAND_PARSER_PROMPT, text, 0.1, 500);
+  const content = await callQVAC(COMMAND_PARSER_PROMPT, text, 0.1, 500, true);
   if (!content) {
     console.log('[NLP] QVAC LLM unavailable, falling back to local parser');
     return parseLocal(text);
@@ -462,7 +482,7 @@ export interface MenuParseResult {
 }
 
 export async function parseMenuInputWithAI(text: string): Promise<MenuParseResult | null> {
-  const content = await callQVAC(MENU_PARSE_PROMPT, text, 0.1, 600);
+  const content = await callQVAC(MENU_PARSE_PROMPT, text, 0.1, 600, true);
   if (!content) return null;
 
   try {
@@ -595,31 +615,44 @@ export interface VoiceAnalysis {
  * Analyze transcribed voice text with QVAC — returns confirmation message + extracted data
  */
 export async function analyzeVoiceWithAI(text: string): Promise<VoiceAnalysis | null> {
-  let content = await callQVAC(VOICE_CONFIRM_PROMPT, `User's voice note: "${text}"`, 0.3, 600);
+  const userPrompt = `Transcribed voice note:\n"${text}"`;
+  let content = await callQVACLLM({
+    systemPrompt: VOICE_CONFIRM_PROMPT,
+    userPrompt,
+    temperature: 0.1,
+    maxTokens: 700,
+    jsonMode: true,
+  });
+
   if (!content) {
-    console.warn('[Voice] QVAC analysis unavailable — trying Kimi fallback');
-    content = await callKimi(VOICE_CONFIRM_PROMPT, `User's voice note: "${text}"`, 0.3, 600);
+    console.warn('[Voice] QVAC analysis unavailable — retrying once');
+    content = await callQVACLLM({
+      systemPrompt: VOICE_CONFIRM_PROMPT,
+      userPrompt,
+      temperature: 0.1,
+      maxTokens: 700,
+      jsonMode: true,
+    });
   }
   if (!content) return null;
 
-  try {
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
-    return {
-      intent: parsed.intent || 'chat',
-      amount: parsed.amount ? Number(parsed.amount) : null,
-      recipientName: parsed.recipientName || null,
-      bankName: parsed.bankName || null,
-      bankCode: parsed.bankCode || null,
-      accountNumber: sanitizeAccountNumber(parsed.accountNumber),
-      walletAddress: parsed.walletAddress || null,
-      message: parsed.message || 'I heard you, but I\'m not sure what you want to do.',
-      needsConfirm: parsed.needsConfirm || false,
-    };
-  } catch (err) {
-    console.error('[Voice] QVAC analysis parse failed:', err);
+  const parsed = extractJsonObject(content);
+  if (!parsed) {
+    console.error('[Voice] QVAC analysis parse failed — no JSON in response:', content.slice(0, 200));
     return null;
   }
+
+  return {
+    intent: String(parsed.intent || 'chat'),
+    amount: parsed.amount != null ? Number(parsed.amount) : null,
+    recipientName: (parsed.recipientName as string) || null,
+    bankName: (parsed.bankName as string) || null,
+    bankCode: (parsed.bankCode as string) || null,
+    accountNumber: sanitizeAccountNumber(parsed.accountNumber as string | undefined),
+    walletAddress: (parsed.walletAddress as string) || null,
+    message: (parsed.message as string) || 'I heard you, but I\'m not sure what you want to do.',
+    needsConfirm: Boolean(parsed.needsConfirm),
+  };
 }
 
 

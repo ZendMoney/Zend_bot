@@ -33,6 +33,7 @@ import { sanitizeAccountNumber } from '../../lib/account.js';
 import { hashPin, verifyPin } from '../../lib/pin.js';
 import { getSession, setSession } from '../../session/store.js';
 import { checkSendBalance } from '../../utils/send-balance.js';
+import { formatNearIntentsError } from '../../utils/api-errors.js';
 import {
   formatSendFeeLabel,
   MIN_SOL_FOR_GAS,
@@ -483,9 +484,8 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       setSession(userId, { state: ConversationState.IDLE });
       await ctx.reply(
         `❌ *Deposit Error*\n\n` +
-        `Could not generate deposit address.\n` +
-        `Error: ${err.message || 'Unknown error'}\n\n` +
-        `Please try again later or contact support.`,
+        `${formatNearIntentsError(err)}\n\n` +
+        `Tap *📤 Send → Other Apps* to try again, or use *📥 Receive* for a direct deposit.`,
         { parse_mode: 'Markdown', ...mainMenu }
       );
     }
@@ -624,8 +624,8 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       console.error('[Withdraw] Quote failed:', err);
       setSession(userId, { state: ConversationState.IDLE });
       await ctx.reply(
-        `❌ Could not get withdrawal quote.\n${err.message || 'Try again later.'}`,
-        mainMenu
+        `❌ *Withdrawal Error*\n\n${formatNearIntentsError(err)}`,
+        { parse_mode: 'Markdown', ...mainMenu }
       );
     }
     return;

@@ -5,7 +5,7 @@
 
 const ONECLICK_API_URL = process.env.NEAR_INTENTS_API_URL || 'https://1click.chaindefuser.com/v0';
 const ONECLICK_JWT = process.env.NEAR_INTENTS_JWT;
-const NEAR_INTENTS_REFUND_ADDRESS = process.env.NEAR_INTENTS_REFUND_ADDRESS || 'zend-refund.near';
+const NEAR_INTENTS_REFUND_ADDRESS = process.env.NEAR_INTENTS_REFUND_ADDRESS || 'zendpay_refund.near';
 
 export interface NearIntentsToken {
   assetId: string;

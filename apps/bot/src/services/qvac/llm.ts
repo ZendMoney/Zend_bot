@@ -51,7 +51,7 @@ async function callQVACLLMUnqueued(options: LLMOptions): Promise<string | null> 
 
   const { systemPrompt, userPrompt, temperature = 0.7, maxTokens = 500, jsonMode = false } = options;
 
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const history = [
         { role: 'system', content: systemPrompt },
@@ -79,9 +79,9 @@ async function callQVACLLMUnqueued(options: LLMOptions): Promise<string | null> 
     } catch (err: any) {
       const msg = err?.message || String(err);
       const busy = msg.includes('concurrency policy') || msg.includes('already running');
-      console.error(`[QVAC LLM] Inference failed (attempt ${attempt}/2):`, msg);
-      if (busy && attempt < 2) {
-        await new Promise((r) => setTimeout(r, 1500));
+      console.error(`[QVAC LLM] Inference failed (attempt ${attempt}/3):`, msg);
+      if (busy && attempt < 3) {
+        await new Promise((r) => setTimeout(r, 2000 * attempt));
         continue;
       }
       return null;

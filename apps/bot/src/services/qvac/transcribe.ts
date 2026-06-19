@@ -68,9 +68,11 @@ export async function transcribeWithQVAC(audioBuffer: Buffer): Promise<string> {
       transcribe({
         modelId,
         audioChunk: wavPath,
-        prompt: 'This is a Nigerian Pidgin English voice message about money transfer or banking.',
+        prompt:
+          'Nigerian English or Pidgin. Banking and money transfer: send, balance, add naira, GTB, UBA, account number.',
+        language: 'en',
       }),
-      30000,
+      60_000,
       'Whisper transcription'
     );
     const text = typeof textResult === 'string' ? textResult : textResult.text;
