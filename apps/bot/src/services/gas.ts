@@ -7,9 +7,50 @@ import {
   calculateSendFee as calcSendFee,
   MIN_SOL_FOR_GAS,
   calcRequiredSol,
+  calcZendFeeUsdt,
+  ZEND_FEE_NORMAL_BPS,
+  ZEND_FEE_NORMAL_CAP_USDT,
   type SendFeeInfo,
 } from '../utils/fees.js';
 import { getSolPriceInUsdt } from '../utils/sol-price.js';
+import { SOLANA_TOKENS } from '@zend/shared';
+
+export interface CountNeededAtasOptions {
+  recipientAddress?: string;
+  feeWalletAddress?: string;
+  /** When PAJ deposit address isn't known yet, assume one recipient ATA may be created */
+  assumeRecipientAta?: boolean;
+}
+
+/** Mirror fundSolIfNeeded ATA logic so fee quotes match execution. */
+export async function countNeededAtas(
+  mintAddress: string,
+  options: CountNeededAtasOptions = {}
+): Promise<number> {
+  let needsAtaCount = 0;
+
+  if (options.recipientAddress) {
+    try {
+      const exists = await walletService.ataExists(options.recipientAddress, mintAddress);
+      if (!exists) needsAtaCount++;
+    } catch {
+      needsAtaCount++;
+    }
+  } else if (options.assumeRecipientAta !== false) {
+    needsAtaCount++;
+  }
+
+  if (options.feeWalletAddress) {
+    try {
+      const exists = await walletService.ataExists(options.feeWalletAddress, mintAddress);
+      if (!exists) needsAtaCount++;
+    } catch {
+      needsAtaCount++;
+    }
+  }
+
+  return needsAtaCount;
+}
 
 const DEV_WALLET_LOW_BALANCE_THRESHOLD = 0.05;
 const DEV_WALLET_CRITICAL_THRESHOLD = 0.01;
@@ -28,12 +69,18 @@ export async function isNewUser(userId: string): Promise<boolean> {
 export async function calculateSendFee(
   transferUsdt: number,
   userWalletAddress: string,
-  userId?: string
+  userId?: string,
+  options?: CountNeededAtasOptions
 ): Promise<SendFeeInfo> {
   const newUser = userId ? await isNewUser(userId) : false;
+  const needsAtaCount = await countNeededAtas(SOLANA_TOKENS.USDT.mint, {
+    recipientAddress: options?.recipientAddress,
+    feeWalletAddress: process.env.ZEND_FEE_WALLET?.trim() || undefined,
+    assumeRecipientAta: options?.assumeRecipientAta,
+  });
   return calcSendFee(transferUsdt, userWalletAddress, walletService, newUser, {
     getSolPriceInUsdt,
-    needsAtaCount: process.env.ZEND_FEE_WALLET?.trim() ? 2 : 1,
+    needsAtaCount,
   });
 }
 

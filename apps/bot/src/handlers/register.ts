@@ -3,6 +3,7 @@ import { registerBalanceHandlers } from './balance.js';
 import { registerStartHandlers } from './start.js';
 import { registerMyrefHandlers } from './myref.js';
 import { registerAdminPanelHandlers } from './admin/panel.js';
+import { registerAdminPushHandlers } from './admin/push.js';
 import { registerWalletHandlers } from './wallet.js';
 import { registerVoiceHandlers } from './voice.js';
 import { registerPhotoHandlers } from './photo.js';
@@ -27,6 +28,7 @@ export function registerPreTextHandlers(ctx: HandlerContext): void {
   registerStartHandlers(ctx);
   registerMyrefHandlers(ctx);
   registerAdminPanelHandlers(ctx);
+  registerAdminPushHandlers(ctx);
 }
 
 /** Text state machine — must run after pre-text hears, before post-text hears. */

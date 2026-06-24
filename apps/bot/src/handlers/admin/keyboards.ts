@@ -6,6 +6,7 @@ export const adminMainKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback('🚨 Suspensions', 'admin_page:suspensions'), Markup.button.callback('💰 Fees & Revenue', 'admin_page:fees')],
   [Markup.button.callback('🎯 Ref Links', 'admin_page:ambassador_refs'), Markup.button.callback('🔍 Search', 'admin_page:search')],
   [Markup.button.callback('⚙️ Features', 'admin_page:features'), Markup.button.callback('📝 Feedback', 'admin_page:feedback')],
+  [Markup.button.callback('📢 Push Notifications', 'admin_page:push')],
 ]);
 
 export const adminSearchKeyboard = Markup.inlineKeyboard([

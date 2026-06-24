@@ -41,10 +41,12 @@ export async function executeSend(
   }
 ) {
   const fromToken = Object.values(SOLANA_TOKENS).find(t => t.mint === (txData.fromMint || SOLANA_TOKENS.USDT.mint)) || SOLANA_TOKENS.USDT;
+  let displayFeeUsdt = txData.zendFeeUsdt || 0;
+
   const processingText =
     `⏳ *Processing...*\n\n` +
     `Sending ${txData.amountUsdt.toFixed(2)} ${fromToken.symbol}\n` +
-    `Fee: ~${(txData.zendFeeUsdt || 0).toFixed(2)} USDT\n` +
+    `Fee: ~${displayFeeUsdt.toFixed(2)} USDT\n` +
     `Estimated: 1-5 minutes`;
 
   if (ctx.callbackQuery) {
@@ -55,6 +57,8 @@ export async function executeSend(
 
   setSession(userId, { state: ConversationState.IDLE });
   const result = await executeSendCore(userId, txData);
+
+  displayFeeUsdt = result.finalFeeUsdt ?? txData.zendFeeUsdt ?? 0;
 
   if (result.success) {
     const { txId, solanaTxHash, offRampRef } = result;
@@ -67,6 +71,7 @@ export async function executeSend(
         `✅ *Transfer Complete!*\n\n` +
         `${formatNgn(txData.amountNgn)} sent to ${finalName}\n` +
         `${finalBank} • \`${finalAccount}\`\n\n` +
+        `Fee: ~${displayFeeUsdt.toFixed(2)} USDT\n` +
         `Reference: \`${txId}\`\n` +
         (solanaTxHash ? `View: [Transaction Details](https://solscan.io/tx/${solanaTxHash})\n` : '') +
         `Time: ~2 minutes`,

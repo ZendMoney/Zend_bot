@@ -16,6 +16,7 @@ import {
   purchaseElectricity as airbillsBuyElectricity,
   purchaseCable as airbillsBuyCable,
 } from '../services/airbills/index.js';
+import { getCablePackagesForProvider } from '../services/airbills/plans.js';
 import type { HandlerContext } from './types.js';
 
 export function registerBillsHandlers({ bot: b }: HandlerContext): void {
@@ -101,6 +102,19 @@ b.action(/^bill_data_(.+)$/, async (ctx) => {
   await ctx.reply('Enter recipient phone number:', cancelKeyboard);
 });
 
+// ─── Meter Type Selected ───
+b.action(/^bill_meter_type:(prepaid|postpaid)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const meterType = ctx.match![1] as 'prepaid' | 'postpaid';
+  const session = getSession(userId);
+  session.billData = { ...session.billData, meterType };
+  session.state = ConversationState.BILL_ENTER_AMOUNT;
+  setSession(userId, session);
+  await ctx.editMessageText(`⚡ ${meterType === 'prepaid' ? 'Prepaid' : 'Postpaid'} selected.\n\nEnter amount in Naira (min ₦2,000):`);
+  await ctx.reply('Enter amount:', cancelKeyboard);
+});
+
 // ─── Data Plan Selected ───
 b.action(/^bill_plan_(.+)_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
@@ -149,10 +163,60 @@ b.action(/^bill_cable_(.+)$/, async (ctx) => {
   const userId = ctx.from!.id.toString();
   const provider = ctx.match![1];
   const session = getSession(userId);
+
+  if (airbillsClient) {
+    const loading = await showLoading(ctx, 'Fetching packages...');
+    try {
+      const packages = await getCablePackagesForProvider(airbillsClient, provider);
+      if (packages.length === 0) {
+        await finishLoading(ctx, loading.message_id, '❌ No packages found for this provider.');
+        setSession(userId, { state: ConversationState.IDLE });
+        await ctx.reply('Menu:', mainMenu);
+        return;
+      }
+      session.billData = { ...session.billData, type: 'cable', provider };
+      session.state = ConversationState.BILL_SELECT_BOUQUET;
+      setSession(userId, session);
+      await finishLoading(ctx, loading.message_id, `📺 Select a ${provider.toUpperCase()} package:`);
+      await ctx.reply(
+        'Choose a package:',
+        Markup.inlineKeyboard(
+          packages.map((p) => [
+            Markup.button.callback(
+              `${p.description} — ₦${p.prodAmount.toLocaleString()}`,
+              `bill_bouquet_${p.prodId}_${p.prodAmount}`
+            ),
+          ])
+        )
+      );
+    } catch (err: any) {
+      console.error('[Bills] Cable packages failed:', err.message);
+      await finishLoading(ctx, loading.message_id, '❌ Could not fetch packages. Please try again.');
+      setSession(userId, { state: ConversationState.IDLE });
+      await ctx.reply('Menu:', mainMenu);
+    }
+    return;
+  }
+
+  // VTpass fallback — keep existing manual amount flow
   session.billData = { ...session.billData, type: 'cable', provider };
   session.state = ConversationState.BILL_ENTER_SMARTCARD;
   setSession(userId, session);
   await ctx.editMessageText(`📺 ${provider.toUpperCase()}\n\nEnter your smart card number:`);
+  await ctx.reply('Enter smart card number:', cancelKeyboard);
+});
+
+// ─── Cable Package Selected ───
+b.action(/^bill_bouquet_(.+)_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from!.id.toString();
+  const bouquetCode = ctx.match![1];
+  const bouquetAmount = parseInt(ctx.match![2], 10);
+  const session = getSession(userId);
+  session.billData = { ...session.billData, bouquetCode, bouquetAmount, amount: bouquetAmount };
+  session.state = ConversationState.BILL_ENTER_SMARTCARD;
+  setSession(userId, session);
+  await ctx.editMessageText(`📺 ${session.billData?.provider?.toUpperCase()}\n\nPackage selected. Enter your smart card number:`);
   await ctx.reply('Enter smart card number:', cancelKeyboard);
 });
 
@@ -184,9 +248,9 @@ b.action('bill_confirm', async (ctx) => {
           airbillsClient, userId, bill.phone, bill.planAmount, bill.network, bill.planId || bill.planCode
         );
       } else if (bill.type === 'electricity' && bill.meterNumber && bill.amount && bill.disco) {
-        result = await airbillsBuyElectricity(airbillsClient, userId, bill.meterNumber, bill.amount, bill.disco);
+        result = await airbillsBuyElectricity(airbillsClient, userId, bill.meterNumber, bill.amount, bill.disco, bill.meterType || 'prepaid');
       } else if (bill.type === 'cable' && bill.smartCardNumber && bill.amount && bill.provider) {
-        result = await airbillsBuyCable(airbillsClient, userId, bill.smartCardNumber, bill.amount, bill.provider);
+        result = await airbillsBuyCable(airbillsClient, userId, bill.smartCardNumber, bill.amount, bill.provider, bill.bouquetCode);
       } else {
         throw new Error('Invalid bill data');
       }

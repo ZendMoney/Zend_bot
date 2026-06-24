@@ -269,3 +269,16 @@ export const feedback = pgTable('feedback', {
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   resolvedAt: timestamp('resolved_at', { withTimezone: true }),
 });
+
+// ─── Admin Push Notifications ───
+
+export const pushNotifications = pgTable('push_notifications', {
+  id: serial('id').primaryKey(),
+  adminId: varchar('admin_id', { length: 50 }).notNull().references((): any => users.id),
+  message: text('message').notNull(),
+  segment: varchar('segment', { length: 50 }).notNull().default('all'), // all | new_users | old_users | active | inactive | tier_1 | tier_2 | tier_3 | language_en | ...
+  status: varchar('status', { length: 20 }).notNull().default('pending'), // pending | sending | sent | failed
+  recipientCount: integer('recipient_count').default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  sentAt: timestamp('sent_at', { withTimezone: true }),
+});

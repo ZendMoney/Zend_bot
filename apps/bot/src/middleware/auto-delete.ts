@@ -68,18 +68,32 @@ export function autoDeleteMiddleware(
 
     const originalReply = ctx.reply.bind(ctx);
     ctx.reply = async function (text: any, extra?: any) {
+      const sensitive = extra?.__sensitive === true;
+      if (sensitive && extra && typeof extra === 'object') {
+        const { __sensitive, ...cleanExtra } = extra;
+        extra = cleanExtra;
+      }
       const msg = await originalReply(text, extra);
       if (isPrivateChat(ctx) && msg && typeof msg === 'object' && 'message_id' in msg && ctx.chat) {
-        trackMessage(ctx.chat.id, msg.message_id, resolveShortTtl());
+        if (resolveShortTtl() || sensitive) {
+          trackMessage(ctx.chat.id, msg.message_id, true);
+        }
       }
       return msg;
     };
 
     const originalEdit = ctx.editMessageText.bind(ctx);
     ctx.editMessageText = async function (text: any, extra?: any) {
+      const sensitive = extra?.__sensitive === true;
+      if (sensitive && extra && typeof extra === 'object') {
+        const { __sensitive, ...cleanExtra } = extra;
+        extra = cleanExtra;
+      }
       const result = await originalEdit(text, extra);
       if (isPrivateChat(ctx) && result && typeof result === 'object' && 'message_id' in result && ctx.chat) {
-        trackMessage(ctx.chat.id, result.message_id, resolveShortTtl());
+        if (resolveShortTtl() || sensitive) {
+          trackMessage(ctx.chat.id, result.message_id, true);
+        }
       }
       return result;
     };
@@ -95,7 +109,12 @@ export function registerUserMessageTracking(
 ) {
   const track = async (ctx: ZendContext, next: () => Promise<void>) => {
     const userId = ctx.from?.id?.toString();
-    if (userId) trackUserMessage(ctx, getState(userId));
+    if (userId) {
+      const state = getState(userId);
+      if (usesShortTtl(state)) {
+        trackUserMessage(ctx, state);
+      }
+    }
     await next();
   };
   bot.on(message('text'), track);

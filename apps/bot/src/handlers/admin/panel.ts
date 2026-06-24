@@ -1,11 +1,12 @@
 import { Markup } from 'telegraf';
-import { db, users, transactions, ambassadorApplications, deviceSuspensionRequests, botFeatures, feedback } from '@zend/db';
+import { db, users, transactions, ambassadorApplications, deviceSuspensionRequests, botFeatures, feedback, billPayments } from '@zend/db';
 import { eq, sql, and, desc } from 'drizzle-orm';
 import { ConversationState } from '@zend/shared';
 import { escapeTelegramMarkdown } from '../../lib/telegram.js';
 import { setSession } from '../../session/store.js';
 import { invalidateBotFeaturesCache } from '../../services/bot-features.js';
 import { adminMainKeyboard } from './keyboards.js';
+import { ZEND_FEE_NORMAL_BPS, ZEND_FEE_FUNDED_BPS } from '../../utils/fees.js';
 import { buildTxnDetailText, buildUserDetailText } from './detail.js';
 import { checkAdmin } from './auth.js';
 import { registerAdminSearchHandlers } from './search.js';

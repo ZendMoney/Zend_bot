@@ -26,6 +26,8 @@ export interface ZendSession {
     swapMinOut?: number;
     swapPriceImpact?: number;
     isLocalSwap?: boolean;
+    pushMessage?: string;
+    pushSegment?: string;
   }>;
   pinVerifyAction?: 'swap' | 'export' | 'withdraw' | 'send' | 'bulk_send' | 'schedule';
   withdrawData?: {
@@ -84,6 +86,7 @@ export interface ZendSession {
     bouquetCode?: string;
     bouquetAmount?: number;
     amount?: number;
+    customerName?: string;
   };
   lastBotMessageId?: number;
 }

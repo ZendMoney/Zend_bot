@@ -1,6 +1,7 @@
 /**
  * AirBills Payment Service
- * Integrates AirBills (Solana-native Nigerian bill payments) into ZendPay.
+ * Integrates AirBills business gateway (Solana-native Nigerian bill payments) into ZendPay.
+ * Docs: https://developer.airbills.org
  */
 
 import { Keypair } from '@solana/web3.js';
@@ -10,48 +11,124 @@ import { eq } from 'drizzle-orm';
 import { WalletService } from '@zend/solana';
 import { SOLANA_TOKENS } from '@zend/shared';
 import type { BillPaymentResult } from '../bills/types.js';
-import { AirbillsClient } from '@zend/airbills-client';
+import {
+  AirbillsClient,
+  type AirbillsCablePackage,
+  type AirbillsElectProvider,
+} from '@zend/airbills-client';
 import { decryptPrivateKey } from '../../utils/wallet.js';
-import { MIN_SOL_FOR_GAS } from '../../utils/fees.js';
+import { fundSolIfNeeded, gasFundingErrorToUserMessage } from '../gas.js';
 
 const SOLANA_RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_KEY || '';
 const walletService = new WalletService(SOLANA_RPC);
 
 function generateReference(): string {
   return `ZND-AB-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 }
 
-async function ensureGasForPayment(walletAddress: string): Promise<void> {
-  const hasGas = await walletService.hasEnoughSolForGas(walletAddress, MIN_SOL_FOR_GAS);
-  if (hasGas) return;
-  if (!DEV_WALLET_SECRET) {
+function networkCodeToId(network: string): string | undefined {
+  const map: Record<string, string> = {
+    mtn: '01',
+    glo: '02',
+    etisalat: '03',
+    airtel: '04',
+  };
+  return map[network.toLowerCase()];
+}
+
+async function ensureGasForPayment(
+  walletAddress: string,
+  paymentAddress: string,
+  userId: string
+): Promise<void> {
+  const funding = await fundSolIfNeeded(
+    walletAddress,
+    paymentAddress,
+    SOLANA_TOKENS.USDT.mint,
+    undefined,
+    userId
+  );
+  if (!funding.error) return;
+  if (funding.error.includes('Dev wallet not configured')) {
     throw new Error('Insufficient SOL for gas. Add a small amount of SOL to your wallet or contact support.');
   }
-  const devKeypair = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET));
-  const devBalance = await walletService.getSolBalance(devKeypair.publicKey.toBase58());
-  if (devBalance < MIN_SOL_FOR_GAS * 2) {
-    throw new Error('Gas station is temporarily unavailable. Please try again shortly.');
+  throw new Error(gasFundingErrorToUserMessage(funding.error, funding.shortfall));
+}
+
+async function findElectId(client: AirbillsClient, provider: string): Promise<string | undefined> {
+  // Common hardcoded fallback mapping
+  const fallback: Record<string, string> = {
+    'ikeja-electric': 'IKEDC',
+    'eko-electric': 'EKEDC',
+    'abuja-electric': 'AEDC',
+    'ibadan-electric': 'IBEDC',
+    'enugu-electric': 'EEDC',
+    'portharcourt-electric': 'PHEDC',
+    'kano-electric': 'KEDCO',
+    'kaduna-electric': 'KAEDCO',
+    'jos-electric': 'JEDC',
+    'benin-electric': 'BEDC',
+    'yola-electric': 'YEDC',
+  };
+  const normalized = provider.toLowerCase();
+  if (fallback[normalized]) return fallback[normalized];
+
+  try {
+    const providers = await client.listElectricity();
+    const match = providers.find(
+      (p) =>
+        p.electId.toLowerCase() === normalized ||
+        p.name.toLowerCase().includes(normalized.replace(/-/g, ' ')) ||
+        normalized.includes(p.name.toLowerCase().split(' ')[0])
+    );
+    return match?.electId;
+  } catch {
+    return fallback[normalized];
   }
-  await walletService.sendSol(devKeypair, walletAddress, MIN_SOL_FOR_GAS);
-  console.log('[AirBills] Funded SOL for gas:', walletAddress);
+}
+
+async function findCablePackage(
+  client: AirbillsClient,
+  provider: string,
+  amountNgn?: number
+): Promise<AirbillsCablePackage | undefined> {
+  try {
+    const packages = await client.listCable();
+    const normalized = provider.toLowerCase();
+    const byProvider = packages.filter(
+      (p) => p.provider.toLowerCase() === normalized || normalized.includes(p.provider.toLowerCase())
+    );
+    if (byProvider.length === 0) return undefined;
+    if (amountNgn) {
+      const exact = byProvider.find((p) => p.prodAmount === amountNgn);
+      if (exact) return exact;
+    }
+    return byProvider[0];
+  } catch {
+    return undefined;
+  }
 }
 
 interface AirbillsPaymentOptions {
   userId: string;
-  service: string;
-  recipient: string;
+  productCode: string;
   amountNgn: number;
-  network?: string;
-  provider?: string;
-  planId?: string;
+  data: {
+    phoneNumber?: string;
+    networkId?: string;
+    prodId?: string;
+    meterNo?: string;
+    electId?: string;
+    smartCardNo?: string;
+    customerId?: string;
+  };
 }
 
 async function executeAirbillsPayment(
   client: AirbillsClient,
   opts: AirbillsPaymentOptions
 ): Promise<BillPaymentResult> {
-  const { userId, service, recipient, amountNgn, network, provider, planId } = opts;
+  const { userId, productCode, amountNgn, data } = opts;
 
   const userRows = await db.select().from(users).where(eq(users.id, userId)).limit(1);
   if (!userRows.length || !userRows[0].walletEncryptedKey) {
@@ -59,44 +136,45 @@ async function executeAirbillsPayment(
   }
   const user = userRows[0];
 
-  let order;
+  let transaction;
   try {
     const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || '';
-    const webhookUrl = webhookBaseUrl ? `${webhookBaseUrl.replace(/\/$/, '')}/webhooks/airbills` : undefined;
+    const callbackUrl = webhookBaseUrl ? `${webhookBaseUrl.replace(/\/$/, '')}/webhooks/airbills` : undefined;
 
-    order = await client.createOrder({
-      service,
-      recipient,
-      amount: amountNgn,
-      currency: 'NGN',
-      email: user.email || undefined,
-      webhookUrl,
-      network,
-      provider,
-      planId,
-      metadata: { network, provider, source: 'zend-bot' },
+    transaction = await client.createTransaction({
+      productCode,
+      payWith: 'transfer',
+      callbackUrl,
+      data: {
+        ...data,
+        pubKey: user.walletAddress,
+        token: 'USDT',
+        amount: amountNgn,
+      },
     });
   } catch (err: any) {
-    console.error('[AirBills] createOrder failed:', err);
-    const msg = err.message?.includes('Forbidden')
-      ? 'AirBills API key is invalid or expired. Contact support.'
-      : (err.message || 'Could not create order');
+    console.error('[AirBills] createTransaction failed:', err);
+    const msg = err.message?.includes('status 03')
+      ? 'AirBills API key is invalid or missing. Contact support.'
+      : err.message?.includes('status 04')
+      ? 'AirBills request is invalid. Please check the details and try again.'
+      : (err.message || 'Could not create AirBills transaction');
     return { success: false, reference: '', message: msg };
   }
 
   const ref = generateReference();
 
   const usdtBalance = await walletService.getTokenBalance(user.walletAddress, SOLANA_TOKENS.USDT.mint);
-  if (usdtBalance < order.amountCrypto) {
+  if (usdtBalance < transaction.amountInToken) {
     return {
       success: false,
       reference: ref,
-      message: `Insufficient USDT. You have ${usdtBalance.toFixed(2)} USDT but need ${order.amountCrypto.toFixed(4)} USDT.`,
+      message: `Insufficient USDT. You have ${usdtBalance.toFixed(2)} USDT but need ${transaction.amountInToken.toFixed(4)} USDT.`,
     };
   }
 
   try {
-    await ensureGasForPayment(user.walletAddress);
+    await ensureGasForPayment(user.walletAddress, transaction.wallet!, userId);
   } catch (gasErr: any) {
     return { success: false, reference: ref, message: gasErr.message };
   }
@@ -108,12 +186,12 @@ async function executeAirbillsPayment(
 
     solanaTxHash = await walletService.sendSplToken(
       keypair,
-      order.paymentAddress,
+      transaction.wallet!,
       SOLANA_TOKENS.USDT.mint,
-      order.amountCrypto,
+      transaction.amountInToken,
       SOLANA_TOKENS.USDT.decimals
     );
-    console.log('[AirBills] USDT sent:', solanaTxHash, 'to', order.paymentAddress);
+    console.log('[AirBills] USDT sent:', solanaTxHash, 'to', transaction.wallet);
   } catch (err: any) {
     console.error('[AirBills] Payment transfer failed:', err);
     return { success: false, reference: ref, message: `Payment failed: ${err.message || 'Could not send USDT'}` };
@@ -121,68 +199,79 @@ async function executeAirbillsPayment(
 
   await db.insert(billPayments).values({
     userId,
-    type: service as any,
-    provider: network || provider || 'airbills',
-    recipient,
+    type: productCodeToType(productCode),
+    provider: data.networkId || data.electId || data.prodId || 'airbills',
+    recipient: data.phoneNumber || data.meterNo || data.smartCardNo || '',
     amountNgn: String(amountNgn),
-    amountUsdt: String(order.amountCrypto),
+    amountUsdt: String(transaction.amountInToken),
     status: 'pending',
     reference: ref,
-    externalReference: order.id,
-    metadata: { order, solanaTxHash, network, provider },
+    externalReference: transaction.id,
+    metadata: { transaction, solanaTxHash, ...data },
   });
 
-  let finalOrder = order;
-  let attempts = 0;
-  const maxAttempts = 30;
+  // Notify AirBills to fulfill the bill
+  try {
+    const processResult = await client.processTransaction({ productCode, id: transaction.id });
+    if (processResult.status === '00' || processResult.status === '06') {
+      const rawData = processResult.data || {};
+      await db.update(billPayments)
+        .set({ status: 'success', token: rawData.token, completedAt: new Date() })
+        .where(eq(billPayments.externalReference, transaction.id));
 
-  while (attempts < maxAttempts) {
-    attempts++;
-    await new Promise((r) => setTimeout(r, 3000));
-
-    try {
-      finalOrder = await client.getOrder(order.id);
-      console.log(`[AirBills] Poll ${attempts}: order ${order.id} status = ${finalOrder.status}`);
-
-      if (finalOrder.status === 'completed') {
-        await db.update(billPayments)
-          .set({ status: 'success', token: finalOrder.token, completedAt: new Date() })
-          .where(eq(billPayments.externalReference, order.id));
-
-        return {
-          success: true,
-          reference: ref,
-          externalReference: order.id,
-          message: `₦${amountNgn.toLocaleString()} ${service} paid to ${recipient}`,
-          token: finalOrder.token,
-          raw: finalOrder,
-        };
-      }
-
-      if (finalOrder.status === 'failed') {
-        await db.update(billPayments)
-          .set({ status: 'failed', metadata: finalOrder })
-          .where(eq(billPayments.externalReference, order.id));
-
-        return {
-          success: false,
-          reference: ref,
-          message: 'AirBills could not fulfil the order. Contact support for a refund.',
-          raw: finalOrder,
-        };
-      }
-    } catch (err: any) {
-      console.error('[AirBills] Poll error:', err.message);
+      return {
+        success: true,
+        reference: ref,
+        externalReference: transaction.id,
+        message: `₦${amountNgn.toLocaleString()} ${productCodeToLabel(productCode)} paid`,
+        token: rawData.token,
+        raw: processResult,
+      };
     }
-  }
 
-  return {
-    success: true,
-    reference: ref,
-    externalReference: order.id,
-    message: `Payment sent. Your ${service} order is processing — you'll be notified when complete.`,
-    raw: finalOrder,
-  };
+    console.error('[AirBills] processTransaction failed:', processResult);
+    await db.update(billPayments)
+      .set({ status: 'failed', metadata: processResult })
+      .where(eq(billPayments.externalReference, transaction.id));
+
+    return {
+      success: false,
+      reference: ref,
+      externalReference: transaction.id,
+      message: processResult.message || 'AirBills could not fulfil the order. Contact support for a refund.',
+      raw: processResult,
+    };
+  } catch (err: any) {
+    console.error('[AirBills] processTransaction error:', err);
+    // We already sent the USDT; leave as pending and let webhook update
+    return {
+      success: true,
+      reference: ref,
+      externalReference: transaction.id,
+      message: `Payment sent. Your ${productCodeToLabel(productCode)} order is processing — you'll be notified when complete.`,
+      raw: transaction,
+    };
+  }
+}
+
+function productCodeToType(code: string): string {
+  switch (code) {
+    case '100': return 'airtime';
+    case '101': return 'electricity';
+    case '102': return 'data';
+    case '104': return 'cable';
+    default: return 'bill';
+  }
+}
+
+function productCodeToLabel(code: string): string {
+  switch (code) {
+    case '100': return 'airtime';
+    case '101': return 'electricity';
+    case '102': return 'data';
+    case '104': return 'cable TV';
+    default: return 'bill';
+  }
 }
 
 export async function purchaseAirtime(
@@ -192,12 +281,15 @@ export async function purchaseAirtime(
   amountNgn: number,
   network: string
 ): Promise<BillPaymentResult> {
+  const networkId = networkCodeToId(network);
+  if (!networkId) {
+    return { success: false, reference: '', message: `Unsupported network: ${network}` };
+  }
   return executeAirbillsPayment(client, {
     userId,
-    service: 'airtime',
-    recipient: phone,
+    productCode: '100',
     amountNgn,
-    network,
+    data: { phoneNumber: phone, networkId },
   });
 }
 
@@ -209,13 +301,18 @@ export async function purchaseData(
   network: string,
   planId?: string
 ): Promise<BillPaymentResult> {
+  const networkId = networkCodeToId(network);
+  if (!networkId) {
+    return { success: false, reference: '', message: `Unsupported network: ${network}` };
+  }
+  if (!planId) {
+    return { success: false, reference: '', message: 'Data plan ID is required.' };
+  }
   return executeAirbillsPayment(client, {
     userId,
-    service: 'data',
-    recipient: phone,
+    productCode: '102',
     amountNgn,
-    network,
-    planId,
+    data: { phoneNumber: phone, networkId, prodId: planId },
   });
 }
 
@@ -224,14 +321,32 @@ export async function purchaseElectricity(
   userId: string,
   meterNumber: string,
   amountNgn: number,
-  disco: string
+  disco: string,
+  meterType: 'prepaid' | 'postpaid' = 'prepaid'
 ): Promise<BillPaymentResult> {
+  if (amountNgn < 2000) {
+    return { success: false, reference: '', message: 'Minimum electricity amount is ₦2,000.' };
+  }
+  const electId = await findElectId(client, disco);
+  if (!electId) {
+    return { success: false, reference: '', message: `Could not map electricity provider: ${disco}` };
+  }
+
+  try {
+    const validation = await client.validateMeter({ meterNo: meterNumber, electId });
+    if (!validation.valid) {
+      return { success: false, reference: '', message: 'Meter number could not be validated for this provider.' };
+    }
+  } catch (err: any) {
+    console.warn('[AirBills] Meter validation failed:', err.message);
+    // Continue anyway; provider may still accept
+  }
+
   return executeAirbillsPayment(client, {
     userId,
-    service: 'electricity',
-    recipient: meterNumber,
+    productCode: '101',
     amountNgn,
-    provider: disco,
+    data: { meterNo: meterNumber, electId, prodId: meterType },
   });
 }
 
@@ -240,21 +355,31 @@ export async function purchaseCable(
   userId: string,
   smartCardNumber: string,
   amountNgn: number,
-  provider: string
+  provider: string,
+  planId?: string
 ): Promise<BillPaymentResult> {
+  let prodId = planId;
+  if (!prodId) {
+    const pkg = await findCablePackage(client, provider, amountNgn);
+    if (!pkg) {
+      return { success: false, reference: '', message: `Could not find a cable package for ${provider}.` };
+    }
+    prodId = pkg.prodId;
+    amountNgn = pkg.prodAmount;
+  }
+
   return executeAirbillsPayment(client, {
     userId,
-    service: 'cable',
-    recipient: smartCardNumber,
+    productCode: '104',
     amountNgn,
-    provider,
+    data: { smartCardNo: smartCardNumber, prodId },
   });
 }
 
 /** Startup health check */
 export async function checkAirbillsHealth(client: AirbillsClient): Promise<boolean> {
   try {
-    await client.ping();
+    await client.listInternet();
     return true;
   } catch (err: any) {
     console.warn('[AirBills] Health check failed:', err.message);

@@ -116,6 +116,9 @@ export enum ConversationState {
   AWAITING_ADMIN_TXN_SEARCH = 'awaiting_admin_txn_search',
   AWAITING_ADMIN_USER_SEARCH = 'awaiting_admin_user_search',
   AWAITING_ADMIN_SET_AMBASSADOR_CODE = 'awaiting_admin_set_ambassador_code',
+  AWAITING_ADMIN_PUSH_MESSAGE = 'awaiting_admin_push_message',
+  AWAITING_ADMIN_PUSH_SEGMENT = 'awaiting_admin_push_segment',
+  AWAITING_ADMIN_PUSH_CONFIRM = 'awaiting_admin_push_confirm',
   AWAITING_BULK_SEND_INPUT = 'awaiting_bulk_send_input',
   AWAITING_FEEDBACK_TEXT = 'awaiting_feedback_text',
 }

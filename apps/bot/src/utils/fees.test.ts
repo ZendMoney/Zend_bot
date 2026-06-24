@@ -29,11 +29,11 @@ describe('calcRequiredSol', () => {
 
 describe('calcSponsoredSendFeeUsdt', () => {
   it('uses gas recovery + flat fee on small transfers', () => {
-    // 0.005 SOL @ $100 = $0.50 gas + $0.25 flat = $0.75
+    // 0.002139 SOL @ $100 = $0.2139 gas + $0.25 flat
     // 1.5% of $10 = $0.15 → gas recovery wins
-    const result = calcSponsoredSendFeeUsdt(0.005, 100, 10);
+    const result = calcSponsoredSendFeeUsdt(0.002139, 100, 10);
     expect(result.feeMode).toBe('gas_recovery');
-    expect(result.zendFeeUsdt).toBeCloseTo(0.5 + ZEND_GAS_EXTRA_FLAT_USDT, 4);
+    expect(result.zendFeeUsdt).toBeCloseTo(0.2139 + ZEND_GAS_EXTRA_FLAT_USDT, 4);
     expect(result.percentageFeeUsdt).toBeLessThan(result.zendFeeUsdt);
   });
 

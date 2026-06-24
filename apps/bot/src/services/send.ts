@@ -14,7 +14,8 @@ import { getAuddPriceInUsdt } from './pricing.js';
 import { indexTransaction } from './nlp.js';
 import { decryptPrivateKey } from '../utils/wallet.js';
 import { ensureUsdtBalance } from './stablecoin.js';
-import { fundSolIfNeeded, gasFundingErrorToUserMessage } from './gas.js';
+import { fundSolIfNeeded, gasFundingErrorToUserMessage, calculateSendFee } from './gas.js';
+import { calcZendFeeUsdt, ZEND_FEE_NORMAL_BPS, ZEND_FEE_NORMAL_CAP_USDT } from '../utils/fees.js';
 import {
   clearPajSession,
   getPajBankList,
@@ -39,7 +40,7 @@ export interface SendTxData {
 export async function executeSendCore(
   userId: string,
   txData: SendTxData
-): Promise<{ success: boolean; txId: string; solanaTxHash?: string; offRampRef?: string; error?: string }> {
+): Promise<{ success: boolean; txId: string; solanaTxHash?: string; offRampRef?: string; error?: string; finalFeeUsdt?: number }> {
   const userFromMint = txData.fromMint || SOLANA_TOKENS.USDT.mint;
   const userFromToken = Object.values(SOLANA_TOKENS).find(t => t.mint === userFromMint) || SOLANA_TOKENS.USDT;
   const userFromSymbol = userFromToken.symbol;
@@ -61,7 +62,7 @@ export async function executeSendCore(
     ngnRate: (txData.ngnRate || 1550).toString(),
     fromAmount: txData.amountUsdt.toString(),
     fromMint: userFromMint,
-    zendFeeUsdt: feeUsdt.toString(),
+    zendFeeUsdt: (txData.zendFeeUsdt || 0).toString(),
     recipientBankCode: finalBankCode,
     recipientBankName: finalBankName,
     recipientAccountNumber: finalAccountNumber,
@@ -77,6 +78,7 @@ export async function executeSendCore(
 
   let offRampRef = 'MOCK-' + Math.random().toString(36).substring(2, 8).toUpperCase();
   let solanaTxHash: string | undefined;
+  let finalFeeUsdt = txData.zendFeeUsdt || 0;
 
   try {
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
@@ -120,7 +122,13 @@ export async function executeSendCore(
       offRampRef = order.id;
       console.log('[PAJ] Off-ramp order created:', order.id, 'deposit address:', order.address, 'amount:', order.amount);
 
-      const feeUsdtAmount = txData.zendFeeUsdt || 0;
+      // Recompute fee based on the actual PAJ order amount and real recipient address
+      const feeWallet = process.env.ZEND_FEE_WALLET;
+      const feeInfo = await calculateSendFee(order.amount, user[0].walletAddress, userId, {
+        recipientAddress: order.address,
+      });
+      finalFeeUsdt = feeInfo.zendFeeUsdt;
+      const quotedTotalUsdt = order.amount + finalFeeUsdt;
 
       // Auto-swap AUDD → USDT via local pool (hidden from user)
       if (userFromMint === SOLANA_TOKENS.AUDD.mint) {
@@ -128,7 +136,7 @@ export async function executeSendCore(
         if (auddBalance <= 0) {
           throw new Error('No AUDD balance. Please deposit AUDD first.');
         }
-        const usdtNeeded = order.amount;
+        const usdtNeeded = quotedTotalUsdt;
         const auddRate = await getAuddPriceInUsdt();
         const auddNeeded = usdtNeeded / auddRate;
         if (auddBalance < auddNeeded) {
@@ -165,15 +173,11 @@ export async function executeSendCore(
         });
       }
 
-      const feeWallet = process.env.ZEND_FEE_WALLET;
-      const feeUsdt = feeUsdtAmount;
-      const totalUsdtNeeded = order.amount + feeUsdt;
-
       let tokenBalance = await ensureUsdtBalance(
         userId,
         user[0].walletAddress,
         user[0].walletEncryptedKey,
-        totalUsdtNeeded,
+        quotedTotalUsdt,
         'bank transfer'
       );
 
@@ -190,9 +194,19 @@ export async function executeSendCore(
         throw new Error(userMsg);
       }
 
+      // Quote may assume ATAs that already exist; only charge sponsorship if we actually funded SOL.
+      if (!gasSponsored && !funded && !fundError) {
+        const normalFee = calcZendFeeUsdt(order.amount, ZEND_FEE_NORMAL_BPS, ZEND_FEE_NORMAL_CAP_USDT);
+        if (normalFee < finalFeeUsdt) {
+          console.log(`[Gas] User had enough SOL; fee ${finalFeeUsdt.toFixed(4)} → ${normalFee.toFixed(4)} USDT`);
+          finalFeeUsdt = normalFee;
+        }
+      }
+      const totalUsdtNeeded = order.amount + finalFeeUsdt;
+
       // Build USDT fee transfer instruction to bundle with main send
       const feeInstructions: any[] = [];
-      if (feeWallet && feeUsdt > 0) {
+      if (feeWallet && finalFeeUsdt > 0) {
         const feeWalletPubkey = new PublicKey(feeWallet);
         const pajMintPubkey = new PublicKey(pajMint);
         const senderPubkey = new PublicKey(user[0].walletAddress);
@@ -200,7 +214,7 @@ export async function executeSendCore(
         const senderTokenAccount = await getAssociatedTokenAddress(pajMintPubkey, senderPubkey);
         const feeWalletTokenAccount = await getAssociatedTokenAddress(pajMintPubkey, feeWalletPubkey);
 
-        const rawFeeAmount = BigInt(Math.round(feeUsdt * Math.pow(10, pajToken.decimals)));
+        const rawFeeAmount = BigInt(Math.round(finalFeeUsdt * Math.pow(10, pajToken.decimals)));
 
         feeInstructions.push(
           createAssociatedTokenAccountIdempotentInstruction(
@@ -228,7 +242,12 @@ export async function executeSendCore(
       console.log(`[Solana] ${userFromSymbol} sent to PAJ via USDT (+ USDT fee bundled):`, solanaTxHash);
 
       await db.update(transactions)
-        .set({ solanaTxHash, pajReference: offRampRef })
+        .set({
+          solanaTxHash,
+          pajReference: offRampRef,
+          zendFeeUsdt: finalFeeUsdt.toString(),
+          fromAmount: totalUsdtNeeded.toString(),
+        })
         .where(eq(transactions.id, txId));
     } else {
       throw new Error(
@@ -244,7 +263,7 @@ export async function executeSendCore(
         .where(eq(transactions.id, txId));
     }, 3000);
 
-    return { success: true, txId, solanaTxHash, offRampRef };
+    return { success: true, txId, solanaTxHash, offRampRef, finalFeeUsdt };
   } catch (err: any) {
     console.error('Off-ramp failed:', err);
     if (isPajSessionError(err)) {

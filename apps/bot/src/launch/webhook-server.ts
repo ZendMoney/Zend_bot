@@ -6,7 +6,7 @@ import bs58 from 'bs58';
 import { db, users, transactions, billPayments, ambassadorApplications, deviceSuspensionRequests } from '@zend/db';
 import { eq, sql } from 'drizzle-orm';
 import { SOLANA_TOKENS } from '@zend/shared';
-import { DEV_WALLET_SECRET, walletService } from '../deps.js';
+import { DEV_WALLET_SECRET, getPublicBaseUrl, walletService } from '../deps.js';
 import { mainMenu } from '../keyboards/index.js';
 import { generateTxId } from '../lib/ids.js';
 import { getAuddPriceInUsdt } from '../services/pricing.js';
@@ -360,10 +360,20 @@ export function startWebhookServer(botInstance: Telegraf<any>): Server {
       req.on('end', async () => {
         try {
           const event = JSON.parse(body);
-          console.log('📩 AirBills Webhook:', event.event, event.orderId);
+          // New gateway sends the transaction object directly; support old wrapper too
+          const transactionId = event.id || event.transactionId || event.orderId;
+          const status = event.status || event.transactionStatus;
+          const token = event.token || event.data?.token;
+          console.log('📩 AirBills Webhook:', transactionId, status);
+
+          if (!transactionId) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ received: true }));
+            return;
+          }
 
           const orders = await db.select().from(billPayments)
-            .where(eq(billPayments.externalReference, event.orderId))
+            .where(eq(billPayments.externalReference, transactionId))
             .limit(1);
 
           if (!orders.length) {
@@ -374,9 +384,9 @@ export function startWebhookServer(botInstance: Telegraf<any>): Server {
 
           const order = orders[0];
 
-          if (event.status === 'completed') {
+          if (status === 'completed' || status === 'success') {
             await db.update(billPayments)
-              .set({ status: 'success', token: event.token, completedAt: new Date() })
+              .set({ status: 'success', token, completedAt: new Date() })
               .where(eq(billPayments.id, order.id));
 
             await botInstance.telegram.sendMessage(
@@ -384,11 +394,11 @@ export function startWebhookServer(botInstance: Telegraf<any>): Server {
               `🎉 *Bill Payment Complete!*\n\n` +
               `${order.type?.toUpperCase()} — ₦${Number(order.amountNgn).toLocaleString()}\n` +
               `Recipient: ${order.recipient}` +
-              (event.token ? `\n\n🔑 *Token:* \`${event.token}\`` : '') +
+              (token ? `\n\n🔑 *Token:* \`${token}\`` : '') +
               `\n\nReference: \`${order.reference}\``,
               { parse_mode: 'Markdown' }
             );
-          } else if (event.status === 'failed') {
+          } else if (status === 'failed') {
             await db.update(billPayments)
               .set({ status: 'failed', metadata: event })
               .where(eq(billPayments.id, order.id));
@@ -504,14 +514,21 @@ export function startWebhookServer(botInstance: Telegraf<any>): Server {
   });
 
   server.listen(port, '0.0.0.0', () => {
-    const host = process.env.RAILWAY_PUBLIC_DOMAIN || `localhost:${port}`;
-    console.log(`🌐 Webhook server running on http://${host}`);
-    console.log(`   PAJ webhook URL: https://${host}/webhooks/paj`);
-    console.log(`   NEAR Intents webhook URL: https://${host}/webhooks/near-intents`);
-    console.log(`   AirBills webhook URL: https://${host}/webhooks/airbills`);
-    console.log(`   Telegram webhook URL: https://${host}/webhook/telegram`);
-    console.log(`   Ambassador API: https://${host}/api/ambassador`);
-    console.log(`   Device Suspend API: https://${host}/api/device-suspend`);
+    const publicBase = getPublicBaseUrl();
+    console.log(`🌐 Webhook server listening on 0.0.0.0:${port}`);
+    if (publicBase) {
+      console.log(`   Public base URL: ${publicBase}`);
+      console.log(`   PAJ webhook URL: ${publicBase}/webhooks/paj`);
+      console.log(`   NEAR Intents webhook URL: ${publicBase}/webhooks/near-intents`);
+      console.log(`   AirBills webhook URL: ${publicBase}/webhooks/airbills`);
+      console.log(`   Telegram webhook URL: ${publicBase}/webhook/telegram`);
+      console.log(`   Ambassador API: ${publicBase}/api/ambassador`);
+      console.log(`   Device Suspend API: ${publicBase}/api/device-suspend`);
+    } else {
+      console.warn('⚠️  No public URL configured — external webhooks (PAJ/AirBills/NEAR) will NOT reach this server');
+      console.warn('   Set WEBHOOK_BASE_URL or expose the Railway service to set RAILWAY_PUBLIC_DOMAIN');
+      console.log(`   Local only: http://localhost:${port}`);
+    }
   });
 
   return server;

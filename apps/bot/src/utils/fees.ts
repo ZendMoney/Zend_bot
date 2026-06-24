@@ -12,14 +12,17 @@ export const ZEND_FEE_FUNDED_CAP_USDT = parseFloat(process.env.ZEND_FEE_FUNDED_C
 /** Small flat fee on top of SOL recovery (the "little extra") */
 export const ZEND_GAS_EXTRA_FLAT_USDT = parseFloat(process.env.ZEND_GAS_EXTRA_FLAT_USDT || '0.25');
 
-export const MIN_SOL_FOR_GAS = 0.003;
+/** ~5000 lamports/sig; small buffer for priority fees on a single SPL transfer */
+export const PER_TX_GAS_SOL = 0.0001;
+/** Minimum SOL balance check when user pays their own gas (not sponsored) */
+export const MIN_SOL_FOR_GAS = PER_TX_GAS_SOL;
 export const ATA_RENT_SOL = 0.002039;
-export const NEW_USER_SOL_BUFFER_MULTIPLIER = 2;
+export const NEW_USER_SOL_BUFFER_MULTIPLIER = 1.5;
 
 export type SponsoredFeeMode = 'percentage' | 'gas_recovery';
 
 export function calcRequiredSol(needsAtaCount: number, isNewUser = false): number {
-  const base = MIN_SOL_FOR_GAS + needsAtaCount * ATA_RENT_SOL;
+  const base = PER_TX_GAS_SOL + needsAtaCount * ATA_RENT_SOL;
   return isNewUser ? base * NEW_USER_SOL_BUFFER_MULTIPLIER : base;
 }
 

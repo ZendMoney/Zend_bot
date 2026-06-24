@@ -99,6 +99,13 @@
       "when": 1781005000000,
       "tag": "0013_widen_mint_columns",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1782244795918,
+      "tag": "0014_tranquil_katie_power",
+      "breakpoints": true
     }
   ]
 }

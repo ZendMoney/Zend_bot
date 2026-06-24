@@ -20,9 +20,10 @@ import {
   parseBulkSendWithAI,
 } from '../../services/nlp.js';
 import { getPAJClient, walletService, airbillsClient } from '../../deps.js';
+import { AirbillsClient, type AirbillsElectProvider } from '@zend/airbills-client';
 import { getStablecoinBalances } from '../../services/stablecoin.js';
 import { getDataPlans, type DataPlan } from '../../services/bills/index.js';
-import { getDataPlansForNetwork } from '../../services/airbills/plans.js';
+import { getDataPlansForNetwork, getCablePackagesForProvider } from '../../services/airbills/plans.js';
 import { mainMenu, cancelKeyboard, REPLY_KEYBOARD_BUTTONS } from '../../keyboards/index.js';
 import { md, escapeTelegramMarkdown } from '../../lib/telegram.js';
 import { formatNgn, formatBalance } from '../../lib/format.js';
@@ -56,6 +57,8 @@ import {
 } from '../../services/near-intents-flow.js';
 import { getSolPriceInUsdt } from '../../utils/sol-price.js';
 import { AUDD_ENABLED } from '../../utils/flags.js';
+import { ZEND_FEE_FUNDED_BPS } from '../../utils/fees.js';
+import { SOLANA_ORIGIN_ASSETS } from '../../services/near-intents-flow.js';
 import { startOnboarding } from '../start.js';
 import { executeSend } from '../send.js';
 import { handleSwapAmount } from '../swap.js';
@@ -66,8 +69,38 @@ import { doExportKey } from '../wallet-export.js';
 import { executeNearIntentWithdraw } from '../withdraw-execute.js';
 import { saveScheduledTransfer } from '../schedule/save.js';
 import { adminMainKeyboard, adminSearchKeyboard } from '../admin/keyboards.js';
+import { PUSH_SEGMENTS } from '../admin/push.js';
 import { buildTxnDetailText, buildUserDetailText } from '../admin/detail.js';
 import type { HandlerContext } from '../types.js';
+
+async function mapDiscoToElectId(client: AirbillsClient, disco: string): Promise<string | undefined> {
+  const fallback: Record<string, string> = {
+    'ikeja-electric': 'IKEDC',
+    'eko-electric': 'EKEDC',
+    'abuja-electric': 'AEDC',
+    'ibadan-electric': 'IBEDC',
+    'enugu-electric': 'EEDC',
+    'portharcourt-electric': 'PHEDC',
+    'kano-electric': 'KEDCO',
+    'kaduna-electric': 'KAEDCO',
+    'jos-electric': 'JEDC',
+    'benin-electric': 'BEDC',
+    'yola-electric': 'YEDC',
+  };
+  const normalized = disco.toLowerCase();
+  if (fallback[normalized]) return fallback[normalized];
+  try {
+    const providers = await client.listElectricity();
+    const match = providers.find(
+      (p: AirbillsElectProvider) =>
+        p.electId.toLowerCase() === normalized ||
+        p.name.toLowerCase().includes(normalized.replace(/-/g, ' '))
+    );
+    return match?.electId;
+  } catch {
+    return undefined;
+  }
+}
 
 /** Text message state router — handles all ConversationState branches. */
 export function registerTextRouter({ bot: b }: HandlerContext): void {
@@ -181,6 +214,35 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       `\`t.me/zend_money_bot?start=${code}\``,
       { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', `admin_ambassador_detail:${ambId}`)]]) }
     );
+    return;
+  }
+
+  // ─── ADMIN: PUSH NOTIFICATION MESSAGE ───
+  if (session.state === ConversationState.AWAITING_ADMIN_PUSH_MESSAGE) {
+    const message = text.trim();
+    if (!message) {
+      await ctx.reply('❌ Message cannot be empty. Please enter a message:', cancelKeyboard);
+      return;
+    }
+    session.pendingTransaction = { ...session.pendingTransaction, pushMessage: message };
+    session.state = ConversationState.AWAITING_ADMIN_PUSH_SEGMENT;
+    setSession(userId, session);
+
+    const rows = PUSH_SEGMENTS.map((s) => [Markup.button.callback(s.label, `admin_push:segment:${s.key}`)]);
+    await ctx.reply('🎯 *Select Target Audience*', {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([...rows, [Markup.button.callback('❌ Cancel', 'admin_back')]]),
+    });
+    return;
+  }
+
+  if (session.state === ConversationState.AWAITING_ADMIN_PUSH_SEGMENT) {
+    await ctx.reply('❌ Please select a target audience using the buttons.', cancelKeyboard);
+    return;
+  }
+
+  if (session.state === ConversationState.AWAITING_ADMIN_PUSH_CONFIRM) {
+    await ctx.reply('❌ Please tap Confirm or Cancel using the buttons.', cancelKeyboard);
     return;
   }
 
@@ -394,8 +456,8 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       `💵 *Deposit Preview*\n\n` +
       `Amount: ${formatNgn(amount)}\n` +
       `Rate: ₦${rate.toLocaleString()}/USD\n` +
-      `Fee: ${formatNgn(feeNgn)}\n` +
-      `You receive: ~${usdtAmount.toFixed(2)} Dollars\n\n` +
+      `Fee: calculated after identity check\n` +
+      `You receive: ~${usdtAmount.toFixed(2)} Dollars (estimate)\n\n` +
       `🔐 *Identity Verification*\n\n` +
       `Enter your email or phone number (with country code):\n` +
       `Example: user@email.com or +2348012345678`,
@@ -444,7 +506,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       const exactAmount = quote.quote.amountInFormatted || amount.toString();
       const chainDisplay = CHAIN_DISPLAY_NAMES[bd.sourceChain] || bd.sourceChain;
       const feeLine = quote.quote.withdrawFee
-        ? `• Est. network fee: ~${quote.quote.withdrawFee}\n`
+        ? `• Est. network fee: ~${quote.quote.withdrawFee} (estimate)\n`
         : '';
 
       // Record in DB
@@ -622,7 +684,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
         `To: *${formatChainName(wd.destChain)}*\n` +
         `Recipient: \`${wd.recipientAddress}\`\n` +
         `They receive: ~${amountOutFormatted} ${wd.destToken}\n` +
-        (quote.quote.withdrawFee ? `Est. fee: ~${quote.quote.withdrawFee}\n` : '') +
+        (quote.quote.withdrawFee ? `Est. fee: ~${quote.quote.withdrawFee} (estimate)\n` : '') +
         `\nReference: \`${txId}\``,
         {
           parse_mode: 'Markdown',
@@ -1226,7 +1288,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
             return;
           }
           rows = plans.map((p) =>
-            [Markup.button.callback(`${p.name} — ₦${p.amount.toLocaleString()}`, `bill_plan_${p.id}_${p.amount}`)]
+            [Markup.button.callback(`${p.description} — ₦${p.prodAmount.toLocaleString()}`, `bill_plan_${p.prodId}_${p.prodAmount}`)]
           );
         } else {
           const plans = await getDataPlans(session.billData.network!);
@@ -1324,17 +1386,22 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
     if (airbillsClient && session.billData?.disco) {
       const verifyMsg = await showLoading(ctx, 'Verifying meter number...');
       try {
-        const validation = await airbillsClient.validateRecipient(session.billData.disco, meter);
-        if (validation.valid && validation.name) {
-          session.billData = { ...session.billData, meterNumber: meter, customerName: validation.name };
-          await finishLoading(
-            ctx,
-            verifyMsg.message_id,
-            `✅ *Meter Verified*\n\nCustomer: ${md(validation.name)}\nMeter: \`${meter}\``,
-            'Markdown'
-          );
+        const electId = await mapDiscoToElectId(airbillsClient, session.billData.disco);
+        if (electId) {
+          const validation = await airbillsClient.validateMeter({ meterNo: meter, electId });
+          if (validation.valid && validation.name) {
+            session.billData = { ...session.billData, meterNumber: meter, customerName: validation.name };
+            await finishLoading(
+              ctx,
+              verifyMsg.message_id,
+              `✅ *Meter Verified*\n\nCustomer: ${md(validation.name)}\nMeter: \`${meter}\``,
+              'Markdown'
+            );
+          } else {
+            await finishLoading(ctx, verifyMsg.message_id, '⚠️ Could not verify meter name. Double-check the number and provider.');
+          }
         } else {
-          await finishLoading(ctx, verifyMsg.message_id, '⚠️ Could not verify meter name. Double-check the number, then enter amount.');
+          await finishLoading(ctx, verifyMsg.message_id, '⚠️ Could not map electricity provider. You can still continue.');
         }
       } catch (err: any) {
         console.error('[Bills] Meter validation failed:', err.message);
@@ -1342,9 +1409,20 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       }
     }
 
-    session.state = ConversationState.BILL_ENTER_AMOUNT;
+    session.state = ConversationState.BILL_SELECT_METER_TYPE;
     setSession(userId, session);
-    await ctx.reply('💵 Enter amount in Naira (e.g., 1000, 5000):', cancelKeyboard);
+    await ctx.reply(
+      '⚡ Select meter type:',
+      Markup.inlineKeyboard([
+        [Markup.button.callback('Prepaid', 'bill_meter_type:prepaid')],
+        [Markup.button.callback('Postpaid', 'bill_meter_type:postpaid')],
+      ])
+    );
+    return;
+  }
+
+  if (session.state === ConversationState.BILL_SELECT_METER_TYPE) {
+    await ctx.reply('❌ Please select a meter type using the buttons.', cancelKeyboard);
     return;
   }
 
@@ -1356,25 +1434,27 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
     }
     session.billData = { ...session.billData, smartCardNumber: card };
 
-    if (airbillsClient && session.billData?.provider) {
-      const verifyMsg = await showLoading(ctx, 'Verifying smart card...');
-      try {
-        const validation = await airbillsClient.validateRecipient(session.billData.provider, card);
-        if (validation.valid && validation.name) {
-          session.billData = { ...session.billData, smartCardNumber: card, customerName: validation.name };
-          await finishLoading(
-            ctx,
-            verifyMsg.message_id,
-            `✅ *Smart Card Verified*\n\nCustomer: ${md(validation.name)}\nCard: \`${card}\``,
-            'Markdown'
-          );
-        } else {
-          await finishLoading(ctx, verifyMsg.message_id, '⚠️ Could not verify subscriber name. Double-check the card number.');
+    // AirBills cable packages set the amount upfront; VTpass fallback asks for amount
+    if (airbillsClient && session.billData?.bouquetAmount) {
+      session.state = ConversationState.BILL_CONFIRM;
+      setSession(userId, session);
+      await ctx.reply(
+        `💳 *Confirm Purchase*\n\n` +
+        `Type: 📺 Cable TV\n` +
+        `Provider: ${session.billData.provider?.toUpperCase()}\n` +
+        `Package: ${session.billData.bouquetCode}\n` +
+        `Smart Card: \`${card}\`\n` +
+        `Amount: ₦${session.billData.bouquetAmount.toLocaleString()}\n\n` +
+        `Tap Confirm to complete.`,
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Confirm', 'bill_confirm')],
+            [Markup.button.callback('❌ Cancel', 'cancel_send')],
+          ]),
         }
-      } catch (err: any) {
-        console.error('[Bills] Smart card validation failed:', err.message);
-        await finishLoading(ctx, verifyMsg.message_id, '⚠️ Lookup unavailable. Enter amount to continue.');
-      }
+      );
+      return;
     }
 
     session.state = ConversationState.BILL_ENTER_AMOUNT;

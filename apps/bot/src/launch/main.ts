@@ -1,4 +1,5 @@
 import { initSessionStore } from '../session/store.js';
+import { runMigrations } from '@zend/db';
 import { initQVAC, getQVACStatus } from '../services/qvac/index.js';
 import { runStartupHealthChecks } from './health.js';
 import { startWebhookServer } from './webhook-server.js';
@@ -13,6 +14,14 @@ export async function run(): Promise<void> {
 
   const health = await runStartupHealthChecks({ getPAJClient, airbillsClient });
   if (!health.database) {
+    process.exit(1);
+  }
+
+  try {
+    await runMigrations();
+    console.log('🗄  Database migrations applied');
+  } catch (err: any) {
+    console.error('❌ Database migration failed:', err.message);
     process.exit(1);
   }
 

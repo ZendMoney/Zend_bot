@@ -1,4 +1,5 @@
 import { drizzle } from 'drizzle-orm/postgres-js';
+import { migrate } from 'drizzle-orm/postgres-js/migrator';
 import postgres from 'postgres';
 import * as schema from './schema.js';
 
@@ -24,4 +25,9 @@ export async function checkConnection(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+// Run pending Drizzle migrations on startup
+export async function runMigrations(): Promise<void> {
+  await migrate(db, { migrationsFolder: './drizzle' });
 }

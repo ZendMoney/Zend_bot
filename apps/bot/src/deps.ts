@@ -24,8 +24,10 @@ export async function getPAJClient(): Promise<PAJClient | null> {
 
 export const walletService = new WalletService(SOLANA_RPC);
 
-export const airbillsClient = process.env.AIRBILLS_API_KEY
-  ? new AirbillsClient(process.env.AIRBILLS_API_KEY, process.env.AIRBILLS_BASE_URL)
+const AIRBILLS_SECRET_KEY =
+  process.env.AIRBILLS_SECRET_KEY?.trim() || process.env.AIRBILLS_API_KEY?.trim();
+export const airbillsClient = AIRBILLS_SECRET_KEY
+  ? new AirbillsClient(AIRBILLS_SECRET_KEY, process.env.AIRBILLS_BASE_URL)
   : null;
 
 export const DEV_WALLET_SECRET = process.env.ZEND_DEV_WALLET_SECRET || process.env.PV_KEY || '';

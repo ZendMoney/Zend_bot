@@ -74,7 +74,10 @@ export async function runStartupHealthChecks(deps: {
     if (airbillsOk) {
       console.log('✅ AirBills API connected');
     } else {
-      console.warn('⚠️  AirBills API key invalid or unreachable — bill payments will fail until fixed');
+      const keyHint = process.env.AIRBILLS_API_KEY?.trim()
+        ? `key ends …${process.env.AIRBILLS_API_KEY.trim().slice(-4)}`
+        : 'no key set';
+      console.warn(`⚠️  AirBills API key invalid or unreachable (${keyHint}) — bill payments will fail until fixed`);
     }
   } else {
     console.warn('⚠️  AirBills not configured — bill payments use VTpass demo fallback');
