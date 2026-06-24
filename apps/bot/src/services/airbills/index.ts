@@ -22,6 +22,12 @@ import { fundSolIfNeeded, gasFundingErrorToUserMessage } from '../gas.js';
 const SOLANA_RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
 const walletService = new WalletService(SOLANA_RPC);
 
+/** AirBills recommended default mode — sign their pre-built Solana tx. Set transfer to revert. */
+function getAirbillsPayWith(): 'default' | 'transfer' {
+  const mode = process.env.AIRBILLS_PAY_WITH?.trim().toLowerCase();
+  return mode === 'transfer' ? 'transfer' : 'default';
+}
+
 function generateReference(): string {
   return `ZND-AB-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 }
@@ -38,13 +44,13 @@ function networkCodeToId(network: string): string | undefined {
 
 async function ensureGasForPayment(
   walletAddress: string,
-  paymentAddress: string,
-  userId: string
+  userId: string,
+  paymentAddress?: string
 ): Promise<void> {
   const funding = await fundSolIfNeeded(
     walletAddress,
     paymentAddress,
-    SOLANA_TOKENS.USDT.mint,
+    paymentAddress ? SOLANA_TOKENS.USDT.mint : undefined,
     undefined,
     userId
   );
@@ -141,9 +147,10 @@ async function executeAirbillsPayment(
     const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || '';
     const callbackUrl = webhookBaseUrl ? `${webhookBaseUrl.replace(/\/$/, '')}/webhooks/airbills` : undefined;
 
+    const payWith = getAirbillsPayWith();
     transaction = await client.createTransaction({
       productCode,
-      payWith: 'transfer',
+      payWith,
       callbackUrl,
       data: {
         ...data,
@@ -152,6 +159,7 @@ async function executeAirbillsPayment(
         amount: amountNgn,
       },
     });
+    console.log(`[AirBills] createTransaction id=${transaction.id} payWith=${payWith}`);
   } catch (err: any) {
     console.error('[AirBills] createTransaction failed:', err);
     const msg = err.message?.includes('status 03')
@@ -173,8 +181,14 @@ async function executeAirbillsPayment(
     };
   }
 
+  const payWith = transaction.payWith || getAirbillsPayWith();
+
   try {
-    await ensureGasForPayment(user.walletAddress, transaction.wallet!, userId);
+    await ensureGasForPayment(
+      user.walletAddress,
+      userId,
+      payWith === 'transfer' ? transaction.wallet : undefined
+    );
   } catch (gasErr: any) {
     return { success: false, reference: ref, message: gasErr.message };
   }
@@ -184,17 +198,36 @@ async function executeAirbillsPayment(
     const secretKey = await decryptPrivateKey(user.walletEncryptedKey);
     const keypair = Keypair.fromSecretKey(secretKey);
 
-    solanaTxHash = await walletService.sendSplToken(
-      keypair,
-      transaction.wallet!,
-      SOLANA_TOKENS.USDT.mint,
-      transaction.amountInToken,
-      SOLANA_TOKENS.USDT.decimals
-    );
-    console.log('[AirBills] USDT sent:', solanaTxHash, 'to', transaction.wallet);
+    if (payWith === 'default') {
+      if (!transaction.transactionIx) {
+        return {
+          success: false,
+          reference: ref,
+          message: 'AirBills did not return a payment transaction. Please try again.',
+        };
+      }
+      solanaTxHash = await walletService.signAndSendSerialized(keypair, transaction.transactionIx);
+      console.log('[AirBills] Signed default-mode tx:', solanaTxHash);
+    } else {
+      if (!transaction.wallet) {
+        return {
+          success: false,
+          reference: ref,
+          message: 'AirBills did not return a deposit wallet. Please try again.',
+        };
+      }
+      solanaTxHash = await walletService.sendSplToken(
+        keypair,
+        transaction.wallet,
+        SOLANA_TOKENS.USDT.mint,
+        transaction.amountInToken,
+        SOLANA_TOKENS.USDT.decimals
+      );
+      console.log('[AirBills] USDT sent (transfer mode):', solanaTxHash, 'to', transaction.wallet);
+    }
   } catch (err: any) {
-    console.error('[AirBills] Payment transfer failed:', err);
-    return { success: false, reference: ref, message: `Payment failed: ${err.message || 'Could not send USDT'}` };
+    console.error('[AirBills] On-chain payment failed:', err);
+    return { success: false, reference: ref, message: `Payment failed: ${err.message || 'Could not complete payment'}` };
   }
 
   await db.insert(billPayments).values({
