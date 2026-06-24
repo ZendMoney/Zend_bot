@@ -76,6 +76,13 @@ interface AirbillsApiResponse<T> {
   data: T | null;
 }
 
+export interface AirbillsProcessResult {
+  /** API status code: 00 = success, 06 = already processed */
+  status: string;
+  message: string;
+  data?: Record<string, unknown>;
+}
+
 export class AirbillsClient {
   private secretKey: string;
   private baseUrl: string;
@@ -85,7 +92,7 @@ export class AirbillsClient {
     this.baseUrl = (baseUrl || DEFAULT_BASE_URL).replace(/\/$/, '');
   }
 
-  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  private async fetchEnvelope<T>(path: string, options: RequestInit = {}): Promise<AirbillsApiResponse<T>> {
     const url = `${this.baseUrl}${path}`;
     const response = await fetch(url, {
       ...options,
@@ -106,22 +113,30 @@ export class AirbillsClient {
     }
 
     if (parsed && typeof parsed === 'object' && 'status' in parsed && 'message' in parsed) {
-      const wrapped = parsed as AirbillsApiResponse<T>;
-      const ok = wrapped.status === '00' || wrapped.status === '0' || wrapped.status === 'success' || wrapped.status === '06';
-      if (!ok) {
-        throw new Error(`AirBills: ${wrapped.message || 'Request failed'} (status ${wrapped.status})`);
-      }
-      if (wrapped.data === null || wrapped.data === undefined) {
-        throw new Error(`AirBills: empty response — ${wrapped.message || 'no data'}`);
-      }
-      return wrapped.data;
+      return parsed as AirbillsApiResponse<T>;
     }
 
     if (!response.ok) {
       throw new Error(`AirBills API error ${response.status}: ${text.slice(0, 200)}`);
     }
 
-    return parsed as T;
+    return { status: '00', message: 'Successful', data: parsed as T };
+  }
+
+  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+    const wrapped = await this.fetchEnvelope<T>(path, options);
+    const ok =
+      wrapped.status === '00' ||
+      wrapped.status === '0' ||
+      wrapped.status === 'success' ||
+      wrapped.status === '06';
+    if (!ok) {
+      throw new Error(`AirBills: ${wrapped.message || 'Request failed'} (status ${wrapped.status})`);
+    }
+    if (wrapped.data === null || wrapped.data === undefined) {
+      throw new Error(`AirBills: empty response — ${wrapped.message || 'no data'}`);
+    }
+    return wrapped.data;
   }
 
   async createTransaction(params: CreateTransactionParams): Promise<AirbillsTransaction> {
@@ -136,14 +151,24 @@ export class AirbillsClient {
     });
   }
 
-  async processTransaction(params: ProcessTransactionParams): Promise<{ status: string; message: string; data?: any }> {
-    return this.request<{ status: string; message: string; data?: any }>('/transact/process', {
+  /** Returns the full API envelope — status is the API code (00/06), not transaction lifecycle. */
+  async processTransaction(params: ProcessTransactionParams): Promise<AirbillsProcessResult> {
+    const wrapped = await this.fetchEnvelope<Record<string, unknown>>('/transact/process', {
       method: 'POST',
       body: JSON.stringify({
         productCode: params.productCode,
         id: params.id,
       }),
     });
+    return {
+      status: wrapped.status,
+      message: wrapped.message,
+      data: wrapped.data ?? undefined,
+    };
+  }
+
+  async getTransaction(id: string): Promise<Record<string, unknown>> {
+    return this.request<Record<string, unknown>>(`/transaction/get?id=${encodeURIComponent(id)}`);
   }
 
   async listInternet(): Promise<AirbillsDataPlan[]> {

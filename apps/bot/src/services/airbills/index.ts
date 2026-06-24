@@ -210,21 +210,39 @@ async function executeAirbillsPayment(
     metadata: { transaction, solanaTxHash, ...data },
   });
 
-  // Notify AirBills to fulfill the bill
+  // Notify AirBills to fulfill the bill (retry — on-chain confirm can lag a few seconds)
   try {
-    const processResult = await client.processTransaction({ productCode, id: transaction.id });
-    if (processResult.status === '00' || processResult.status === '06') {
-      const rawData = processResult.data || {};
+    const processResult = await processWithRetries(client, productCode, transaction.id);
+    const fulfillment = interpretProcessResult(processResult);
+
+    if (fulfillment.outcome === 'success') {
       await db.update(billPayments)
-        .set({ status: 'success', token: rawData.token, completedAt: new Date() })
+        .set({
+          status: 'success',
+          token: fulfillment.token as string | undefined,
+          completedAt: new Date(),
+          metadata: { transaction, solanaTxHash, processResult },
+        })
         .where(eq(billPayments.externalReference, transaction.id));
 
       return {
         success: true,
         reference: ref,
         externalReference: transaction.id,
-        message: `₦${amountNgn.toLocaleString()} ${productCodeToLabel(productCode)} paid`,
-        token: rawData.token,
+        message: `₦${amountNgn.toLocaleString()} ${productCodeToLabel(productCode)} paid` +
+          (fulfillment.token ? '' : ' successfully'),
+        token: fulfillment.token as string | undefined,
+        raw: processResult,
+      };
+    }
+
+    if (fulfillment.outcome === 'pending') {
+      console.log('[AirBills] processTransaction pending — awaiting webhook:', transaction.id);
+      return {
+        success: true,
+        reference: ref,
+        externalReference: transaction.id,
+        message: `Payment sent. Your ${productCodeToLabel(productCode)} order is processing — you'll be notified when complete.`,
         raw: processResult,
       };
     }
@@ -243,7 +261,7 @@ async function executeAirbillsPayment(
     };
   } catch (err: any) {
     console.error('[AirBills] processTransaction error:', err);
-    // We already sent the USDT; leave as pending and let webhook update
+    // USDT already sent — leave pending and let webhook/callback update
     return {
       success: true,
       reference: ref,
@@ -252,6 +270,71 @@ async function executeAirbillsPayment(
       raw: transaction,
     };
   }
+}
+
+function normalizeTxnStatus(status: unknown): string {
+  return String(status || '').toLowerCase();
+}
+
+function extractToken(data?: Record<string, unknown>): string | undefined {
+  if (!data) return undefined;
+  const token = data.token ?? data.meterToken ?? data.pin ?? data.voucher;
+  return token != null ? String(token) : undefined;
+}
+
+function interpretProcessResult(result: { status: string; message: string; data?: Record<string, unknown> }): {
+  outcome: 'success' | 'pending' | 'failed';
+  token?: string;
+} {
+  const apiStatus = result.status;
+  const txnStatus = normalizeTxnStatus(result.data?.status);
+
+  if (apiStatus === '00' || apiStatus === '06') {
+    if (txnStatus === 'failed') {
+      return { outcome: 'failed' };
+    }
+    if (txnStatus === 'successful' || txnStatus === 'success' || txnStatus === 'completed') {
+      return { outcome: 'success', token: extractToken(result.data) };
+    }
+    // API accepted — bill may still be fulfilling async
+    return { outcome: 'pending', token: extractToken(result.data) };
+  }
+
+  return { outcome: 'failed' };
+}
+
+async function processWithRetries(
+  client: AirbillsClient,
+  productCode: string,
+  transactionId: string,
+  maxAttempts = 5
+) {
+  let lastResult: Awaited<ReturnType<AirbillsClient['processTransaction']>> | undefined;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const result = await client.processTransaction({ productCode, id: transactionId });
+    lastResult = result;
+    const fulfillment = interpretProcessResult(result);
+    console.log(
+      `[AirBills] process attempt ${attempt}/${maxAttempts}: api=${result.status} txn=${result.data?.status ?? 'n/a'}`
+    );
+
+    if (shouldStopProcessRetries(result)) {
+      return result;
+    }
+
+    if (attempt < maxAttempts) {
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+  return lastResult!;
+}
+
+function shouldStopProcessRetries(result: { status: string; message: string; data?: Record<string, unknown> }): boolean {
+  const fulfillment = interpretProcessResult(result);
+  if (fulfillment.outcome === 'success' || fulfillment.outcome === 'failed') return true;
+  // Auth/validation errors won't resolve with retries
+  if (result.status === '03' || result.status === '04') return true;
+  return false;
 }
 
 function productCodeToType(code: string): string {

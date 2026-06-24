@@ -362,8 +362,8 @@ export function startWebhookServer(botInstance: Telegraf<any>): Server {
           const event = JSON.parse(body);
           // New gateway sends the transaction object directly; support old wrapper too
           const transactionId = event.id || event.transactionId || event.orderId;
-          const status = event.status || event.transactionStatus;
-          const token = event.token || event.data?.token;
+          const status = String(event.status || event.transactionStatus || '').toLowerCase();
+          const token = event.token || event.data?.token || event.meterToken || event.pin;
           console.log('📩 AirBills Webhook:', transactionId, status);
 
           if (!transactionId) {
@@ -384,7 +384,7 @@ export function startWebhookServer(botInstance: Telegraf<any>): Server {
 
           const order = orders[0];
 
-          if (status === 'completed' || status === 'success') {
+          if (status === 'completed' || status === 'success' || status === 'successful') {
             await db.update(billPayments)
               .set({ status: 'success', token, completedAt: new Date() })
               .where(eq(billPayments.id, order.id));
