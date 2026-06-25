@@ -7,7 +7,9 @@ import { NIGERIAN_BANKS } from '@zend/shared';
 import { mainMenu } from '../keyboards/index.js';
 import { showLoading, finishLoading } from '../lib/loading.js';
 import { prepareSendConfirmation } from './send.js';
+import { saveBusinessLogo } from './business/onboarding.js';
 import type { HandlerContext } from './types.js';
+import type { ZendContext } from '../session/types.js';
 
 export function registerPhotoHandlers({ bot: b }: HandlerContext): void {
   b.on(message('photo'), async (ctx) => {
@@ -19,12 +21,14 @@ export function registerPhotoHandlers({ bot: b }: HandlerContext): void {
     return;
   }
 
+  const photo = ctx.message.photo[ctx.message.photo.length - 1];
+  const handledLogo = await saveBusinessLogo(ctx as ZendContext, userId, photo.file_id);
+  if (handledLogo) return;
+
   const loading = await showLoading(ctx, 'Reading your screenshot with QVAC OCR...');
   const startTime = Date.now();
 
   try {
-    // Get the largest photo
-    const photo = ctx.message.photo[ctx.message.photo.length - 1];
     console.log(`[Photo] Downloading image ${photo.file_id} (${photo.width}x${photo.height})`);
     const fileLink = await ctx.telegram.getFileLink(photo.file_id);
     const response = await fetch(fileLink.toString());

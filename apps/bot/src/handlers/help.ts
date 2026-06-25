@@ -5,10 +5,14 @@ import { mainMenu, cancelKeyboard } from '../keyboards/index.js';
 import { formatNgn } from '../lib/format.js';
 import { md } from '../lib/telegram.js';
 import { setSession } from '../session/store.js';
+import { resolveActiveMode } from '../services/business/mode.js';
 import type { HandlerContext } from './types.js';
 
 export function registerHelpHandlers({ bot: b }: HandlerContext): void {
 b.hears('❓ Help', async (ctx) => {
+  const mode = await resolveActiveMode(ctx.from!.id.toString());
+  if (mode === 'business') return;
+
   await ctx.reply(
     `❓ *ZendPay Help*\n\n` +
     `Need support? Reach out anytime:\n\n` +

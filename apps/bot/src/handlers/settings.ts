@@ -7,6 +7,8 @@ import { showLoading, finishLoading } from '../lib/loading.js';
 import { md } from '../lib/telegram.js';
 import { isGroupChat, promptPrivateChat } from '../lib/group.js';
 import { getSession, setSession } from '../session/store.js';
+import { resolveActiveMode } from '../services/business/mode.js';
+import { showBusinessSettings } from './business/settings.js';
 import type { ZendContext } from '../session/types.js';
 import type { HandlerContext } from './types.js';
 
@@ -55,6 +57,13 @@ export async function showSettings(ctx: ZendContext, userId: string) {
     buttons.push([Markup.button.callback('🔑 Show Secret Code', 'export_key')]);
     buttons.push([Markup.button.callback('📅 Schedule Transfer', 'schedule_start')]);
 
+    const activeMode = await resolveActiveMode(userId);
+    if (activeMode === 'personal') {
+      buttons.push([Markup.button.callback('🏢 Switch to Business Mode', 'settings_switch_business')]);
+    } else {
+      buttons.push([Markup.button.callback('👤 Switch to Personal Mode', 'settings_switch_personal')]);
+    }
+
     await finishLoading(ctx, loading.message_id, msg, 'Markdown');
     await ctx.reply('Menu:', {
       parse_mode: 'Markdown',
@@ -75,7 +84,13 @@ b.hears('⚙️ Settings', async (ctx) => {
     await promptPrivateChat(ctx, 'access Settings');
     return;
   }
-  await showSettings(ctx, ctx.from.id.toString());
+  const userId = ctx.from.id.toString();
+  const mode = await resolveActiveMode(userId);
+  if (mode === 'business') {
+    await showBusinessSettings(ctx as ZendContext, userId);
+    return;
+  }
+  await showSettings(ctx, userId);
 });
 
 b.action('settings_paj', async (ctx) => {

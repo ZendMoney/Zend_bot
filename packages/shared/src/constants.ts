@@ -121,6 +121,46 @@ export enum ConversationState {
   AWAITING_ADMIN_PUSH_CONFIRM = 'awaiting_admin_push_confirm',
   AWAITING_BULK_SEND_INPUT = 'awaiting_bulk_send_input',
   AWAITING_FEEDBACK_TEXT = 'awaiting_feedback_text',
+  // Unified bot — mode selection
+  AWAITING_MODE_SELECTION = 'awaiting_mode_selection',
+}
+
+export type ZendMode = 'personal' | 'business';
+
+export enum BusinessFlow {
+  ONBOARDING = 'ONBOARDING',
+  MAIN_MENU = 'MAIN_MENU',
+  INVOICE_GENERATION = 'INVOICE_GENERATION',
+  INVOICE_EDIT = 'INVOICE_EDIT',
+  MY_INVOICES = 'MY_INVOICES',
+  SETTINGS = 'SETTINGS',
+  PLANS = 'PLANS',
+  TOP_UP = 'TOP_UP',
+  DISPUTE = 'DISPUTE',
+  REMINDER = 'REMINDER',
+}
+
+export enum BusinessOnboardingStep {
+  BUSINESS_NAME = 'BUSINESS_NAME',
+  BUSINESS_EMAIL = 'BUSINESS_EMAIL',
+  BUSINESS_PHONE = 'BUSINESS_PHONE',
+  BUSINESS_LOGO = 'BUSINESS_LOGO',
+  BANK_NAME = 'BANK_NAME',
+  BANK_ACCOUNT = 'BANK_ACCOUNT',
+  BANK_CONFIRM = 'BANK_CONFIRM',
+  USDC_WALLET = 'USDC_WALLET',
+  COMPLETE = 'COMPLETE',
+}
+
+export enum InvoiceStatus {
+  DRAFT = 'draft',
+  ACTIVE = 'active',
+  PARTIALLY_PAID = 'partially_paid',
+  PAID = 'paid',
+  OVERPAID = 'overpaid',
+  EXPIRED = 'expired',
+  CANCELLED = 'cancelled',
+  REACTIVATED = 'reactivated',
 }
 
 // Transaction Types

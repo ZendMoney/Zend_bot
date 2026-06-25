@@ -40,6 +40,9 @@ export const users = pgTable('users', {
   // Onboarding
   onboardingComplete: boolean('onboarding_complete').default(false).notNull(),
 
+  // Personal vs Business mode (unified bot)
+  defaultMode: varchar('default_mode', { length: 20 }).default('personal').notNull(),
+
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
@@ -281,4 +284,166 @@ export const pushNotifications = pgTable('push_notifications', {
   recipientCount: integer('recipient_count').default(0),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   sentAt: timestamp('sent_at', { withTimezone: true }),
+});
+
+// ─── Zend Business ───
+
+export const businesses = pgTable('businesses', {
+  id: serial('id').primaryKey(),
+  userId: varchar('user_id', { length: 50 }).notNull().unique().references((): any => users.id),
+  name: varchar('name', { length: 200 }),
+  email: varchar('email', { length: 255 }),
+  phone: varchar('phone', { length: 30 }),
+  logoUrl: text('logo_url'),
+  bankCode: varchar('bank_code', { length: 10 }),
+  bankName: varchar('bank_name', { length: 100 }),
+  accountNumber: varchar('account_number', { length: 20 }),
+  accountName: varchar('account_name', { length: 100 }),
+  usdcWalletAddress: varchar('usdc_wallet_address', { length: 100 }),
+  invoicePrefix: varchar('invoice_prefix', { length: 10 }).default('INV-').notNull(),
+  onboardingComplete: boolean('onboarding_complete').default(false).notNull(),
+  invoiceQuotaRemaining: integer('invoice_quota_remaining').default(3).notNull(),
+  subscriptionPlan: varchar('subscription_plan', { length: 20 }).default('starter').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const businessWallets = pgTable('business_wallets', {
+  businessId: integer('business_id').primaryKey().references((): any => businesses.id),
+  ngnBalance: decimal('ngn_balance', { precision: 20, scale: 2 }).default('0').notNull(),
+  usdcBalance: decimal('usdc_balance', { precision: 20, scale: 9 }).default('0').notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const businessSessions = pgTable('business_sessions', {
+  userId: varchar('user_id', { length: 50 }).primaryKey().references((): any => users.id),
+  activeMode: varchar('active_mode', { length: 20 }).default('personal').notNull(),
+  currentFlow: varchar('current_flow', { length: 50 }),
+  currentStep: varchar('current_step', { length: 50 }),
+  flowData: jsonb('flow_data').default({}).notNull(),
+  returnToFlow: varchar('return_to_flow', { length: 50 }),
+  returnToStep: varchar('return_to_step', { length: 50 }),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const businessClients = pgTable('business_clients', {
+  id: serial('id').primaryKey(),
+  businessId: integer('business_id').notNull().references((): any => businesses.id),
+  name: varchar('name', { length: 200 }).notNull(),
+  email: varchar('email', { length: 255 }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const invoices = pgTable('invoices', {
+  id: varchar('id', { length: 20 }).primaryKey(),
+  businessId: integer('business_id').notNull().references((): any => businesses.id),
+  clientId: integer('client_id').references((): any => businessClients.id),
+  status: varchar('status', { length: 20 }).notNull().default('draft'),
+  subtotalNgn: decimal('subtotal_ngn', { precision: 20, scale: 2 }).notNull().default('0'),
+  vatNgn: decimal('vat_ngn', { precision: 20, scale: 2 }).default('0').notNull(),
+  totalNgn: decimal('total_ngn', { precision: 20, scale: 2 }).notNull().default('0'),
+  paymentThresholdNgn: decimal('payment_threshold_ngn', { precision: 20, scale: 2 }),
+  amountReceivedNgn: decimal('amount_received_ngn', { precision: 20, scale: 2 }).default('0').notNull(),
+  overpaymentRule: varchar('overpayment_rule', { length: 30 }),
+  paymentMethod: varchar('payment_method', { length: 20 }),
+  settlementPreference: varchar('settlement_preference', { length: 30 }),
+  recurringInterval: varchar('recurring_interval', { length: 20 }),
+  expiresAt: timestamp('expires_at', { withTimezone: true }),
+  generationFeeNgn: decimal('generation_fee_ngn', { precision: 20, scale: 2 }),
+  settlementFeeBps: integer('settlement_fee_bps'),
+  imageUrl: text('image_url'),
+  pdfUrl: text('pdf_url'),
+  metadata: jsonb('metadata'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  paidAt: timestamp('paid_at', { withTimezone: true }),
+});
+
+export const invoiceLineItems = pgTable('invoice_line_items', {
+  id: serial('id').primaryKey(),
+  invoiceId: varchar('invoice_id', { length: 20 }).notNull().references((): any => invoices.id),
+  name: varchar('name', { length: 200 }).notNull(),
+  amountNgn: decimal('amount_ngn', { precision: 20, scale: 2 }).notNull(),
+  sortOrder: integer('sort_order').default(0).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const invoicePaymentRails = pgTable('invoice_payment_rails', {
+  invoiceId: varchar('invoice_id', { length: 20 }).primaryKey().references((): any => invoices.id),
+  fwVirtualAccount: jsonb('fw_virtual_account'),
+  cryptoDepositAddresses: jsonb('crypto_deposit_addresses'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const invoicePayments = pgTable('invoice_payments', {
+  id: serial('id').primaryKey(),
+  invoiceId: varchar('invoice_id', { length: 20 }).notNull().references((): any => invoices.id),
+  amountNgn: decimal('amount_ngn', { precision: 20, scale: 2 }).notNull(),
+  source: varchar('source', { length: 20 }).notNull(),
+  webhookId: varchar('webhook_id', { length: 100 }),
+  metadata: jsonb('metadata'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const invoiceReminders = pgTable('invoice_reminders', {
+  id: serial('id').primaryKey(),
+  invoiceId: varchar('invoice_id', { length: 20 }).notNull().references((): any => invoices.id),
+  type: varchar('type', { length: 20 }).notNull(),
+  sentAt: timestamp('sent_at', { withTimezone: true }).defaultNow().notNull(),
+  feeNgn: decimal('fee_ngn', { precision: 20, scale: 2 }).default('0'),
+  customMessage: text('custom_message'),
+});
+
+export const businessFeeLedger = pgTable('business_fee_ledger', {
+  id: serial('id').primaryKey(),
+  businessId: integer('business_id').notNull().references((): any => businesses.id),
+  invoiceId: varchar('invoice_id', { length: 20 }).references((): any => invoices.id),
+  feeType: varchar('fee_type', { length: 30 }).notNull(),
+  amountNgn: decimal('amount_ngn', { precision: 20, scale: 2 }).notNull(),
+  status: varchar('status', { length: 20 }).notNull().default('pending'),
+  metadata: jsonb('metadata'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const businessSubscriptions = pgTable('business_subscriptions', {
+  id: serial('id').primaryKey(),
+  businessId: integer('business_id').notNull().references((): any => businesses.id),
+  plan: varchar('plan', { length: 20 }).notNull(),
+  amountNgn: decimal('amount_ngn', { precision: 20, scale: 2 }).notNull(),
+  startsAt: timestamp('starts_at', { withTimezone: true }).notNull(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  status: varchar('status', { length: 20 }).notNull().default('active'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const invoiceBundleCredits = pgTable('invoice_bundle_credits', {
+  id: serial('id').primaryKey(),
+  businessId: integer('business_id').notNull().references((): any => businesses.id),
+  bundleSize: integer('bundle_size').notNull(),
+  remainingCount: integer('remaining_count').notNull(),
+  purchasedAt: timestamp('purchased_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const invoiceTemplates = pgTable('invoice_templates', {
+  id: serial('id').primaryKey(),
+  businessId: integer('business_id').notNull().references((): any => businesses.id),
+  clientId: integer('client_id').references((): any => businessClients.id),
+  name: varchar('name', { length: 200 }).notNull(),
+  lineItems: jsonb('line_items').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const businessDisputes = pgTable('business_disputes', {
+  id: serial('id').primaryKey(),
+  invoiceId: varchar('invoice_id', { length: 20 }).notNull().references((): any => invoices.id),
+  businessId: integer('business_id').notNull().references((): any => businesses.id),
+  disputeType: varchar('dispute_type', { length: 50 }).notNull(),
+  submittedAt: timestamp('submitted_at', { withTimezone: true }).defaultNow().notNull(),
+  autoResolutionAttempted: boolean('auto_resolution_attempted').default(false).notNull(),
+  resolutionStatus: varchar('resolution_status', { length: 20 }).notNull().default('open'),
+  supportAgentId: varchar('support_agent_id', { length: 50 }),
+  metadata: jsonb('metadata'),
 });

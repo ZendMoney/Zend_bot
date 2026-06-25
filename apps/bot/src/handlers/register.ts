@@ -21,11 +21,13 @@ import { registerScheduleHandlers } from './schedule/index.js';
 import { registerBridgeHandlers } from './bridge.js';
 import { registerWithdrawHandlers } from './withdraw.js';
 import { registerTextRouter } from './text/router.js';
+import { registerBusinessHandlers } from './business/register.js';
 
 /** Handlers that must register before the text router (keyboard pass-through). */
 export function registerPreTextHandlers(ctx: HandlerContext): void {
   registerBalanceHandlers(ctx);
   registerStartHandlers(ctx);
+  registerBusinessHandlers(ctx);
   registerMyrefHandlers(ctx);
   registerAdminPanelHandlers(ctx);
   registerAdminPushHandlers(ctx);

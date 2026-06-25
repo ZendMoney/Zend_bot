@@ -1,4 +1,5 @@
 import { Markup } from 'telegraf';
+import { BUSINESS_REPLY_KEYBOARD_BUTTONS } from './business.js';
 
 export const mainMenu = Markup.keyboard([
   ['💰 Balance', '📤 Send', '🔄 Swap'],
@@ -40,4 +41,6 @@ export const REPLY_KEYBOARD_BUTTONS = new Set([
   '📊 Stats', '👤 Users', '💸 Transactions', '🏦 Bank Accounts', '📅 Scheduled', '🤖 QVAC Status',
   // Shared
   '🔙 Back to Menu',
+  // Business menu
+  ...BUSINESS_REPLY_KEYBOARD_BUTTONS,
 ]);

@@ -60,6 +60,10 @@ import { AUDD_ENABLED } from '../../utils/flags.js';
 import { ZEND_FEE_FUNDED_BPS } from '../../utils/fees.js';
 import { SOLANA_ORIGIN_ASSETS } from '../../services/near-intents-flow.js';
 import { startOnboarding } from '../start.js';
+import { tryHandleBusinessText } from '../business/register.js';
+import { resolveActiveMode } from '../../services/business/mode.js';
+import { businessMainMenu } from '../../keyboards/business.js';
+import type { ZendContext } from '../../session/types.js';
 import { executeSend } from '../send.js';
 import { handleSwapAmount } from '../swap.js';
 import { executeSwap } from '../../services/swap.js';
@@ -109,14 +113,19 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
   const text = ctx.message.text;
   const session = getSession(userId);
 
+  if (await tryHandleBusinessText(ctx as ZendContext, userId, text)) {
+    return;
+  }
+
   // ─── Pass reply-keyboard buttons to bot.hears() handlers ───
   if (REPLY_KEYBOARD_BUTTONS.has(text)) {
     return next();
   }
 
-  // ─── Onboarding gate ───
+  // ─── Onboarding gate (personal mode only) ───
+  const activeMode = await resolveActiveMode(userId);
   const isOnboardingState = session.state.startsWith('onboarding_');
-  if (!isOnboardingState) {
+  if (!isOnboardingState && activeMode === 'personal') {
     const userRow = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     if (userRow.length > 0 && !userRow[0].onboardingComplete) {
       await ctx.reply(
@@ -137,7 +146,8 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
   // Cancel
   if (text === '❌ Cancel') {
     setSession(userId, { state: ConversationState.IDLE });
-    await ctx.reply('Cancelled.', mainMenu);
+    const cancelMenu = activeMode === 'business' ? businessMainMenu : mainMenu;
+    await ctx.reply('Cancelled.', cancelMenu);
     return;
   }
 

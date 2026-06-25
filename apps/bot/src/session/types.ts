@@ -1,8 +1,10 @@
 import type { Context } from 'telegraf';
-import { ConversationState } from '@zend/shared';
+import { ConversationState, type ZendMode } from '@zend/shared';
 
 export interface ZendSession {
   state: ConversationState;
+  activeMode?: ZendMode;
+  pendingStartPayload?: string;
   pendingTransaction?: Partial<{
     amountNgn: number;
     amountUsdt: number;

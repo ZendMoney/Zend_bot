@@ -79,8 +79,10 @@ export function getSession(userId: string): ZendSession {
   return sess;
 }
 
-export function setSession(userId: string, session: ZendSession): void {
-  const stored: StoredSession = { ...session, _lastAccessed: Date.now() };
+export function setSession(userId: string, patch: Partial<ZendSession>): void {
+  const existing = memory.get(userId);
+  const base: ZendSession = existing ?? { state: ConversationState.IDLE };
+  const stored: StoredSession = { ...base, ...patch, _lastAccessed: Date.now() };
   memory.set(userId, stored);
   persistToRedis(userId, stored);
 }
