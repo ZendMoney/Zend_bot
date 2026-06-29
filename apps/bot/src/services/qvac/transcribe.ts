@@ -48,7 +48,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 export async function transcribeWithQVAC(audioBuffer: Buffer): Promise<string> {
   const modelId = await getWhisperModelId();
   if (!modelId) {
-    throw new Error('QVAC Whisper model not loaded. Run initQVAC() first.');
+    throw new Error('QVAC Whisper model not available. Check QVAC_ENABLED and model cache.');
   }
 
   let oggPath: string | undefined;

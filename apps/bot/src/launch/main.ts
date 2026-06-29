@@ -28,8 +28,7 @@ export async function run(): Promise<void> {
   try {
     await initQVAC();
     const qvacStatus = getQVACStatus();
-    console.log('🧠 QVAC AI stack initialized');
-    console.log('   Models:', JSON.stringify(qvacStatus.models));
+    console.log('🧠 QVAC ready (lazy:', qvacStatus.lazyMode + ', in RAM:', qvacStatus.loadedCount + '/' + qvacStatus.maxLoadedModels + ')');
   } catch (err: any) {
     console.warn('⚠️  QVAC init failed:', err.message);
   }

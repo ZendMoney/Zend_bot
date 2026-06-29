@@ -14,6 +14,7 @@ interface EmbeddedDoc {
 
 // In-memory vector store per user (replace with DB in production)
 const userVectorStores = new Map<string, EmbeddedDoc[]>();
+const MAX_DOCS_PER_USER = 200;
 
 /**
  * Compute cosine similarity between two vectors.
@@ -63,6 +64,9 @@ export async function indexTransaction(
 
   const store = userVectorStores.get(userId) || [];
   store.push({ id: txId, text: description, embedding, metadata });
+  if (store.length > MAX_DOCS_PER_USER) {
+    store.splice(0, store.length - MAX_DOCS_PER_USER);
+  }
   userVectorStores.set(userId, store);
 }
 

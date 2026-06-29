@@ -135,7 +135,9 @@ b.hears('🤖 QVAC Status', async (ctx) => {
     .join('\n');
   await ctx.reply(
     `🤖 *QVAC AI Stack*\n\n` +
-    `Ready: ${status.ready ? '✅' : '❌'}\n\n` +
+    `Enabled: ${status.enabled ? '✅' : '❌'}\n` +
+    `Mode: ${status.lazyMode ? 'lazy (on-demand)' : 'preloaded'}\n` +
+    `In RAM: ${status.loadedCount}/${status.maxLoadedModels}\n\n` +
     `${statusLines}\n\n` +
     `${status.errors.length ? 'Errors:\n' + status.errors.join('\n') : 'No errors.'}`,
     { parse_mode: 'Markdown', ...adminMenu }

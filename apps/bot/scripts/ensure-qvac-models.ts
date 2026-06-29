@@ -24,7 +24,7 @@ const MODELS = [
     name: USE_LIGHT ? 'LLM (Llama 3.2 1B)' : 'LLM (Qwen3 4B)',
     descriptor: USE_LIGHT ? registry.LLAMA_3_2_1B_INST_Q4_0 : registry.QWEN3_4B_INST_Q4_K_M,
     type: 'llamacpp-completion',
-    config: { ctx_size: 4096, temp: 0.7 },
+    config: { ctx_size: 2048, temp: 0.7 },
   },
   {
     name: 'Whisper (Tiny)',

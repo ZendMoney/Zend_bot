@@ -45,6 +45,9 @@ ENV QVAC_MODEL_DIR=/data/qvac
 ENV QVAC_CONFIG_PATH=/app/qvac.config.mjs
 ENV QVAC_USE_LIGHT_MODELS=true
 ENV QVAC_DOWNLOAD_ON_START=true
+# Keep one model in RAM at a time; unload after 5m idle (saves Railway memory)
+ENV QVAC_MAX_LOADED_MODELS=1
+ENV QVAC_IDLE_UNLOAD_MS=300000
 ENV NODE_ENV=production
 
 # Start: migrate → download models once to volume → run bot
