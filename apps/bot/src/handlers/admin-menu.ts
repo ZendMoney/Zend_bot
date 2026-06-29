@@ -4,6 +4,7 @@ import { adminMenu, mainMenu } from '../keyboards/index.js';
 import { escapeTelegramMarkdown } from '../lib/telegram.js';
 import { getAdminStats, isSuperAdmin, isAdminUser } from '../services/admin.js';
 import { getQVACStatus } from '../services/qvac/index.js';
+import { getPublicBaseUrl } from '../deps.js';
 import type { ZendContext } from '../session/types.js';
 import type { HandlerContext } from './types.js';
 
@@ -125,6 +126,31 @@ b.hears('📅 Scheduled', async (ctx) => {
     console.error('[Admin] Scheduled error:', err);
     await ctx.reply('❌ Could not fetch scheduled transfers.', adminMenu);
   }
+});
+
+b.hears('📡 System API', async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const base = getPublicBaseUrl();
+  const secret = process.env.ADMIN_MONITOR_SECRET?.trim();
+  if (!base || !secret) {
+    await ctx.reply(
+      '❌ System monitor not configured.\n\n' +
+        'Set `WEBHOOK_BASE_URL` (or Railway public domain) and `ADMIN_MONITOR_SECRET` on the server.',
+      { parse_mode: 'Markdown', ...adminMenu },
+    );
+    return;
+  }
+  const snapshotUrl = `${base}/api/system/snapshot?key=${secret}`;
+  const pingUrl = `${base}/api/system/ping?key=${secret}`;
+  await ctx.reply(
+    `📡 *System Monitor API*\n\n` +
+      `*For AI analysis* — paste this URL into ChatGPT/Claude:\n` +
+      `\`${snapshotUrl}\`\n\n` +
+      `*Fast health check:*\n\`${pingUrl}\`\n\n` +
+      `*Public manifest:* ${base}/api/system\n\n` +
+      `_Keep the key secret. Rotate ADMIN_MONITOR_SECRET if leaked._`,
+    { parse_mode: 'Markdown', ...adminMenu },
+  );
 });
 
 b.hears('🤖 QVAC Status', async (ctx) => {

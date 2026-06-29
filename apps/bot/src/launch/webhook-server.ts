@@ -18,6 +18,7 @@ import {
   isDuplicateWebhook,
   markWebhookProcessed,
 } from '../utils/paj-webhook.js';
+import { handleMonitorRoutes } from './monitor-routes.js';
 
 export function startWebhookServer(botInstance: Telegraf<any>): Server {
   const port = parseInt(process.env.PORT || process.env.WEBHOOK_PORT || '3001');
@@ -38,10 +39,16 @@ export function startWebhookServer(botInstance: Telegraf<any>): Server {
     }
 
     // Health check
-    if (url === '/health' && method === 'GET') {
+    if (url.split('?')[0] === '/health' && method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'ok', time: new Date().toISOString() }));
       return;
+    }
+
+    // System monitor API (admin + AI diagnostics)
+    if (url.startsWith('/api/system') && method === 'GET') {
+      const handled = await handleMonitorRoutes(req, res);
+      if (handled) return;
     }
 
     // PAJ Webhooks
@@ -524,6 +531,12 @@ export function startWebhookServer(botInstance: Telegraf<any>): Server {
       console.log(`   Telegram webhook URL: ${publicBase}/webhook/telegram`);
       console.log(`   Ambassador API: ${publicBase}/api/ambassador`);
       console.log(`   Device Suspend API: ${publicBase}/api/device-suspend`);
+      console.log(`   System monitor: ${publicBase}/api/system`);
+      if (process.env.ADMIN_MONITOR_SECRET) {
+        console.log(`   AI snapshot: ${publicBase}/api/system/snapshot?key=<secret>`);
+      } else {
+        console.warn('⚠️  ADMIN_MONITOR_SECRET not set — system monitor snapshot disabled');
+      }
     } else {
       console.warn('⚠️  No public URL configured — external webhooks (PAJ/AirBills/NEAR) will NOT reach this server');
       console.warn('   Set WEBHOOK_BASE_URL or expose the Railway service to set RAILWAY_PUBLIC_DOMAIN');

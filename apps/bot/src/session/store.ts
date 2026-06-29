@@ -95,3 +95,17 @@ export function evictStaleSessions(): void {
     }
   }
 }
+
+export function getSessionStoreStats(): {
+  backend: 'redis' | 'memory';
+  inMemorySessions: number;
+  maxSessions: number;
+  ttlMinutes: number;
+} {
+  return {
+    backend: redisReady ? 'redis' : 'memory',
+    inMemorySessions: memory.size,
+    maxSessions: MAX_SESSIONS,
+    ttlMinutes: SESSION_TTL_MS / 60_000,
+  };
+}

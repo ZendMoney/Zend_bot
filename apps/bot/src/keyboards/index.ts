@@ -23,7 +23,7 @@ export const adminMenu = Markup.keyboard([
   ['📊 Stats', '👤 Users'],
   ['💸 Transactions', '🏦 Bank Accounts'],
   ['📅 Scheduled', '🤖 QVAC Status'],
-  ['🔙 Back to Menu'],
+  ['📡 System API', '🔙 Back to Menu'],
 ]).resize();
 
 /**
@@ -38,7 +38,7 @@ export const REPLY_KEYBOARD_BUTTONS = new Set([
   // Bills submenu
   '📱 Airtime', '🌐 Data', '⚡ Electricity', '📺 Cable TV',
   // Admin submenu
-  '📊 Stats', '👤 Users', '💸 Transactions', '🏦 Bank Accounts', '📅 Scheduled', '🤖 QVAC Status',
+  '📊 Stats', '👤 Users', '💸 Transactions', '🏦 Bank Accounts', '📅 Scheduled', '🤖 QVAC Status', '📡 System API',
   // Shared
   '🔙 Back to Menu',
   // Business menu
