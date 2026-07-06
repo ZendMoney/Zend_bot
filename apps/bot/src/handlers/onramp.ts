@@ -21,11 +21,17 @@ export async function showVirtualAccount(
   ctx: ZendContext,
   userId: string,
   sessionToken: string,
-  amount?: number,
+  amount: number,
   rate?: number,
   fee?: number,
   targetToken: 'USDT' | 'AUDD' = 'USDT'
 ): Promise<void> {
+  if (!amount || amount < PAJ_MIN_DEPOSIT_NGN || amount > PAJ_MAX_DEPOSIT_NGN) {
+    if (targetToken === 'AUDD') await startAddAudd(ctx, userId);
+    else await startAddNaira(ctx, userId);
+    return;
+  }
+
   const pajClient = await getPAJClient();
   if (!pajClient) {
     await ctx.reply('❌ PAJ service unavailable.', mainMenu);
@@ -39,7 +45,7 @@ export async function showVirtualAccount(
   }
   const walletAddress = user[0].walletAddress;
 
-  const fiatAmount = amount && amount >= PAJ_MIN_DEPOSIT_NGN && amount <= PAJ_MAX_DEPOSIT_NGN ? amount : PAJ_MIN_DEPOSIT_NGN;
+  const fiatAmount = amount;
 
   let _rate = rate || 1550;
   let _fee = fee || 0;
@@ -121,12 +127,11 @@ export async function showVirtualAccount(
   const displayFee = order?.fee || _fee;
   const displayReceive = order?.amount || usdtAmount;
 
-  const isExactAmount = amount && amount >= PAJ_MIN_DEPOSIT_NGN;
   const menuTitle = targetToken === 'AUDD' ? '🇦🇺 Add AUDD' : '💵 Add Naira';
   await finishLoading(ctx, loadingVA.message_id,
     `${menuTitle}\n\n` +
     `*Deposit Details:*\n` +
-    (isExactAmount ? `Amount: ${formatNgn(fiatAmount)}\n` : `Minimum: ${formatNgn(PAJ_MIN_DEPOSIT_NGN)}\n`) +
+    `Amount: ${formatNgn(fiatAmount)}\n` +
     `Rate: ₦${displayRate.toLocaleString()}/USD\n` +
     `Fee: ${formatNgn(displayFee)}\n` +
     `You receive: ~${Number(displayReceive).toFixed(2)} ${receiveLabel}\n\n` +
@@ -149,7 +154,7 @@ export async function startAddNaira(ctx: ZendContext, userId: string) {
     return;
   }
 
-  setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampTargetToken: 'USDT' });
+  setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampTargetToken: 'USDT', onrampAmount: undefined });
 
   await ctx.reply(
     `💵 *Add Naira*\n\n` +
@@ -169,7 +174,7 @@ export async function startAddAudd(ctx: ZendContext, userId: string) {
     return;
   }
 
-  setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampTargetToken: 'AUDD' });
+  setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampTargetToken: 'AUDD', onrampAmount: undefined });
 
   await ctx.reply(
     `🇦🇺 *Add AUDD*\n\n` +

@@ -446,13 +446,14 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
     const totalNgn = amount + feeNgn;
 
     // Store amount and check PAJ auth
+    const targetToken = session.onrampTargetToken || 'USDT';
     session.onrampAmount = amount;
+    session.onrampTargetToken = targetToken;
     const user = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     const hasPajSession = user[0]?.pajSessionToken && user[0]?.pajSessionExpiresAt && new Date(user[0].pajSessionExpiresAt) > new Date();
 
     if (hasPajSession && user[0]) {
       // Already authenticated — create order and show VA
-      const targetToken = session.onrampTargetToken || 'USDT';
       setSession(userId, { state: ConversationState.IDLE, onrampAmount: amount, onrampTargetToken: targetToken });
       await showVirtualAccount(ctx, userId, user[0].pajSessionToken!, amount, rate, feeNgn, targetToken);
       return;
@@ -460,6 +461,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
 
     // Need PAJ auth — proceed to email/phone
     session.state = ConversationState.AWAITING_EMAIL;
+    session.onrampTargetToken = targetToken;
     setSession(userId, session);
 
     await ctx.reply(
@@ -980,11 +982,10 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
         { parse_mode: 'Markdown' }
       );
 
-      // Now show virtual account (with pending amount if any)
+      // Continue on-ramp only if user already entered a deposit amount
       const onrampAmount = session.onrampAmount;
       const targetToken = session.onrampTargetToken || 'USDT';
-      if (onrampAmount) {
-        // Get rate for the pending amount
+      if (onrampAmount && onrampAmount >= PAJ_MIN_DEPOSIT_NGN && onrampAmount <= PAJ_MAX_DEPOSIT_NGN) {
         let rate = 1550;
         let fee = 0;
         try {
@@ -995,8 +996,18 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
           console.log('Using fallback rate for on-ramp after verify');
         }
         await showVirtualAccount(ctx, userId, verified.token, onrampAmount, rate, fee, targetToken);
-      } else {
-        await showVirtualAccount(ctx, userId, verified.token, undefined, undefined, undefined, targetToken);
+      } else if (session.onrampTargetToken) {
+        setSession(userId, {
+          state: ConversationState.AWAITING_ONRAMP_AMOUNT,
+          onrampTargetToken: targetToken,
+          onrampAmount: undefined,
+        });
+        await ctx.reply(
+          `💵 *How much do you want to deposit?*\n\n` +
+          `Minimum: ${formatNgn(PAJ_MIN_DEPOSIT_NGN)}\n\n` +
+          `Enter the amount (numbers only):`,
+          { parse_mode: 'Markdown', ...cancelKeyboard }
+        );
       }
     } catch (err: any) {
       console.error('[PAJ] Verify failed:', err);
@@ -1716,7 +1727,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
             : `How much NGN do you want to add? (Minimum ₦1,000)`),
           { parse_mode: 'Markdown', ...cancelKeyboard }
         );
-        setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampAmount: parsed.amount });
+        setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampAmount: parsed.amount, onrampTargetToken: 'USDT' });
         return;
       }
 

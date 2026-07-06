@@ -38,7 +38,7 @@ async function executeVoiceCommand(ctx: ZendContext, userId: string, cmd: Parsed
         await ctx.reply(`❌ Amount too large.\nMaximum deposit is ${formatNgn(PAJ_MAX_DEPOSIT_NGN)}.`, mainMenu);
         return;
       }
-      setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampAmount: cmd.amount || undefined });
+      setSession(userId, { state: ConversationState.AWAITING_ONRAMP_AMOUNT, onrampAmount: cmd.amount || undefined, onrampTargetToken: 'USDT' });
       await ctx.reply(
         `💵 *Add Naira*\n\n` +
         (cmd.amount && cmd.amount >= PAJ_MIN_DEPOSIT_NGN
