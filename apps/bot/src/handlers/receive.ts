@@ -2,7 +2,9 @@ import { Markup } from 'telegraf';
 import { db, users } from '@zend/db';
 import { eq } from 'drizzle-orm';
 import { mainMenu } from '../keyboards/index.js';
+import { formatNgn } from '../lib/format.js';
 import { AUDD_ENABLED } from '../utils/flags.js';
+import { startAddNaira } from './onramp.js';
 import type { ZendContext } from '../session/types.js';
 import type { HandlerContext } from './types.js';
 
@@ -28,9 +30,13 @@ export async function showReceive(ctx: ZendContext, userId: string) {
   if (hasVA) {
     msg += `*🇳🇬 Naira (Bank Transfer)*\n`;
     msg += `Send NGN to your virtual account:\n\n`;
+    if (virtualAccount.amount) {
+      msg += `💰 *Amount for this account:* ${formatNgn(Number(virtualAccount.amount))}\n\n`;
+    }
     msg += `🏦 *Bank:* ${virtualAccount.bankName || 'ZendPay Bank'}\n`;
     msg += `👤 *Name:* ${virtualAccount.accountName || user[0].firstName + ' ' + (user[0].lastName || '')}\n`;
     msg += `🔢 *Number:* \`${virtualAccount.accountNumber}\`\n\n`;
+    msg += `Need a different amount? Tap *Add Different Naira Amount* below.\n\n`;
   } else {
     msg += `*🇳🇬 Naira (Bank Transfer)*\n`;
     msg += `You don't have a virtual account yet.\n`;
@@ -47,6 +53,7 @@ export async function showReceive(ctx: ZendContext, userId: string) {
   kbRows.push([{ text: '📋 Copy Crypto Address', copy_text: { text: walletAddress } } as any]);
   if (hasVA) {
     kbRows.push([{ text: '📋 Copy Account Number', copy_text: { text: virtualAccount.accountNumber } } as any]);
+    kbRows.push([Markup.button.callback('💵 Add Different Naira Amount', 'receive_naira_amount')]);
   } else {
     kbRows.push([Markup.button.callback('💵 Add Naira', 'add_naira_start')]);
   }
@@ -64,5 +71,10 @@ export async function showReceive(ctx: ZendContext, userId: string) {
 export function registerReceiveHandlers({ bot: b }: HandlerContext): void {
   b.hears('📥 Receive', async (ctx) => {
     await showReceive(ctx, ctx.from.id.toString());
+  });
+
+  b.action('receive_naira_amount', async (ctx) => {
+    await ctx.answerCbQuery();
+    await startAddNaira(ctx, ctx.from!.id.toString());
   });
 }
