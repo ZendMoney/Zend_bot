@@ -13,9 +13,14 @@ import { generateTxId } from '../lib/ids.js';
 import { getAuddPriceInUsdt } from './pricing.js';
 import { indexTransaction } from './nlp.js';
 import { decryptPrivateKey } from '../utils/wallet.js';
-import { ensureUsdtBalance } from './stablecoin.js';
+import { ensureUsdtBalance, getStablecoinBalances } from './stablecoin.js';
 import { fundSolIfNeeded, gasFundingErrorToUserMessage, calculateSendFee } from './gas.js';
-import { calcZendFeeUsdt, ZEND_FEE_NORMAL_BPS, ZEND_FEE_NORMAL_CAP_USDT } from '../utils/fees.js';
+import {
+  calcZendFeeUsdt,
+  fitFeeToAvailableBalance,
+  ZEND_FEE_NORMAL_BPS,
+  ZEND_FEE_NORMAL_CAP_USDT,
+} from '../utils/fees.js';
 import {
   clearPajSession,
   getPajBankList,
@@ -108,6 +113,25 @@ export async function executeSendCore(
       const pajBank = bestMatch.bank;
       console.log(`[PAJ] Send bank matched: ${ourBank?.name} → ${pajBank.name} (score: ${bestMatch.score})`);
 
+      const feeWallet = process.env.ZEND_FEE_WALLET?.trim() || undefined;
+
+      // Pre-flight balance check BEFORE creating a PAJ order (avoids orphaned orders).
+      // Quote is approximate (rate may differ from final PAJ amount by a few cents).
+      if (userFromMint !== SOLANA_TOKENS.AUDD.mint) {
+        const preBalances = await getStablecoinBalances(user[0].walletAddress);
+        const preFee = await calculateSendFee(txData.amountUsdt, user[0].walletAddress, userId, {
+          assumeRecipientAta: true,
+        });
+        // Need at least the transfer amount; fee can flex slightly after PAJ quotes.
+        if (preBalances.total + 1e-9 < txData.amountUsdt) {
+          throw new Error(
+            `Insufficient Dollars. You need ~${(txData.amountUsdt + preFee.zendFeeUsdt).toFixed(2)} USDT ` +
+            `(incl. ~${preFee.zendFeeUsdt.toFixed(2)} fee) for this bank transfer ` +
+            `(you have ${preBalances.usdt.toFixed(2)} USDT + ${preBalances.usdc.toFixed(2)} USDC).`
+          );
+        }
+      }
+
       const webhookUrl = getPajWebhookUrl();
       const order = await pajClient.createOfframp({
         bank: pajBank.id,
@@ -123,12 +147,10 @@ export async function executeSendCore(
       console.log('[PAJ] Off-ramp order created:', order.id, 'deposit address:', order.address, 'amount:', order.amount);
 
       // Recompute fee based on the actual PAJ order amount and real recipient address
-      const feeWallet = process.env.ZEND_FEE_WALLET;
       const feeInfo = await calculateSendFee(order.amount, user[0].walletAddress, userId, {
         recipientAddress: order.address,
       });
       finalFeeUsdt = feeInfo.zendFeeUsdt;
-      const quotedTotalUsdt = order.amount + finalFeeUsdt;
 
       // Auto-swap AUDD → USDT via local pool (hidden from user)
       if (userFromMint === SOLANA_TOKENS.AUDD.mint) {
@@ -136,7 +158,8 @@ export async function executeSendCore(
         if (auddBalance <= 0) {
           throw new Error('No AUDD balance. Please deposit AUDD first.');
         }
-        const usdtNeeded = quotedTotalUsdt;
+        // Reserve enough for order + quoted fee (fee may be reduced slightly later)
+        const usdtNeeded = order.amount + finalFeeUsdt;
         const auddRate = await getAuddPriceInUsdt();
         const auddNeeded = usdtNeeded / auddRate;
         if (auddBalance < auddNeeded) {
@@ -173,11 +196,12 @@ export async function executeSendCore(
         });
       }
 
-      let tokenBalance = await ensureUsdtBalance(
+      // Ensure we hold enough USDT for the PAJ deposit first; fee fitted after.
+      await ensureUsdtBalance(
         userId,
         user[0].walletAddress,
         user[0].walletEncryptedKey,
-        quotedTotalUsdt,
+        order.amount,
         'bank transfer'
       );
 
@@ -186,7 +210,7 @@ export async function executeSendCore(
         user[0].walletAddress,
         order.address,
         pajMint,
-        feeWallet || undefined,
+        feeWallet,
         userId
       );
       if (shortfall && !funded) {
@@ -202,9 +226,27 @@ export async function executeSendCore(
           finalFeeUsdt = normalFee;
         }
       }
-      const totalUsdtNeeded = order.amount + finalFeeUsdt;
+
+      // Fit fee to actual USDT available so a 1–2¢ quote drift does not fail the whole send.
+      const usdtAvailable = await walletService.getTokenBalance(user[0].walletAddress, pajMint);
+      const fitted = fitFeeToAvailableBalance(order.amount, finalFeeUsdt, usdtAvailable);
+      if (!fitted.ok) {
+        throw new Error(
+          `Insufficient Dollars. You need ${order.amount.toFixed(2)} USDT for this bank transfer ` +
+          `(you have ${usdtAvailable.toFixed(2)} USDT).`
+        );
+      }
+      if (fitted.feeReduced) {
+        console.log(
+          `[Fees] Reduced fee ${finalFeeUsdt.toFixed(6)} → ${fitted.feeUsdt.toFixed(6)} USDT ` +
+          `to fit balance ${usdtAvailable.toFixed(6)} (order ${order.amount})`
+        );
+      }
+      finalFeeUsdt = fitted.feeUsdt;
+      const totalUsdtNeeded = fitted.totalUsdt;
 
       // Build USDT fee transfer instruction to bundle with main send
+      // Fees go to ZEND_FEE_WALLET (NOT the gas-sponsor dev wallet, unless they are the same address).
       const feeInstructions: any[] = [];
       if (feeWallet && finalFeeUsdt > 0) {
         const feeWalletPubkey = new PublicKey(feeWallet);
@@ -230,6 +272,11 @@ export async function executeSendCore(
             rawFeeAmount
           )
         );
+        console.log(`[Fees] Will collect ${finalFeeUsdt.toFixed(6)} USDT → fee wallet ${feeWallet}`);
+      } else if (!feeWallet) {
+        console.warn('[Fees] ZEND_FEE_WALLET unset — sending without on-chain fee transfer');
+      } else {
+        console.log('[Fees] Fee is 0 — no fee transfer instruction');
       }
 
       const secretKey = await decryptPrivateKey(user[0].walletEncryptedKey);
@@ -239,7 +286,12 @@ export async function executeSendCore(
         feeInstructions.length > 0 ? feeInstructions : undefined,
         totalUsdtNeeded
       );
-      console.log(`[Solana] ${userFromSymbol} sent to PAJ via USDT (+ USDT fee bundled):`, solanaTxHash);
+      console.log(
+        `[Solana] ${userFromSymbol} sent to PAJ via USDT` +
+        (finalFeeUsdt > 0 ? ` (+ ${finalFeeUsdt.toFixed(6)} USDT fee → ${feeWallet})` : ' (no fee)') +
+        `:`,
+        solanaTxHash
+      );
 
       await db.update(transactions)
         .set({

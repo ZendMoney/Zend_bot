@@ -4,6 +4,7 @@ import {
   calcRequiredSol,
   calcSponsoredSendFeeUsdt,
   calculateSendFee,
+  fitFeeToAvailableBalance,
   ZEND_FEE_NORMAL_BPS,
   ZEND_FEE_FUNDED_BPS,
   ZEND_GAS_EXTRA_FLAT_USDT,
@@ -69,5 +70,29 @@ describe('calculateSendFee', () => {
     expect(result.willFundSol).toBe(true);
     expect(result.feeMode).toBe('gas_recovery');
     expect(result.gasCostUsdt).toBeGreaterThan(0);
+  });
+});
+
+describe('fitFeeToAvailableBalance', () => {
+  it('keeps full fee when balance covers order + fee', () => {
+    const r = fitFeeToAvailableBalance(12.28, 0.1228, 20);
+    expect(r.ok).toBe(true);
+    expect(r.feeReduced).toBe(false);
+    expect(r.feeUsdt).toBeCloseTo(0.1228, 6);
+  });
+
+  it('reduces fee by a few cents when slightly short (prod 12.40 needed / 12.38 held)', () => {
+    // order 12.28 + fee 0.1228 = 12.4028; user has 12.38
+    const r = fitFeeToAvailableBalance(12.28, 0.1228, 12.38);
+    expect(r.ok).toBe(true);
+    expect(r.feeReduced).toBe(true);
+    expect(r.totalUsdt).toBeLessThanOrEqual(12.38);
+    expect(r.feeUsdt).toBeCloseTo(0.1, 4); // 12.38 - 12.28
+  });
+
+  it('fails when balance cannot cover PAJ order amount', () => {
+    const r = fitFeeToAvailableBalance(12.28, 0.12, 12.0);
+    expect(r.ok).toBe(false);
+    expect(r.shortfall).toBeCloseTo(0.28, 4);
   });
 });

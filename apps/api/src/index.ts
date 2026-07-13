@@ -36,8 +36,13 @@ async function notifyUser(userId: string, text: string) {
 app.get('/health', (c) => c.json({ status: 'ok', time: new Date().toISOString() }));
 
 app.post('/webhooks/paj', async (c) => {
-  const signature = c.req.header('x-paj-signature');
   const body = await c.req.text();
+  const signature =
+    c.req.header('x-paj-signature') ||
+    c.req.header('x-signature') ||
+    c.req.header('x-hub-signature-256') ||
+    c.req.header('signature') ||
+    null;
 
   if (!verifyPajWebhookSignature(body, signature)) {
     return c.json({ error: 'Unauthorized' }, 401);

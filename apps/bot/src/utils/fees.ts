@@ -180,3 +180,49 @@ export function validateFeeWallet(): string | null {
   }
   return wallet;
 }
+
+/**
+ * After PAJ quotes the exact USDT deposit, fit fee to the user's balance.
+ *
+ * - Must always cover `orderAmount` (what PAJ needs).
+ * - Fee may be reduced slightly if the user is a few cents short of order+full fee
+ *   (common when quote rate ≠ final PAJ amount).
+ * - Fails only when balance cannot cover the PAJ order itself.
+ */
+export function fitFeeToAvailableBalance(
+  orderAmountUsdt: number,
+  quotedFeeUsdt: number,
+  availableUsdt: number
+): {
+  feeUsdt: number;
+  totalUsdt: number;
+  ok: boolean;
+  feeReduced: boolean;
+  shortfall?: number;
+} {
+  const order = Math.max(0, orderAmountUsdt);
+  const quotedFee = Math.max(0, quotedFeeUsdt);
+  const available = Math.max(0, availableUsdt);
+
+  // 6-decimal USDT floor so on-chain amounts never exceed available balance
+  const floor6 = (n: number) => Math.floor(n * 1e6) / 1e6;
+
+  if (available + 1e-9 < order) {
+    return {
+      feeUsdt: 0,
+      totalUsdt: order,
+      ok: false,
+      feeReduced: false,
+      shortfall: order - available,
+    };
+  }
+
+  const maxFee = floor6(available - order);
+  const feeUsdt = floor6(Math.min(quotedFee, maxFee));
+  return {
+    feeUsdt,
+    totalUsdt: floor6(order + feeUsdt),
+    ok: true,
+    feeReduced: feeUsdt + 1e-9 < quotedFee,
+  };
+}

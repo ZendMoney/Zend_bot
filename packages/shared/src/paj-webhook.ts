@@ -26,6 +26,39 @@ export function markWebhookProcessed(key: string): void {
   processedEvents.set(key, Date.now());
 }
 
+/** Pull PAJ/HMAC signature from common header names providers use. */
+export function extractPajSignatureHeader(
+  headers: Record<string, string | string[] | undefined> | {
+    get?: (name: string) => string | null | undefined;
+  }
+): string | null {
+  const names = [
+    'x-paj-signature',
+    'x-signature',
+    'x-hub-signature-256',
+    'x-hub-signature',
+    'paj-signature',
+    'signature',
+  ];
+
+  const read = (name: string): string | undefined => {
+    if (typeof (headers as any).get === 'function') {
+      const v = (headers as { get: (n: string) => string | null | undefined }).get(name)
+        ?? (headers as { get: (n: string) => string | null | undefined }).get(name.toLowerCase());
+      return v ?? undefined;
+    }
+    const h = headers as Record<string, string | string[] | undefined>;
+    const v = h[name] ?? h[name.toLowerCase()];
+    return Array.isArray(v) ? v[0] : v;
+  };
+
+  for (const name of names) {
+    const v = read(name)?.trim();
+    if (v) return v;
+  }
+  return null;
+}
+
 export function verifyPajWebhookSignature(rawBody: string, signatureHeader?: string | null): boolean {
   const secret = process.env.PAJ_WEBHOOK_SECRET || process.env.PAJ_BUSINESS_API_KEY;
   if (!secret) {
@@ -33,7 +66,7 @@ export function verifyPajWebhookSignature(rawBody: string, signatureHeader?: str
     return process.env.NODE_ENV !== 'production';
   }
   if (!signatureHeader) {
-    console.warn('[PAJ Webhook] Missing x-paj-signature header');
+    console.warn('[PAJ Webhook] Missing signature header (tried x-paj-signature, x-signature, x-hub-signature-256, …)');
     return false;
   }
 
@@ -47,9 +80,10 @@ export function verifyPajWebhookSignature(rawBody: string, signatureHeader?: str
     `sha256=${expectedBase64}`,
   ];
 
+  const provided = signatureHeader.trim();
   for (const candidate of candidates) {
     try {
-      const a = Buffer.from(signatureHeader.trim());
+      const a = Buffer.from(provided);
       const b = Buffer.from(candidate);
       if (a.length === b.length && crypto.timingSafeEqual(a, b)) return true;
     } catch {
@@ -57,9 +91,9 @@ export function verifyPajWebhookSignature(rawBody: string, signatureHeader?: str
     }
   }
 
-  if (/^[a-f0-9]{64}$/i.test(signatureHeader.trim())) {
+  if (/^[a-f0-9]{64}$/i.test(provided)) {
     try {
-      const a = Buffer.from(signatureHeader.trim(), 'hex');
+      const a = Buffer.from(provided, 'hex');
       const b = Buffer.from(expectedHex, 'hex');
       if (a.length === b.length && crypto.timingSafeEqual(a, b)) return true;
     } catch {
@@ -67,6 +101,10 @@ export function verifyPajWebhookSignature(rawBody: string, signatureHeader?: str
     }
   }
 
+  console.warn(
+    `[PAJ Webhook] Signature mismatch (header present, length=${provided.length}). ` +
+    `Check PAJ_WEBHOOK_SECRET matches the secret configured in PAJ dashboard.`
+  );
   return false;
 }
 

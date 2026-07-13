@@ -64,8 +64,35 @@ export async function runStartupHealthChecks(deps: {
 
   report.feeWallet = validateFeeWallet();
   if (report.feeWallet) {
-    console.log('💰 Fee collection wallet:', report.feeWallet);
+    console.log('💰 Fee collection wallet (ZEND_FEE_WALLET):', report.feeWallet);
     console.log(`📐 Fee rates: ${ZEND_FEE_NORMAL_BPS / 100}% normal / max(${ZEND_FEE_FUNDED_BPS / 100}%, gas+$flat) when sponsored`);
+    console.log('   → Zend USDT fees are sent here on every bank send (bundled with PAJ transfer).');
+  }
+
+  // Gas sponsor (dev wallet) is separate from fee collection — warn if misconfigured/empty SOL
+  try {
+    const { checkDevWalletHealth } = await import('../services/gas.js');
+    const { DEV_WALLET_SECRET } = await import('../deps.js');
+    if (DEV_WALLET_SECRET) {
+      const { Keypair } = await import('@solana/web3.js');
+      const bs58 = (await import('bs58')).default;
+      const devPk = Keypair.fromSecretKey(bs58.decode(DEV_WALLET_SECRET)).publicKey.toBase58();
+      console.log('⛽ Gas sponsor wallet (ZEND_DEV_WALLET_SECRET):', devPk);
+      if (report.feeWallet && report.feeWallet === devPk) {
+        console.warn(
+          '⚠️  Fee wallet and gas-sponsor wallet are the SAME address. ' +
+          'Fees (USDT) still collect correctly, but gas sponsorship needs SOL in this wallet.'
+        );
+      }
+      const health = await checkDevWalletHealth();
+      if (health.level !== 'ok') {
+        console.warn(`⚠️  Gas sponsor SOL balance ${health.balance.toFixed(6)} (${health.level}) — top up SOL for sponsorship`);
+      }
+    } else {
+      console.warn('⚠️  ZEND_DEV_WALLET_SECRET not set — gas sponsorship disabled');
+    }
+  } catch (err: any) {
+    console.warn('⚠️  Could not check gas sponsor wallet:', err?.message || err);
   }
 
   if (deps.airbillsClient) {

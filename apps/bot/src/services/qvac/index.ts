@@ -38,7 +38,8 @@ const MAX_LOADED_MODELS = Math.max(
   1,
   parseInt(process.env.QVAC_MAX_LOADED_MODELS || '1', 10) || 1,
 );
-const IDLE_UNLOAD_MS = parseInt(process.env.QVAC_IDLE_UNLOAD_MS || '300000', 10) || 0;
+// Keep models warm longer by default (15m) — reload thrash was causing 90s Telegram timeouts
+const IDLE_UNLOAD_MS = parseInt(process.env.QVAC_IDLE_UNLOAD_MS || '900000', 10) || 0;
 const LLM_CTX_SIZE = USE_LIGHT_MODELS ? 2048 : 4096;
 
 export const MODELS = {

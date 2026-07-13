@@ -13,6 +13,7 @@ import { getAuddPriceInUsdt } from '../services/pricing.js';
 import { decryptPrivateKey } from '../utils/wallet.js';
 import {
   verifyPajWebhookSignature,
+  extractPajSignatureHeader,
   normalizePajWebhookEvent,
   webhookEventKey,
   isDuplicateWebhook,
@@ -57,9 +58,9 @@ export function startWebhookServer(botInstance: Telegraf<any>): Server {
       req.on('data', chunk => body += chunk);
       req.on('end', async () => {
         try {
-          const signature = req.headers['x-paj-signature'] as string | undefined;
+          const signature = extractPajSignatureHeader(req.headers as Record<string, string | string[] | undefined>);
           if (!verifyPajWebhookSignature(body, signature)) {
-            console.warn('[PAJ Webhook] Invalid signature');
+            // verifyPajWebhookSignature already logs missing/mismatch detail — avoid double noise
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'Unauthorized' }));
             return;

@@ -13,7 +13,9 @@ import { BOT_TOKEN } from './deps.js';
 import { isGroupChat } from './lib/group.js';
 
 export function createBot(): Telegraf<ZendContext> {
-  const bot = new Telegraf<ZendContext>(BOT_TOKEN);
+  // Default Telegraf handlerTimeout is 90s — NLP + QVAC model load often exceeds that.
+  const handlerTimeout = parseInt(process.env.BOT_HANDLER_TIMEOUT_MS || '180000', 10) || 180000;
+  const bot = new Telegraf<ZendContext>(BOT_TOKEN, { handlerTimeout });
 
   bot.use(rateLimitMiddleware);
   bot.use(sessionMiddleware);
