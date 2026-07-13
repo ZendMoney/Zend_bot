@@ -51,7 +51,13 @@ function persistToRedis(userId: string, sess: StoredSession): void {
 export async function hydrateSession(userId: string): Promise<void> {
   if (!redisReady || !redisClient || memory.has(userId)) return;
   try {
-    const raw = await redisClient.get(redisKey(userId));
+    // Bound Redis so a stuck connection cannot freeze one user's every message
+    const raw = await Promise.race([
+      redisClient.get(redisKey(userId)),
+      new Promise<null>((_, reject) =>
+        setTimeout(() => reject(new Error('Redis hydrate timeout')), 3000)
+      ),
+    ]);
     if (!raw) return;
     const parsed = JSON.parse(raw) as StoredSession;
     if (parsed.scheduleData?.startAt) {
@@ -60,7 +66,7 @@ export async function hydrateSession(userId: string): Promise<void> {
     parsed._lastAccessed = Date.now();
     memory.set(userId, parsed);
   } catch (err: any) {
-    console.warn('[Session] Redis read failed:', err.message);
+    console.warn(`[Session] Redis read failed user=${userId}:`, err.message);
   }
 }
 

@@ -65,7 +65,10 @@ export async function tryHandleBusinessText(ctx: ZendContext, userId: string, te
   const mode = await resolveActiveMode(userId);
   if (mode !== 'business') return false;
 
-  if (BUSINESS_REPLY_KEYBOARD_BUTTONS.has(text)) return true;
+  // Keyboard labels are handled by bot.hears() — must call next() from the text router, not swallow.
+  if (BUSINESS_REPLY_KEYBOARD_BUTTONS.has(text) || text === '⚙️ Settings') {
+    return false;
+  }
 
   return handleBusinessOnboardingText(ctx, userId, text);
 }

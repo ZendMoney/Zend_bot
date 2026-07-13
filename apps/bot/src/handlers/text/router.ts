@@ -117,7 +117,9 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
   }
 
   // ─── Pass reply-keyboard buttons to bot.hears() handlers ───
-  if (REPLY_KEYBOARD_BUTTONS.has(text)) {
+  // Include business keyboard labels so they are never swallowed in this router.
+  if (REPLY_KEYBOARD_BUTTONS.has(text) || text === '🧾 Generate Invoice' || text === '📋 My Invoices'
+    || text === '💰 My Balance' || text === '📊 Analytics') {
     return next();
   }
 
@@ -139,7 +141,9 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
 
   // ─── Ignore stateful flows in groups ───
   if (isGroupChat(ctx) && session.state !== ConversationState.IDLE) {
-    return; // silently ignore — user should continue in DM
+    console.log(`[Update] drop group stateful user=${userId} state=${session.state}`);
+    await ctx.reply('Please continue this in a private chat with me (open ZendPay DM).').catch(() => {});
+    return;
   }
 
   // Cancel
