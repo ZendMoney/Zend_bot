@@ -1,6 +1,6 @@
 /**
  * QVAC Service — Local-first AI for ZendPay Bot
- * Replaces all cloud AI (Kimi/Moonshot) with on-device inference.
+ * Local on-device inference via Tether QVAC (no cloud LLM providers).
  * Uses Tether's QVAC SDK: https://github.com/tetherto/qvac
  */
 

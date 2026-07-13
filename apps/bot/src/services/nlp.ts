@@ -6,7 +6,7 @@
  * 1. Local regex parser (fast, zero latency, works offline)
  * 2. QVAC local LLM fallback (private, no API cost, sovereign AI)
  *
- * Previously used Kimi (Moonshot) cloud API — now fully local via QVAC.
+ * Cloud LLM providers are not used — QVAC only.
  */
 
 import { NIGERIAN_BANKS } from '@zend/shared';
@@ -284,70 +284,6 @@ function extractFromToken(text: string): ParsedCommand['fromToken'] {
   return undefined;
 }
 
-// ─── Kimi Coding API ───
-
-const KIMI_API_KEY = process.env.KIMI_API_KEY || process.env.OPENAI_API_KEY;
-const KIMI_BASE_URL = process.env.KIMI_BASE_URL || 'https://api.kimi.com/coding';
-const KIMI_MODEL = process.env.KIMI_MODEL || 'kimi-for-coding';
-
-function getKimiBaseUrl(): string {
-  let url = KIMI_BASE_URL;
-  if (url.endsWith('/v1')) {
-    url = url.slice(0, -3);
-  }
-  return url.replace(/\/$/, '');
-}
-
-if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
-  console.warn('[NLP] ⚠️  KIMI_API_KEY not set — AI features disabled');
-}
-
-function getKimiResponse(data: any): string {
-  const text = data?.content?.[0]?.text;
-  if (text) return text;
-  return data?.choices?.[0]?.message?.content || '';
-}
-
-/**
- * Cloud Kimi is disabled by default. ZendPay production uses local QVAC only.
- * Set KIMI_ENABLED=true to re-enable (not recommended — membership/402 errors).
- */
-async function callKimi(systemPrompt: string, userPrompt: string, temperature: number, maxTokens: number): Promise<string | null> {
-  if (process.env.KIMI_ENABLED !== 'true') {
-    return null;
-  }
-  if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
-    return null;
-  }
-  try {
-    const response = await fetch(`${getKimiBaseUrl()}/v1/messages`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${KIMI_API_KEY}`,
-        'User-Agent': 'claude-code/0.1.0',
-      },
-      body: JSON.stringify({
-        model: KIMI_MODEL,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userPrompt }],
-        temperature,
-        max_tokens: maxTokens,
-      }),
-    });
-    if (!response.ok) {
-      const errText = await response.text().catch(() => '');
-      console.error(`[Kimi] API error ${response.status}: ${errText.slice(0, 200)}`);
-      return null;
-    }
-    const data: any = await response.json();
-    return getKimiResponse(data) || null;
-  } catch (err) {
-    console.error('[Kimi] API call failed:', err);
-    return null;
-  }
-}
-
 /**
  * Parse natural language command locally (fast, no API call)
  */
@@ -590,15 +526,7 @@ export interface ChatReply {
   suggestedAction?: string;
 }
 
-/**
- * Get a conversational reply from QVAC local LLM when the user's message is not a command.
- */
-
-/** @deprecated Use chatWithAI (QVAC). Kept as alias so old imports don't hit cloud Kimi. */
-export async function chatWithKimi(text: string, features?: BotFeature[]): Promise<ChatReply | null> {
-  return chatWithAI(text, features);
-}
-
+/** Conversational reply from QVAC local LLM when the message is not a structured command. */
 export async function chatWithAI(text: string, features?: BotFeature[]): Promise<ChatReply | null> {
   const systemPrompt = features?.length
     ? buildChatSystemPrompt(features)
@@ -780,9 +708,6 @@ export async function parseBulkSendWithAI(text: string): Promise<BulkRecipient[]
     return null;
   }
 }
-
-// Backward-compatible alias
-export { analyzeVoiceWithAI as analyzeVoiceWithKimi };
 
 // ─── Receipt OCR + LLM Parser ───
 

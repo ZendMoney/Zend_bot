@@ -1526,7 +1526,7 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
           parsed.accountNumber = sanitizeAccountNumber(parsed.accountNumber) || parsed.accountNumber;
         }
 
-        // Missing details → fast static prompts (no cloud AI / no Kimi)
+        // Missing details → fast static prompts (no LLM needed)
         if (!parsed.amount) {
           await ctx.reply('How much do you want to send? (in Naira)\nExample: 5000', cancelKeyboard);
           setSession(userId, { state: ConversationState.AWAITING_SEND_AMOUNT, pendingTransaction: { recipientName: parsed.recipientName } });
@@ -1799,7 +1799,6 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       default: {
         const features = await getBotFeatures();
         const loading = await showLoading(ctx, 'Thinking...');
-        // Local QVAC only — no cloud Kimi fallback
         const aiReply = await chatWithAI(text, features);
         if (aiReply?.reply) {
           await finishLoading(ctx, loading.message_id, aiReply.reply);

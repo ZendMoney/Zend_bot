@@ -1,6 +1,5 @@
 /**
- * QVAC LLM Wrapper
- * Replaces cloud-based Kimi/Moonshot API calls with local inference.
+ * QVAC LLM Wrapper — local on-device inference only.
  */
 
 import { completion, getLLMModelId } from './index.js';
@@ -23,7 +22,7 @@ export interface LLMOptions {
 }
 
 /**
- * Call the local QVAC LLM (replaces callKimi).
+ * Call the local QVAC LLM.
  * Returns the full text response, or null if the model isn't loaded or fails.
  */
 export async function callQVACLLM(options: LLMOptions): Promise<string | null> {
