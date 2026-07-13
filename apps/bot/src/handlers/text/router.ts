@@ -20,7 +20,8 @@ import {
 } from '../../services/nlp.js';
 import { getPAJClient, walletService, airbillsClient } from '../../deps.js';
 import { AirbillsClient, type AirbillsElectProvider } from '@zend/airbills-client';
-import { estimatePayableUsdt, getPaymentAssetSnapshot, getStablecoinBalances } from '../../services/stablecoin.js';
+import { estimatePayableUsdt, getPaymentAssetSnapshot, getStablecoinBalances, SOL_GAS_RESERVE } from '../../services/stablecoin.js';
+import { logWarn } from '../../lib/logger.js';
 import { getDataPlans, type DataPlan } from '../../services/bills/index.js';
 import { getDataPlansForNetwork, getCablePackagesForProvider } from '../../services/airbills/plans.js';
 import { mainMenu, cancelKeyboard, REPLY_KEYBOARD_BUTTONS } from '../../keyboards/index.js';
@@ -1620,9 +1621,26 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
         if (user[0]?.walletAddress) {
           const solBalance = await walletService.getSolBalance(user[0].walletAddress);
           if (isStableSend) {
-            const { payableUsdt, breakdown } = await estimatePayableUsdt(user[0].walletAddress);
+            const { payableUsdt, breakdown, notes } = await estimatePayableUsdt(user[0].walletAddress);
             if (payableUsdt + 1e-9 < usdtNeeded) {
               const snap = await getPaymentAssetSnapshot(user[0].walletAddress);
+              logWarn('Send', 'insufficient balance (NLP path)', {
+                userId,
+                need: usdtNeeded.toFixed(4),
+                payable: payableUsdt.toFixed(4),
+                short: (usdtNeeded - payableUsdt).toFixed(4),
+                usdt: snap.usdt,
+                usdc: snap.usdc,
+                sol: snap.sol,
+                notes: notes.join(' | ') || 'none',
+                raw: parsed.raw?.slice(0, 80),
+              });
+              const solNote =
+                snap.sol > 0 && snap.sol <= SOL_GAS_RESERVE
+                  ? `\n⚠️ Your *${snap.sol.toFixed(4)} SOL* is reserved for network fees (need >${SOL_GAS_RESERVE} SOL free to auto-swap SOL). It cannot cover this payment.\n`
+                  : notes.length
+                    ? `\n_${notes.join(' · ')}_\n`
+                    : '\n';
               await ctx.reply(
                 `❌ *Insufficient Balance*\n\n` +
                 `You want to send ${formatNgn(parsed.amount)}\n` +
@@ -1630,13 +1648,19 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
                 `Spendable after auto-convert: *~${payableUsdt.toFixed(2)} USDT*\n` +
                 `Short by: *~${(usdtNeeded - payableUsdt).toFixed(2)} USDT*\n\n` +
                 `• ${snap.usdt.toFixed(2)} USDT · ${snap.usdc.toFixed(2)} USDC\n` +
-                `• ${snap.audd.toFixed(2)} AUDD · ${snap.near.toFixed(4)} NEAR · ${snap.sol.toFixed(4)} SOL\n\n` +
-                `_We'll auto-swap other tokens → USDT when you pay._`,
+                `• ${snap.audd.toFixed(2)} AUDD · ${snap.near.toFixed(4)} NEAR · ${snap.sol.toFixed(4)} SOL` +
+                solNote +
+                `\nAdd ~${(usdtNeeded - payableUsdt).toFixed(2)} more USDT/USDC, or send a smaller amount.`,
                 { parse_mode: 'Markdown', ...mainMenu }
               );
               return;
             }
             if (!feeInfo.willFundSol && solBalance < MIN_SOL_FOR_GAS) {
+              logWarn('Send', 'insufficient SOL for gas (NLP path)', {
+                userId,
+                sol: solBalance,
+                min: MIN_SOL_FOR_GAS,
+              });
               await ctx.reply(
                 `❌ *Insufficient SOL for gas*\n\n` +
                 `Gas: ~${MIN_SOL_FOR_GAS} SOL\n` +

@@ -21,6 +21,9 @@ export interface StablecoinBalances {
   total: number;
 }
 
+/** Keep this much SOL unswapped so the user can still pay network fees (gas sponsor is often empty). */
+export const SOL_GAS_RESERVE = 0.01;
+
 /** Tokens we will auto-swap into USDT for bank payments (order = priority). */
 const AUTO_SWAP_SOURCES: Array<{
   symbol: string;
@@ -31,11 +34,11 @@ const AUTO_SWAP_SOURCES: Array<{
   /** Min human units to bother swapping */
   dust?: number;
 }> = [
-  { symbol: 'USDC', mint: SOLANA_TOKENS.USDC.mint, decimals: SOLANA_TOKENS.USDC.decimals, dust: 0.01 },
+  { symbol: 'USDC', mint: SOLANA_TOKENS.USDC.mint, decimals: SOLANA_TOKENS.USDC.decimals, dust: 0.001 },
   { symbol: 'AUDD', mint: SOLANA_TOKENS.AUDD.mint, decimals: SOLANA_TOKENS.AUDD.decimals, dust: 0.01 },
   { symbol: 'NEAR', mint: SOLANA_TOKENS.NEAR.mint, decimals: SOLANA_TOKENS.NEAR.decimals, dust: 0.001 },
-  // Leave SOL for network fees / ATA rent
-  { symbol: 'SOL', mint: SOLANA_TOKENS.SOL.mint, decimals: SOLANA_TOKENS.SOL.decimals, reserve: 0.015, dust: 0.002 },
+  // Never drain SOL below reserve — required for ATA rent / tx fees when gas sponsorship is empty
+  { symbol: 'SOL', mint: SOLANA_TOKENS.SOL.mint, decimals: SOLANA_TOKENS.SOL.decimals, reserve: SOL_GAS_RESERVE, dust: 0.002 },
 ];
 
 export async function getStablecoinBalances(walletAddress: string): Promise<StablecoinBalances> {
@@ -81,13 +84,16 @@ export async function getPaymentAssetSnapshot(walletAddress: string): Promise<Pa
 export async function estimatePayableUsdt(walletAddress: string): Promise<{
   payableUsdt: number;
   breakdown: Array<{ symbol: string; amount: number; usdtOut: number }>;
+  /** Human notes e.g. why SOL was skipped */
+  notes: string[];
 }> {
   const snap = await getPaymentAssetSnapshot(walletAddress);
   const breakdown: Array<{ symbol: string; amount: number; usdtOut: number }> = [];
+  const notes: string[] = [];
   let payable = snap.usdt;
-  breakdown.push({ symbol: 'USDT', amount: snap.usdt, usdtOut: snap.usdt });
+  if (snap.usdt > 0) breakdown.push({ symbol: 'USDT', amount: snap.usdt, usdtOut: snap.usdt });
 
-  if (snap.usdc > 0.01) {
+  if (snap.usdc >= 0.001) {
     payable += snap.usdc;
     breakdown.push({ symbol: 'USDC', amount: snap.usdc, usdtOut: snap.usdc });
   }
@@ -99,14 +105,30 @@ export async function estimatePayableUsdt(walletAddress: string): Promise<{
       src.symbol === 'NEAR' ? snap.near :
       src.symbol === 'SOL' ? snap.sol :
       0;
-    const available = Math.max(0, raw - (src.reserve || 0));
+    const reserve = src.reserve || 0;
+    const available = Math.max(0, raw - reserve);
+    if (src.symbol === 'SOL' && raw > 0 && available < (src.dust || 0.002)) {
+      notes.push(
+        `SOL ${raw.toFixed(4)} kept for gas (need ≥${reserve} SOL free to auto-swap; gas sponsor is empty)`
+      );
+      logInfo('Stablecoin', 'SOL not spendable — below gas reserve', {
+        sol: raw,
+        reserve,
+        available,
+      });
+      continue;
+    }
     if (available < (src.dust || 0.01)) continue;
 
     const base = Math.floor(available * 10 ** src.decimals);
     if (base <= 0) continue;
     try {
       const quote = await getSwapQuote(src.mint, SOLANA_TOKENS.USDT.mint, base, 100);
-      if (!quote) continue;
+      if (!quote) {
+        notes.push(`${src.symbol}: no Jupiter route right now`);
+        logWarn('Stablecoin', 'estimate no quote', { symbol: src.symbol, available });
+        continue;
+      }
       const usdtOut = Number(quote.outAmount) / 10 ** SOLANA_TOKENS.USDT.decimals;
       if (usdtOut > 0) {
         payable += usdtOut;
@@ -114,10 +136,20 @@ export async function estimatePayableUsdt(walletAddress: string): Promise<{
       }
     } catch (err) {
       logWarn('Stablecoin', 'estimate quote failed', { symbol: src.symbol, err: String((err as any)?.message || err) });
+      notes.push(`${src.symbol}: quote failed`);
     }
   }
 
-  return { payableUsdt: payable, breakdown };
+  logInfo('Stablecoin', 'estimate payable', {
+    wallet: walletAddress.slice(0, 8),
+    payableUsdt: payable.toFixed(4),
+    usdt: snap.usdt,
+    usdc: snap.usdc,
+    sol: snap.sol,
+    notes: notes.join('; ') || 'none',
+  });
+
+  return { payableUsdt: payable, breakdown, notes };
 }
 
 async function swapTokenToUsdt(

@@ -16,7 +16,8 @@ import {
 } from '../utils/fees.js';
 import { AUDD_ENABLED } from '../utils/flags.js';
 import { calculateSendFee } from '../services/gas.js';
-import { estimatePayableUsdt, getPaymentAssetSnapshot } from '../services/stablecoin.js';
+import { estimatePayableUsdt, getPaymentAssetSnapshot, SOL_GAS_RESERVE } from '../services/stablecoin.js';
+import { logWarn } from '../lib/logger.js';
 import { getPAJRates, verifyBankAccount } from '../services/paj.js';
 import { executeSendCore } from '../services/send.js';
 import { checkMilestones } from '../services/milestones.js';
@@ -178,13 +179,27 @@ export async function prepareSendConfirmation(
       }
     } else {
       // Auto-route: USDT + USDC face value, then quote other tokens (SOL/NEAR/AUDD)
-      const { payableUsdt, breakdown } = await estimatePayableUsdt(user[0].walletAddress);
+      const { payableUsdt, breakdown, notes } = await estimatePayableUsdt(user[0].walletAddress);
       if (payableUsdt + 1e-9 < usdtNeeded) {
         const snap = await getPaymentAssetSnapshot(user[0].walletAddress);
+        logWarn('Send', 'insufficient balance (confirm path)', {
+          userId,
+          need: usdtNeeded.toFixed(4),
+          payable: payableUsdt.toFixed(4),
+          short: (usdtNeeded - payableUsdt).toFixed(4),
+          usdt: snap.usdt,
+          usdc: snap.usdc,
+          sol: snap.sol,
+          notes: notes.join(' | ') || 'none',
+        });
         const lines = breakdown
           .filter((b) => b.amount > 0)
           .map((b) => `• ${b.amount.toFixed(4)} ${b.symbol} ≈ ${b.usdtOut.toFixed(2)} USDT`)
           .join('\n');
+        const solNote =
+          snap.sol > 0 && snap.sol <= SOL_GAS_RESERVE
+            ? `\n⚠️ Your *${snap.sol.toFixed(4)} SOL* is reserved for network fees (need >${SOL_GAS_RESERVE} SOL free to auto-swap SOL).\n`
+            : '';
         await ctx.reply(
           `❌ *Insufficient Balance*\n\n` +
           `You want to send ${formatNgn(amountNgn)}\n` +
@@ -193,9 +208,10 @@ export async function prepareSendConfirmation(
           `Short by: *~${(usdtNeeded - payableUsdt).toFixed(2)} USDT*\n\n` +
           `Wallet:\n` +
           `• ${snap.usdt.toFixed(2)} USDT · ${snap.usdc.toFixed(2)} USDC\n` +
-          `• ${snap.audd.toFixed(2)} AUDD · ${snap.near.toFixed(4)} NEAR · ${snap.sol.toFixed(4)} SOL\n` +
+          `• ${snap.audd.toFixed(2)} AUDD · ${snap.near.toFixed(4)} NEAR · ${snap.sol.toFixed(4)} SOL` +
+          solNote +
           (lines ? `\nQuoted routes:\n${lines}\n` : '\n') +
-          `\n_We'll auto-swap non-USDT tokens to USDT when you pay — no manual swap needed._`,
+          `\nAdd ~${(usdtNeeded - payableUsdt).toFixed(2)} more USDT/USDC, or send a smaller amount.`,
           { parse_mode: 'Markdown', ...mainMenu }
         );
         return;
