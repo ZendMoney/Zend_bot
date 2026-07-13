@@ -11,6 +11,15 @@ registerAllHandlers({ bot, deps });
 bot.catch((err, ctx) => {
   const msg = String((err as any)?.message || err || '');
   const desc = String((err as any)?.response?.description || '');
+  const userId = ctx.from?.id?.toString() || 'unknown';
+  const username = ctx.from?.username ? `@${ctx.from.username}` : '';
+  const updateType = ctx.updateType || 'unknown';
+  const text =
+    ctx.message && 'text' in ctx.message
+      ? String(ctx.message.text).slice(0, 120)
+      : ctx.callbackQuery && 'data' in ctx.callbackQuery
+        ? `cb:${String(ctx.callbackQuery.data).slice(0, 80)}`
+        : '';
 
   // Stale inline-button clicks after a slow handler — not a user-facing failure
   if (
@@ -20,11 +29,17 @@ bot.catch((err, ctx) => {
     /response timeout expired/i.test(desc) ||
     /query ID is invalid/i.test(msg)
   ) {
-    console.warn('[Bot] Ignoring stale callback query:', desc || msg);
+    console.warn(`[Bot] Ignoring stale callback query user=${userId} ${username}:`, desc || msg);
     return;
   }
 
-  console.error('Bot error:', err);
+  // Always log WHO failed — previous TimeoutErrors had no user id in logs
+  console.error(
+    `[Bot] error user=${userId} ${username} type=${updateType}` +
+      (text ? ` text="${text.replace(/\n/g, ' ')}"` : '') +
+      `:` ,
+    err
+  );
 
   // Don't stack "something went wrong" on top of a timeout if we already replied mid-flow
   try {
