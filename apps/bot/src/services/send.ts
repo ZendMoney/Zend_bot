@@ -74,12 +74,12 @@ export async function executeSendCore(
     recipientAccountName: finalAccountName,
   });
 
-  // Index for semantic search
-  await indexTransaction(userId, txId, `Sent ₦${txData.amountNgn} to ${finalAccountName} at ${finalBankName}`, {
+  // Index for semantic search in the background — never block the send path on QVAC embed load
+  void indexTransaction(userId, txId, `Sent ₦${txData.amountNgn} to ${finalAccountName} at ${finalBankName}`, {
     amount: txData.amountNgn,
     bank: finalBankName,
     recipient: finalAccountName,
-  });
+  }).catch((err) => console.warn('[NLP] indexTransaction failed (non-blocking):', err?.message || err));
 
   let offRampRef = 'MOCK-' + Math.random().toString(36).substring(2, 8).toUpperCase();
   let solanaTxHash: string | undefined;

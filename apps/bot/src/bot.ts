@@ -13,9 +13,40 @@ import { BOT_TOKEN } from './deps.js';
 import { isGroupChat } from './lib/group.js';
 
 export function createBot(): Telegraf<ZendContext> {
-  // Default Telegraf handlerTimeout is 90s — NLP + QVAC model load often exceeds that.
+  // Default Telegraf handlerTimeout is 90s — keep high for rare slow PAJ/Solana paths.
+  // Critical work must still answer callbacks immediately (see middleware below).
   const handlerTimeout = parseInt(process.env.BOT_HANDLER_TIMEOUT_MS || '180000', 10) || 180000;
   const bot = new Telegraf<ZendContext>(BOT_TOKEN, { handlerTimeout });
+
+  // Telegram requires answerCallbackQuery within ~seconds. Answer first so Confirm/Cancel
+  // never show a spinning clock while we talk to PAJ/Solana/QVAC. Handlers may call
+  // answerCbQuery again — make subsequent calls no-ops so they don't throw.
+  bot.use(async (ctx, next) => {
+    if (ctx.callbackQuery && 'id' in ctx.callbackQuery) {
+      const original = ctx.answerCbQuery.bind(ctx);
+      let answered = false;
+      ctx.answerCbQuery = (async (...args: Parameters<typeof ctx.answerCbQuery>) => {
+        if (answered) return true as any;
+        answered = true;
+        try {
+          return await original(...args);
+        } catch (err: any) {
+          const m = String(err?.message || err || '');
+          if (!/query is too old|query ID is invalid|response timeout|already answered/i.test(m)) {
+            console.warn('[Bot] answerCbQuery failed:', m);
+          }
+          return true as any;
+        }
+      }) as typeof ctx.answerCbQuery;
+
+      try {
+        await ctx.answerCbQuery();
+      } catch {
+        // already logged above
+      }
+    }
+    return next();
+  });
 
   bot.use(rateLimitMiddleware);
   bot.use(sessionMiddleware);
