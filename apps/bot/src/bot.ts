@@ -24,7 +24,7 @@ export function createBot(): Telegraf<ZendContext> {
     const userId = ctx.from?.id?.toString() || '?';
     const username = ctx.from?.username ? `@${ctx.from.username}` : '';
     const chatType = ctx.chat?.type || '?';
-    let detail = ctx.updateType || '?';
+    let detail = String(ctx.updateType || '?');
     if (ctx.message && 'text' in ctx.message) {
       detail = `text="${String(ctx.message.text).slice(0, 100).replace(/\n/g, ' ')}"`;
     } else if (ctx.callbackQuery && 'data' in ctx.callbackQuery) {
