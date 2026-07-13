@@ -1797,20 +1797,33 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       }
 
       default: {
-        const features = await getBotFeatures();
-        const loading = await showLoading(ctx, 'Thinking...');
-        const aiReply = await chatWithAI(text, features);
-        if (aiReply?.reply) {
-          await finishLoading(ctx, loading.message_id, aiReply.reply);
-          await ctx.reply('Menu:', mainMenu);
-        } else {
+        // Free-text chat via QVAC is optional — on Railway CPU it often exceeds Telegraf's
+        // handler timeout and freezes the LLM queue for every user. Default: instant help.
+        const freeChat = process.env.QVAC_FREE_CHAT === 'true';
+        if (freeChat) {
+          const features = await getBotFeatures();
+          const loading = await showLoading(ctx, 'Thinking...');
+          const aiReply = await chatWithAI(text, features);
+          if (aiReply?.reply) {
+            await finishLoading(ctx, loading.message_id, aiReply.reply);
+            await ctx.reply('Menu:', mainMenu);
+            return;
+          }
           await finishLoading(
             ctx,
             loading.message_id,
             `I didn't catch that. Try the menu below or say something like:\n"Send 500 to 08123456789 Opay"`
           );
           await ctx.reply('Menu:', mainMenu);
+          return;
         }
+
+        await ctx.reply(
+          `I didn't catch that. Use the menu buttons, or try:\n` +
+          `• "Send 5000 to 08123456789 Opay"\n` +
+          `• 💰 Balance  ·  📤 Send  ·  📥 Receive`,
+          mainMenu
+        );
       }
     }
   }
