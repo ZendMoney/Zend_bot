@@ -3,9 +3,11 @@ import './env.js';
 import { bot } from './bot.js';
 import { deps } from './deps.js';
 import { mainMenu } from './keyboards/index.js';
+import { installProcessErrorLogging, logError, logWarn } from './lib/logger.js';
 import { registerAllHandlers } from './handlers/register.js';
 import { run } from './launch/main.js';
 
+installProcessErrorLogging();
 registerAllHandlers({ bot, deps });
 
 bot.catch((err, ctx) => {
@@ -14,6 +16,7 @@ bot.catch((err, ctx) => {
   const userId = ctx.from?.id?.toString() || 'unknown';
   const username = ctx.from?.username ? `@${ctx.from.username}` : '';
   const updateType = ctx.updateType || 'unknown';
+  const chatType = ctx.chat?.type || '';
   const text =
     ctx.message && 'text' in ctx.message
       ? String(ctx.message.text).slice(0, 120)
@@ -29,27 +32,31 @@ bot.catch((err, ctx) => {
     /response timeout expired/i.test(desc) ||
     /query ID is invalid/i.test(msg)
   ) {
-    console.warn(`[Bot] Ignoring stale callback query user=${userId} ${username}:`, desc || msg);
+    logWarn('Bot', 'stale callback query ignored', {
+      userId,
+      username,
+      desc: desc || msg,
+      text,
+    });
     return;
   }
 
-  // Always log WHO failed — previous TimeoutErrors had no user id in logs
-  console.error(
-    `[Bot] error user=${userId} ${username} type=${updateType}` +
-      (text ? ` text="${text.replace(/\n/g, ' ')}"` : '') +
-      `:` ,
-    err
-  );
+  logError('Bot', 'handler error', err, {
+    userId,
+    username,
+    type: updateType,
+    chat: chatType,
+    text,
+  });
 
-  // Don't stack "something went wrong" on top of a timeout if we already replied mid-flow
-  try {
-    void ctx.reply('❌ Something went wrong. Please try again or contact support.', mainMenu);
-  } catch {
-    // ignore
-  }
+  void ctx
+    .reply('❌ Something went wrong. Please try again or contact support.', mainMenu)
+    .catch((replyErr) => {
+      logError('Bot', 'failed to send error reply to user', replyErr, { userId });
+    });
 });
 
 run().catch((err) => {
-  console.error('Fatal startup error:', err);
+  logError('Bot', 'fatal startup error', err);
   process.exit(1);
 });

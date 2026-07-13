@@ -16,7 +16,7 @@ import {
 } from '../utils/fees.js';
 import { AUDD_ENABLED } from '../utils/flags.js';
 import { calculateSendFee } from '../services/gas.js';
-import { getStablecoinBalances } from '../services/stablecoin.js';
+import { estimatePayableUsdt, getPaymentAssetSnapshot } from '../services/stablecoin.js';
 import { getPAJRates, verifyBankAccount } from '../services/paj.js';
 import { executeSendCore } from '../services/send.js';
 import { checkMilestones } from '../services/milestones.js';
@@ -156,47 +156,51 @@ export async function prepareSendConfirmation(
 
   if (user[0]?.walletAddress) {
     const isAudd = selectedMint === SOLANA_TOKENS.AUDD.mint;
-    const stable = isAudd ? null : await getStablecoinBalances(user[0].walletAddress);
-    const tokenBalance = isAudd
-      ? await walletService.getTokenBalance(user[0].walletAddress, selectedMint)
-      : stable!.total;
     const solBalance = await walletService.getSolBalance(user[0].walletAddress);
-    const balanceCheck = checkSendBalance({
-      tokenBalance,
-      solBalance,
-      transferUsdt,
-      zendFeeUsdt,
-      willFundSol,
-      isAudd,
-    });
+    const usdtNeeded = transferUsdt + zendFeeUsdt;
 
-    if (!balanceCheck.ok) {
-      if (balanceCheck.error === 'no_audd') {
+    if (isAudd) {
+      const auddBal = await walletService.getTokenBalance(user[0].walletAddress, selectedMint);
+      const balanceCheck = checkSendBalance({
+        tokenBalance: auddBal,
+        solBalance,
+        transferUsdt,
+        zendFeeUsdt,
+        willFundSol,
+        isAudd: true,
+      });
+      if (!balanceCheck.ok && balanceCheck.error === 'no_audd') {
         await ctx.reply(
-          `❌ *No AUDD Balance*\n\n` +
-          `You don't have any AUDD to send.\n\n` +
-          `Add AUDD to your wallet first.`,
+          `❌ *No AUDD Balance*\n\nYou don't have any AUDD to send.\n\nAdd AUDD to your wallet first.`,
           { parse_mode: 'Markdown', ...mainMenu }
         );
         return;
       }
-      if (balanceCheck.error === 'insufficient_token') {
-        const haveLine = isAudd
-          ? `You have: *${tokenBalance.toFixed(2)} ${selectedSymbol}*`
-          : `You have: *${stable!.usdt.toFixed(2)} USDT + ${stable!.usdc.toFixed(2)} USDC* ` +
-            `(*${stable!.total.toFixed(2)}* total)`;
+    } else {
+      // Auto-route: USDT + USDC face value, then quote other tokens (SOL/NEAR/AUDD)
+      const { payableUsdt, breakdown } = await estimatePayableUsdt(user[0].walletAddress);
+      if (payableUsdt + 1e-9 < usdtNeeded) {
+        const snap = await getPaymentAssetSnapshot(user[0].walletAddress);
+        const lines = breakdown
+          .filter((b) => b.amount > 0)
+          .map((b) => `• ${b.amount.toFixed(4)} ${b.symbol} ≈ ${b.usdtOut.toFixed(2)} USDT`)
+          .join('\n');
         await ctx.reply(
           `❌ *Insufficient Balance*\n\n` +
           `You want to send ${formatNgn(amountNgn)}\n` +
-          `You need: *${balanceCheck.usdtNeeded.toFixed(2)} ${isAudd ? selectedSymbol : 'USDT'}* (incl. ${zendFeeUsdt.toFixed(2)} fee)\n` +
-          `${haveLine}\n` +
-          `Short by: *${balanceCheck.shortfall!.toFixed(2)} ${isAudd ? selectedSymbol : 'USDT'}*\n\n` +
-          `Add more Dollars to your wallet or send a smaller amount.`,
+          `You need: *${usdtNeeded.toFixed(2)} USDT* (incl. ${zendFeeUsdt.toFixed(2)} fee)\n` +
+          `Spendable after auto-convert: *~${payableUsdt.toFixed(2)} USDT*\n` +
+          `Short by: *~${(usdtNeeded - payableUsdt).toFixed(2)} USDT*\n\n` +
+          `Wallet:\n` +
+          `• ${snap.usdt.toFixed(2)} USDT · ${snap.usdc.toFixed(2)} USDC\n` +
+          `• ${snap.audd.toFixed(2)} AUDD · ${snap.near.toFixed(4)} NEAR · ${snap.sol.toFixed(4)} SOL\n` +
+          (lines ? `\nQuoted routes:\n${lines}\n` : '\n') +
+          `\n_We'll auto-swap non-USDT tokens to USDT when you pay — no manual swap needed._`,
           { parse_mode: 'Markdown', ...mainMenu }
         );
         return;
       }
-      if (balanceCheck.error === 'insufficient_sol') {
+      if (!willFundSol && solBalance < MIN_SOL_FOR_GAS) {
         await ctx.reply(
           `❌ *Insufficient SOL for gas*\n\n` +
           `Gas: ~${MIN_SOL_FOR_GAS} SOL\n` +
@@ -257,7 +261,10 @@ export async function prepareSendConfirmation(
     `Account: \`${recipientAccountNumber}\`\n` +
     `Amount: ${formatNgn(amountNgn)}\n` +
     `${formatSendFeeLabel({ zendFeeUsdt, feeBps, willFundSol, gasCostUsdt: feeInfo.gasCostUsdt, extraFeeUsdt: feeInfo.extraFeeUsdt, feeSol, feeMode: feeInfo.feeMode, percentageFeeUsdt: feeInfo.percentageFeeUsdt })}\n` +
-    `You pay: *${usdtNeeded.toFixed(2)} ${selectedSymbol}*${autoSwapNote}` +
+    `You pay: *${usdtNeeded.toFixed(2)} USDT*` +
+    (selectedMint === SOLANA_TOKENS.USDT.mint
+      ? `\n_Auto-routes USDC / AUDD / NEAR / excess SOL → USDT if needed — no manual swap._\n`
+      : autoSwapNote) +
     `Rate: ${formatNgn(rate)} per Dollar\n\n` +
     `Confirm?`;
 

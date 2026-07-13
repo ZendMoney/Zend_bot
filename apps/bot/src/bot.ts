@@ -11,6 +11,7 @@ import { getSession } from './session/store.js';
 import type { ZendContext } from './session/types.js';
 import { BOT_TOKEN } from './deps.js';
 import { isGroupChat } from './lib/group.js';
+import { logDrop, logInfo, logWarn } from './lib/logger.js';
 
 export function createBot(): Telegraf<ZendContext> {
   // Default Telegraf handlerTimeout is 90s — keep high for rare slow PAJ/Solana paths.
@@ -34,14 +35,23 @@ export function createBot(): Telegraf<ZendContext> {
     } else if (ctx.message && 'photo' in ctx.message) {
       detail = 'photo';
     }
-    console.log(`[Update] user=${userId} ${username} chat=${chatType} ${detail}`);
+    logInfo('Update', 'inbound', { userId, username, chat: chatType, detail });
     const started = Date.now();
     try {
       await next();
+    } catch (err) {
+      // Ensure middleware failures are never silent (bot.catch may not see these)
+      logWarn('Update', 'middleware/handler threw', {
+        userId,
+        username,
+        detail,
+        err: String((err as any)?.message || err),
+      });
+      throw err;
     } finally {
       const ms = Date.now() - started;
       if (ms > 5000) {
-        console.warn(`[Update] slow user=${userId} ${ms}ms ${detail}`);
+        logWarn('Update', 'slow', { userId, ms, detail });
       }
     }
   });
@@ -90,7 +100,10 @@ export function createBot(): Telegraf<ZendContext> {
     if (chatType === 'group' || chatType === 'supergroup') {
       const msg = ctx.message;
       if (!msg || !('text' in msg)) {
-        console.log(`[Update] drop group non-text chat=${ctx.chat?.id} user=${ctx.from?.id}`);
+        logDrop('group non-text ignored', {
+          userId: ctx.from?.id?.toString(),
+          chat: ctx.chat?.id,
+        });
         return;
       }
 
@@ -100,10 +113,11 @@ export function createBot(): Telegraf<ZendContext> {
       const isReplyToBot = msg.reply_to_message?.from?.id === ctx.botInfo?.id;
 
       if (!isMentioned && !isReplyToBot) {
-        // Silent by design in groups — log so "no response" is diagnosable
-        console.log(
-          `[Update] drop group (no @mention) user=${ctx.from?.id} chat=${ctx.chat?.id} text="${text.slice(0, 60)}"`
-        );
+        logDrop('group message without @mention or reply-to-bot', {
+          userId: ctx.from?.id?.toString(),
+          chat: ctx.chat?.id,
+          text: text.slice(0, 80),
+        });
         return;
       }
 

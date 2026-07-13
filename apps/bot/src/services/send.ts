@@ -13,7 +13,7 @@ import { generateTxId } from '../lib/ids.js';
 import { getAuddPriceInUsdt } from './pricing.js';
 import { indexTransaction } from './nlp.js';
 import { decryptPrivateKey } from '../utils/wallet.js';
-import { ensureUsdtBalance, getStablecoinBalances } from './stablecoin.js';
+import { ensureUsdtBalance } from './stablecoin.js';
 import { fundSolIfNeeded, gasFundingErrorToUserMessage, calculateSendFee } from './gas.js';
 import {
   calcZendFeeUsdt,
@@ -115,19 +115,18 @@ export async function executeSendCore(
 
       const feeWallet = process.env.ZEND_FEE_WALLET?.trim() || undefined;
 
-      // Pre-flight balance check BEFORE creating a PAJ order (avoids orphaned orders).
-      // Quote is approximate (rate may differ from final PAJ amount by a few cents).
+      // Pre-flight: estimate spendable USDT including auto-route from other tokens.
       if (userFromMint !== SOLANA_TOKENS.AUDD.mint) {
-        const preBalances = await getStablecoinBalances(user[0].walletAddress);
+        const { estimatePayableUsdt } = await import('./stablecoin.js');
         const preFee = await calculateSendFee(txData.amountUsdt, user[0].walletAddress, userId, {
           assumeRecipientAta: true,
         });
-        // Need at least the transfer amount; fee can flex slightly after PAJ quotes.
-        if (preBalances.total + 1e-9 < txData.amountUsdt) {
+        const need = txData.amountUsdt + preFee.zendFeeUsdt;
+        const { payableUsdt } = await estimatePayableUsdt(user[0].walletAddress);
+        if (payableUsdt + 1e-9 < txData.amountUsdt) {
           throw new Error(
-            `Insufficient Dollars. You need ~${(txData.amountUsdt + preFee.zendFeeUsdt).toFixed(2)} USDT ` +
-            `(incl. ~${preFee.zendFeeUsdt.toFixed(2)} fee) for this bank transfer ` +
-            `(you have ${preBalances.usdt.toFixed(2)} USDT + ${preBalances.usdc.toFixed(2)} USDC).`
+            `Insufficient balance. You need ~${need.toFixed(2)} USDT (incl. fee) for this bank transfer. ` +
+            `After auto-converting your tokens you have ~${payableUsdt.toFixed(2)} USDT spendable.`
           );
         }
       }
