@@ -156,9 +156,10 @@ export async function prepareSendConfirmation(
 
   if (user[0]?.walletAddress) {
     const isAudd = selectedMint === SOLANA_TOKENS.AUDD.mint;
+    const stable = isAudd ? null : await getStablecoinBalances(user[0].walletAddress);
     const tokenBalance = isAudd
       ? await walletService.getTokenBalance(user[0].walletAddress, selectedMint)
-      : (await getStablecoinBalances(user[0].walletAddress)).total;
+      : stable!.total;
     const solBalance = await walletService.getSolBalance(user[0].walletAddress);
     const balanceCheck = checkSendBalance({
       tokenBalance,
@@ -180,11 +181,15 @@ export async function prepareSendConfirmation(
         return;
       }
       if (balanceCheck.error === 'insufficient_token') {
+        const haveLine = isAudd
+          ? `You have: *${tokenBalance.toFixed(2)} ${selectedSymbol}*`
+          : `You have: *${stable!.usdt.toFixed(2)} USDT + ${stable!.usdc.toFixed(2)} USDC* ` +
+            `(*${stable!.total.toFixed(2)}* total)`;
         await ctx.reply(
           `❌ *Insufficient Balance*\n\n` +
           `You want to send ${formatNgn(amountNgn)}\n` +
-          `You need: *${balanceCheck.usdtNeeded.toFixed(2)} ${selectedSymbol}* (incl. ${zendFeeUsdt.toFixed(2)} fee)\n` +
-          `You have: *${tokenBalance.toFixed(2)} ${isAudd ? selectedSymbol : 'USDT/USDC'}*\n` +
+          `You need: *${balanceCheck.usdtNeeded.toFixed(2)} ${isAudd ? selectedSymbol : 'USDT'}* (incl. ${zendFeeUsdt.toFixed(2)} fee)\n` +
+          `${haveLine}\n` +
           `Short by: *${balanceCheck.shortfall!.toFixed(2)} ${isAudd ? selectedSymbol : 'USDT'}*\n\n` +
           `Add more Dollars to your wallet or send a smaller amount.`,
           { parse_mode: 'Markdown', ...mainMenu }

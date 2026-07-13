@@ -1607,43 +1607,72 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
           console.log('Using fallback rate for NLP send');
         }
 
-        const fromMint = parsed.fromToken === 'USDC' ? SOLANA_TOKENS.USDC.mint :
-                           parsed.fromToken === 'SOL' ? SOLANA_TOKENS.SOL.mint :
-                           SOLANA_TOKENS.USDT.mint;
+        // Bank off-ramp settles in USDT; USDC is auto-swapped at execution (same as button send flow).
+        // Never treat "fromMint=USDT" as "ignore USDC" for balance checks.
+        const fromMint = parsed.fromToken === 'SOL'
+          ? SOLANA_TOKENS.SOL.mint
+          : SOLANA_TOKENS.USDT.mint;
         const fromTokenInfo = Object.values(SOLANA_TOKENS).find(t => t.mint === fromMint) || SOLANA_TOKENS.USDT;
+        const isStableSend = fromMint !== SOLANA_TOKENS.SOL.mint;
 
         const transferUsdt = parsed.amount / rate;
         const feeInfo = user[0]?.walletAddress
           ? await calculateSendFee(transferUsdt, user[0].walletAddress, userId)
-          : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false };
+          : { zendFeeUsdt: Math.min(transferUsdt * 0.01, 2), feeSol: 0, feeBps: 100, willFundSol: false, transferUsdt, totalUsdt: transferUsdt + Math.min(transferUsdt * 0.01, 2) } as SendFeeInfo;
         const usdtNeeded = transferUsdt + feeInfo.zendFeeUsdt;
 
         // ─── Check wallet balance before showing confirmation ───
+        // Count USDT + USDC as Dollars (getStablecoinBalances.total). Old path only read USDT mint → false "0.00".
         if (user[0]?.walletAddress) {
-          const tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, fromMint);
           const solBalance = await walletService.getSolBalance(user[0].walletAddress);
-          if (tokenBalance < transferUsdt) {
-            const shortfall = transferUsdt - tokenBalance;
-            await ctx.reply(
-              `❌ *Insufficient Balance*\n\n` +
-              `You want to send ${formatNgn(parsed.amount)}\n` +
-              `You need: *${transferUsdt.toFixed(2)} ${fromTokenInfo.symbol}*\n` +
-              `You have: *${tokenBalance.toFixed(2)} ${fromTokenInfo.symbol}*\n` +
-              `Short by: *${shortfall.toFixed(2)} ${fromTokenInfo.symbol}*\n\n` +
-              `Add more Dollars to your wallet or send a smaller amount.`,
-              { parse_mode: 'Markdown', ...mainMenu }
-            );
-            return;
-          }
-          if (!feeInfo.willFundSol && solBalance < MIN_SOL_FOR_GAS) {
-            await ctx.reply(
-              `❌ *Insufficient SOL for gas*\n\n` +
-              `Gas: ~${MIN_SOL_FOR_GAS} SOL\n` +
-              `You have: ${solBalance.toFixed(6)} SOL\n\n` +
-              `Top up your SOL balance first.`,
-              { parse_mode: 'Markdown', ...mainMenu }
-            );
-            return;
+          if (isStableSend) {
+            const stable = await getStablecoinBalances(user[0].walletAddress);
+            const balanceCheck = checkSendBalance({
+              tokenBalance: stable.total,
+              solBalance,
+              transferUsdt,
+              zendFeeUsdt: feeInfo.zendFeeUsdt,
+              willFundSol: feeInfo.willFundSol,
+              isAudd: false,
+            });
+            if (!balanceCheck.ok && balanceCheck.error === 'insufficient_token') {
+              await ctx.reply(
+                `❌ *Insufficient Balance*\n\n` +
+                `You want to send ${formatNgn(parsed.amount)}\n` +
+                `You need: *${balanceCheck.usdtNeeded.toFixed(2)} USDT* (incl. ${feeInfo.zendFeeUsdt.toFixed(2)} fee)\n` +
+                `You have: *${stable.usdt.toFixed(2)} USDT + ${stable.usdc.toFixed(2)} USDC* ` +
+                `(*${stable.total.toFixed(2)}* total)\n` +
+                `Short by: *${balanceCheck.shortfall!.toFixed(2)} USDT*\n\n` +
+                `Add more Dollars to your wallet or send a smaller amount.`,
+                { parse_mode: 'Markdown', ...mainMenu }
+              );
+              return;
+            }
+            if (!balanceCheck.ok && balanceCheck.error === 'insufficient_sol') {
+              await ctx.reply(
+                `❌ *Insufficient SOL for gas*\n\n` +
+                `Gas: ~${MIN_SOL_FOR_GAS} SOL\n` +
+                `You have: ${solBalance.toFixed(6)} SOL\n\n` +
+                `Top up your SOL balance first.`,
+                { parse_mode: 'Markdown', ...mainMenu }
+              );
+              return;
+            }
+          } else {
+            const tokenBalance = await walletService.getTokenBalance(user[0].walletAddress, fromMint);
+            if (tokenBalance < usdtNeeded) {
+              const shortfall = usdtNeeded - tokenBalance;
+              await ctx.reply(
+                `❌ *Insufficient Balance*\n\n` +
+                `You want to send ${formatNgn(parsed.amount)}\n` +
+                `You need: *${usdtNeeded.toFixed(2)} ${fromTokenInfo.symbol}*\n` +
+                `You have: *${tokenBalance.toFixed(2)} ${fromTokenInfo.symbol}*\n` +
+                `Short by: *${shortfall.toFixed(2)} ${fromTokenInfo.symbol}*\n\n` +
+                `Add more balance or send a smaller amount.`,
+                { parse_mode: 'Markdown', ...mainMenu }
+              );
+              return;
+            }
           }
         }
 
@@ -1689,14 +1718,14 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
           msg += `⚠️ *Could not verify account* — please double-check details\n`;
         }
 
-        const fromSymbol = fromTokenInfo.symbol;
         msg += `\n` +
           `To: *${md(verifiedName || 'Recipient')}*\n` +
           `Bank: ${md(parsed.bankName) || 'Solana'}\n` +
           `Account: \`${parsed.accountNumber || parsed.walletAddress}\`\n` +
           `Amount: ${formatNgn(parsed.amount)}\n` +
           `${formatSendFeeLabel(feeInfo)}\n` +
-          `You pay: *${usdtNeeded.toFixed(2)} ${fromSymbol}*\n` +
+          `You pay: *${usdtNeeded.toFixed(2)} USDT*` +
+          (isStableSend ? `\n_Paid in USDT — we auto-convert USDC if needed._\n` : `\n`) +
           `Rate: ${formatNgn(rate)} per Dollar\n\n` +
           `Confirm?`;
 
