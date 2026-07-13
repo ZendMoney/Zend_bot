@@ -308,7 +308,14 @@ function getKimiResponse(data: any): string {
   return data?.choices?.[0]?.message?.content || '';
 }
 
+/**
+ * Cloud Kimi is disabled by default. ZendPay production uses local QVAC only.
+ * Set KIMI_ENABLED=true to re-enable (not recommended — membership/402 errors).
+ */
 async function callKimi(systemPrompt: string, userPrompt: string, temperature: number, maxTokens: number): Promise<string | null> {
+  if (process.env.KIMI_ENABLED !== 'true') {
+    return null;
+  }
   if (!KIMI_API_KEY || KIMI_API_KEY === 'your_openai_key') {
     return null;
   }
@@ -587,11 +594,9 @@ export interface ChatReply {
  * Get a conversational reply from QVAC local LLM when the user's message is not a command.
  */
 
+/** @deprecated Use chatWithAI (QVAC). Kept as alias so old imports don't hit cloud Kimi. */
 export async function chatWithKimi(text: string, features?: BotFeature[]): Promise<ChatReply | null> {
-  const systemPrompt = buildChatSystemPrompt(features || []);
-  const reply = await callKimi(systemPrompt, text, 0.7, 400);
-  if (!reply) return null;
-  return { reply: reply.trim() };
+  return chatWithAI(text, features);
 }
 
 export async function chatWithAI(text: string, features?: BotFeature[]): Promise<ChatReply | null> {
@@ -752,7 +757,7 @@ export interface BulkRecipient {
 }
 
 export async function parseBulkSendWithAI(text: string): Promise<BulkRecipient[] | null> {
-  const content = await callKimi(BULK_PARSE_PROMPT, text, 0.1, 800);
+  const content = await callQVAC(BULK_PARSE_PROMPT, text, 0.1, 800, true);
   if (!content) return null;
   try {
     const clean = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
@@ -811,11 +816,7 @@ export async function parseReceiptWithQVAC(imageBuffer: Buffer): Promise<ParsedR
   });
 
   if (!content) {
-    console.warn('[Receipt] QVAC LLM unavailable — trying Kimi fallback');
-    content = await callKimi(RECEIPT_PARSER_PROMPT, prompt, 0.1, 300);
-  }
-
-  if (!content) {
+    console.warn('[Receipt] QVAC LLM unavailable — falling back to OCR-only parser');
     return parseReceiptImage(imageBuffer).catch(() => null);
   }
 

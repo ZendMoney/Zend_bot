@@ -12,7 +12,6 @@ import {
 import {
   parseCommand,
   chatWithAI,
-  chatWithKimi,
   isCasualGreeting,
   parseMenuInputWithAI,
   askTransactionQuestion,
@@ -1527,37 +1526,26 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
           parsed.accountNumber = sanitizeAccountNumber(parsed.accountNumber) || parsed.accountNumber;
         }
 
-        // Use Kimi for conversational responses when details are missing
+        // Missing details → fast static prompts (no cloud AI / no Kimi)
         if (!parsed.amount) {
-          const features = await getBotFeatures();
-          const reply = await chatWithKimi(
-            `The user said: "${text}". They want to send money but didn't specify an amount. ` +
-            `Respond conversationally in Nigerian Pidgin style. Ask how much they want to send.`,
-            features
-          );
-          await ctx.reply(escapeTelegramMarkdown(reply?.reply || 'How much do you want to send?'), { parse_mode: 'Markdown', ...cancelKeyboard });
+          await ctx.reply('How much do you want to send? (in Naira)\nExample: 5000', cancelKeyboard);
           setSession(userId, { state: ConversationState.AWAITING_SEND_AMOUNT, pendingTransaction: { recipientName: parsed.recipientName } });
           return;
         }
         if (parsed.amount < 100) {
-          const features = await getBotFeatures();
-          const reply = await chatWithKimi(
-            `The user wants to send ${parsed.amount} Naira. Minimum is ₦100. ` +
-            `Respond in Nigerian Pidgin style telling them the minimum.`,
-            features
+          await ctx.reply(
+            `Minimum send amount is ${formatNgn(100)}.\nYou tried ${formatNgn(parsed.amount)} — try a higher amount.`,
+            cancelKeyboard
           );
-          await ctx.reply(reply?.reply || `Minimum send amount is ${formatNgn(100)}.`, cancelKeyboard);
           return;
         }
         if (!parsed.accountNumber && !parsed.walletAddress) {
-          // We have amount + recipient name but missing bank/account
-          const features = await getBotFeatures();
-          const reply = await chatWithKimi(
-            `The user said: "${text}". I understood they want to send ${formatNgn(parsed.amount)} to ${parsed.recipientName || 'someone'}. ` +
-            `But I need the bank name and account number. Respond conversationally in Nigerian Pidgin style.`,
-            features
+          await ctx.reply(
+            `Got it — ${formatNgn(parsed.amount)}` +
+            (parsed.recipientName ? ` to ${parsed.recipientName}` : '') +
+            `.\nWhat's the bank and 10-digit account number?\nExample: Opay 7082406410`,
+            cancelKeyboard
           );
-          await ctx.reply(reply?.reply || `I got that you want to send ${formatNgn(parsed.amount)}. What's the bank and account number?`, cancelKeyboard);
           setSession(userId, {
             state: ConversationState.AWAITING_SEND_RECIPIENT,
             pendingTransaction: { amountNgn: parsed.amount, recipientName: parsed.recipientName },
@@ -1811,7 +1799,8 @@ export function registerTextRouter({ bot: b }: HandlerContext): void {
       default: {
         const features = await getBotFeatures();
         const loading = await showLoading(ctx, 'Thinking...');
-        const aiReply = (await chatWithAI(text, features)) ?? (await chatWithKimi(text, features));
+        // Local QVAC only — no cloud Kimi fallback
+        const aiReply = await chatWithAI(text, features);
         if (aiReply?.reply) {
           await finishLoading(ctx, loading.message_id, aiReply.reply);
           await ctx.reply('Menu:', mainMenu);
