@@ -125,18 +125,56 @@ export class WalletService {
     // User signs alone — they pay gas AND authorize the action
     transaction.sign([userWallet]);
 
-    const signature = await this.connection.sendTransaction(transaction, {
-      maxRetries: 3,
-      skipPreflight: false,
-    });
+    try {
+      const signature = await this.connection.sendTransaction(transaction, {
+        maxRetries: 3,
+        skipPreflight: false,
+      });
 
-    // Wait for confirmation
-    await this.connection.confirmTransaction(
-      { signature, blockhash, lastValidBlockHeight },
-      'confirmed'
-    );
+      // Wait for confirmation
+      await this.connection.confirmTransaction(
+        { signature, blockhash, lastValidBlockHeight },
+        'confirmed'
+      );
 
-    return signature;
+      return signature;
+    } catch (err: any) {
+      // Surface full simulation logs — otherwise Railway only shows partial Token program noise
+      let logs: string[] | null = null;
+      try {
+        if (typeof err?.getLogs === 'function') {
+          logs = await err.getLogs(this.connection);
+        } else if (Array.isArray(err?.transactionLogs)) {
+          logs = err.transactionLogs;
+        }
+      } catch {
+        // ignore
+      }
+      if (logs?.length) {
+        console.error('[Solana] Tx simulation/send failed. Logs:\n' + logs.join('\n'));
+      }
+
+      const logText = (logs || []).join(' | ');
+      if (/insufficient lamports/i.test(logText) || /insufficient funds for rent/i.test(logText)) {
+        throw new Error(
+          'Not enough SOL for network fees (and token-account rent if needed). ' +
+          'Add a little SOL to your ZendPay wallet and try again.'
+        );
+      }
+      if (/insufficient funds|Error: insufficient/i.test(logText) || /custom program error: 0x1/i.test(logText)) {
+        throw new Error(
+          'Token transfer failed — insufficient balance or the destination account rejected the transfer. ' +
+          'Check your balance and try again.'
+        );
+      }
+      if (err?.transactionMessage || err?.message) {
+        const base = err.transactionMessage || err.message;
+        throw new Error(
+          `${base}${logs?.length ? ` | ${logs.filter((l) => /error|fail|insufficient|left/i.test(l)).slice(-5).join(' · ')}` : ''}`
+        );
+      }
+      throw err;
+    }
   }
 
   // Sign and send a serialized VersionedTransaction (base64)

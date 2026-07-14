@@ -1,11 +1,14 @@
 import { db, users, transactions } from '@zend/db';
 import { eq } from 'drizzle-orm';
+import { SOLANA_TOKENS } from '@zend/shared';
 import { SOLANA_RPC } from '../deps.js';
 import { getNearIntentsClient } from '@zend/near-intents-client';
 import { mainMenu } from '../keyboards/index.js';
 import { getSession, setSession } from '../session/store.js';
+import { logError, logInfo } from '../lib/logger.js';
 import { indexTransaction } from '../services/nlp.js';
 import { fundNearIntentDeposit, formatChainName } from '../services/near-intents-flow.js';
+import { fundSolIfNeeded, gasFundingErrorToUserMessage } from '../services/gas.js';
 import { ensureUsdtBalance } from '../services/stablecoin.js';
 import { ConversationState } from '@zend/shared';
 import type { ZendContext } from '../session/types.js';
@@ -28,6 +31,14 @@ export async function executeNearIntentWithdraw(ctx: ZendContext, userId: string
   try {
     await ctx.reply('⏳ Preparing USDT and sending via NEAR Intents...');
 
+    logInfo('Withdraw', 'starting', {
+      userId,
+      amount: wd.amount,
+      dest: wd.destChain,
+      deposit: String(wd.depositAddress).slice(0, 12),
+      wallet: user[0].walletAddress.slice(0, 8),
+    });
+
     await ensureUsdtBalance(
       userId,
       user[0].walletAddress,
@@ -35,6 +46,18 @@ export async function executeNearIntentWithdraw(ctx: ZendContext, userId: string
       wd.amount,
       'cross-chain send'
     );
+
+    // May need SOL for gas + ATA rent if NEAR deposit address needs a USDT token account
+    const funding = await fundSolIfNeeded(
+      user[0].walletAddress,
+      wd.depositAddress,
+      SOLANA_TOKENS.USDT.mint,
+      undefined,
+      userId
+    );
+    if (funding.shortfall && !funding.funded) {
+      throw new Error(gasFundingErrorToUserMessage(funding.error, funding.shortfall));
+    }
 
     const solanaTxHash = await fundNearIntentDeposit(
       user[0].walletEncryptedKey,
@@ -80,13 +103,21 @@ export async function executeNearIntentWithdraw(ctx: ZendContext, userId: string
       { parse_mode: 'Markdown', ...mainMenu }
     );
   } catch (err: any) {
-    console.error('[Withdraw] Failed:', err);
+    logError('Withdraw', 'failed', err, {
+      userId,
+      amount: wd.amount,
+      dest: wd.destChain,
+      txId: wd.txId,
+    });
     await db.update(transactions)
       .set({ status: 'failed', metadata: { error: err.message } })
       .where(eq(transactions.id, wd.txId));
     setSession(userId, { state: ConversationState.IDLE });
+    const friendly = String(err.message || 'Unknown error')
+      .replace(/Simulation failed\.?/gi, 'Network rejected the transaction.')
+      .slice(0, 400);
     await ctx.reply(
-      `❌ *Withdrawal Failed*\n\n${err.message || 'Unknown error'}\nNo funds were deducted.`,
+      `❌ *Withdrawal Failed*\n\n${friendly}\n\nNo funds were deducted. Try again, or add a little SOL for fees.`,
       { parse_mode: 'Markdown', ...mainMenu }
     );
   }
