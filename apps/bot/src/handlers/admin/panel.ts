@@ -51,12 +51,11 @@ b.action('admin_page:overview', async (ctx) => {
   const userCount = await db.select({ count: sql`count(*)` }).from(users);
   const txCount = await db.select({ count: sql`count(*)` }).from(transactions);
   const completed = eq(transactions.status, 'completed');
-  const saneNgn = sql`coalesce(${transactions.ngnAmount}, 0) > 0 AND coalesce(${transactions.ngnAmount}, 0) <= ${NGN_VOLUME_CAP}`;
   const totalNgnOut = await db.select({
-    sum: sql`coalesce(sum(CASE WHEN ${saneNgn} THEN ${transactions.ngnAmount} ELSE 0 END), 0)`,
+    sum: sql`coalesce(sum(${transactions.ngnAmount}), 0)`,
   }).from(transactions).where(sql`${completed} AND ${eq(transactions.type, 'ngn_send')}`);
   const totalNgnIn = await db.select({
-    sum: sql`coalesce(sum(CASE WHEN ${saneNgn} THEN ${transactions.ngnAmount} ELSE 0 END), 0)`,
+    sum: sql`coalesce(sum(${transactions.ngnAmount}), 0)`,
   }).from(transactions).where(sql`${completed} AND ${eq(transactions.type, 'ngn_receive')}`);
   const totalZendFee = await db.select({ sum: sql`coalesce(sum(${transactions.zendFeeUsdt}), 0)` }).from(transactions).where(completed);
   const activeFeatures = await db.select().from(botFeatures).where(eq(botFeatures.isActive, true));
@@ -66,7 +65,7 @@ b.action('admin_page:overview', async (ctx) => {
 
   const text =
     `📊 *Overview*\n` +
-    `_Completed volume · junk NGN rows excluded_\n\n` +
+    `_Volume = completed txs only_\n\n` +
     `👤 Total Users: ${userCount[0]?.count || 0} (+${newToday[0]?.count || 0} today)\n` +
     `📋 Total Transactions: ${txCount[0]?.count || 0}\n` +
     `💰 NGN In (completed): ₦${Number(totalNgnIn[0]?.sum || 0).toLocaleString()}\n` +
@@ -255,35 +254,30 @@ b.action(/admin_suspensions_page:(\d+)/, async (ctx) => {
 });
 
 // ─── Fees & Revenue ───
-// Volume MUST be completed-only and sanity-capped. Raw sum(ngn_amount) across all statuses
-// was producing fantasy numbers (e.g. ₦26B) from failed/test/garbage rows while fees stayed ~$6.
-const NGN_VOLUME_CAP = 50_000_000; // ignore single rows above ₦50M as data errors
-
+// Volume = completed only. Do NOT cap large legitimate NGN amounts.
+// The old ₦26B figure came from summing failed/junk statuses, not from big real sends.
 b.action('admin_page:fees', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
   if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
   const completed = eq(transactions.status, 'completed');
-  const saneNgn = sql`coalesce(${transactions.ngnAmount}, 0) > 0 AND coalesce(${transactions.ngnAmount}, 0) <= ${NGN_VOLUME_CAP}`;
 
   const totalZendFee = await db.select({ sum: sql`coalesce(sum(${transactions.zendFeeUsdt}), 0)` })
     .from(transactions).where(completed);
 
   const feeBearing = await db.select({
     count: sql`count(*)`,
-    sumFee: sql`coalesce(sum(${transactions.zendFeeUsdt}), 0)`,
-    sumNgn: sql`coalesce(sum(CASE WHEN ${saneNgn} THEN ${transactions.ngnAmount} ELSE 0 END), 0)`,
   }).from(transactions).where(sql`${completed} AND coalesce(${transactions.zendFeeUsdt}, 0) > 0`);
 
   const totalNgnOut = await db.select({
-    sum: sql`coalesce(sum(CASE WHEN ${saneNgn} THEN ${transactions.ngnAmount} ELSE 0 END), 0)`,
+    sum: sql`coalesce(sum(${transactions.ngnAmount}), 0)`,
     count: sql`count(*)`,
-    outliers: sql`count(*) FILTER (WHERE coalesce(${transactions.ngnAmount}, 0) > ${NGN_VOLUME_CAP})`,
+    maxNgn: sql`coalesce(max(${transactions.ngnAmount}), 0)`,
   }).from(transactions).where(sql`${completed} AND ${eq(transactions.type, 'ngn_send')}`);
 
   const totalNgnIn = await db.select({
-    sum: sql`coalesce(sum(CASE WHEN ${saneNgn} THEN ${transactions.ngnAmount} ELSE 0 END), 0)`,
+    sum: sql`coalesce(sum(${transactions.ngnAmount}), 0)`,
     count: sql`count(*)`,
   }).from(transactions).where(sql`${completed} AND ${eq(transactions.type, 'ngn_receive')}`);
 
@@ -298,18 +292,18 @@ b.action('admin_page:fees', async (ctx) => {
   const fees = Number(totalZendFee[0]?.sum || 0);
   const ngnOut = Number(totalNgnOut[0]?.sum || 0);
   const ngnIn = Number(totalNgnIn[0]?.sum || 0);
-  const outliers = Number(totalNgnOut[0]?.outliers || 0);
+  const maxOut = Number(totalNgnOut[0]?.maxNgn || 0);
   const feeTx = Number(feeBearing[0]?.count || 0);
 
   const text =
     `💰 *Fees & Revenue*\n` +
-    `_Completed txs only · NGN rows > ₦${(NGN_VOLUME_CAP / 1e6).toFixed(0)}M excluded_\n\n` +
+    `_Completed transactions only (all sizes included)_\n\n` +
     `🪙 *Collected fees:* $${fees.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })} USDT\n` +
     `   (${feeTx} fee-bearing completed sends)\n` +
     `📐 Config: ${ZEND_FEE_NORMAL_BPS / 100}% normal / max(${ZEND_FEE_FUNDED_BPS / 100}%, gas+$flat) sponsored · cap $${ZEND_FEE_NORMAL_CAP_USDT}\n\n` +
     `📊 *Volume (completed):*\n` +
-    `📤 Off-Ramp: ${totalNgnOut[0]?.count || 0} tx | ₦${ngnOut.toLocaleString()}` +
-    (outliers > 0 ? ` _(excluded ${outliers} junk rows)_` : '') + `\n` +
+    `📤 Off-Ramp: ${totalNgnOut[0]?.count || 0} tx | ₦${ngnOut.toLocaleString()}\n` +
+    `   (largest single completed send: ₦${maxOut.toLocaleString()})\n` +
     `📥 On-Ramp: ${totalNgnIn[0]?.count || 0} tx | ₦${ngnIn.toLocaleString()}\n` +
     `🔄 Swaps: ${swapCount[0]?.count || 0} tx\n` +
     `📱 Bills (success): ${billCount[0]?.count || 0} | ₦${Number(billVolume[0]?.sum || 0).toLocaleString()}\n\n` +
