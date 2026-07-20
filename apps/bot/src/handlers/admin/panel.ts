@@ -6,7 +6,7 @@ import { escapeTelegramMarkdown } from '../../lib/telegram.js';
 import { setSession } from '../../session/store.js';
 import { invalidateBotFeaturesCache } from '../../services/bot-features.js';
 import { adminMainKeyboard } from './keyboards.js';
-import { ZEND_FEE_NORMAL_BPS, ZEND_FEE_FUNDED_BPS } from '../../utils/fees.js';
+import { ZEND_FEE_NORMAL_BPS, ZEND_FEE_FUNDED_BPS, ZEND_FEE_NORMAL_CAP_USDT } from '../../utils/fees.js';
 import { buildTxnDetailText, buildUserDetailText } from './detail.js';
 import { checkAdmin } from './auth.js';
 import { registerAdminSearchHandlers } from './search.js';
@@ -50,21 +50,28 @@ b.action('admin_page:overview', async (ctx) => {
 
   const userCount = await db.select({ count: sql`count(*)` }).from(users);
   const txCount = await db.select({ count: sql`count(*)` }).from(transactions);
-  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_send'));
-  const totalNgnIn = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
-  const totalZendFee = await db.select({ sum: sql`coalesce(sum(zend_fee_usdt), 0)` }).from(transactions).where(eq(transactions.status, 'completed'));
+  const completed = eq(transactions.status, 'completed');
+  const saneNgn = sql`coalesce(${transactions.ngnAmount}, 0) > 0 AND coalesce(${transactions.ngnAmount}, 0) <= ${NGN_VOLUME_CAP}`;
+  const totalNgnOut = await db.select({
+    sum: sql`coalesce(sum(CASE WHEN ${saneNgn} THEN ${transactions.ngnAmount} ELSE 0 END), 0)`,
+  }).from(transactions).where(sql`${completed} AND ${eq(transactions.type, 'ngn_send')}`);
+  const totalNgnIn = await db.select({
+    sum: sql`coalesce(sum(CASE WHEN ${saneNgn} THEN ${transactions.ngnAmount} ELSE 0 END), 0)`,
+  }).from(transactions).where(sql`${completed} AND ${eq(transactions.type, 'ngn_receive')}`);
+  const totalZendFee = await db.select({ sum: sql`coalesce(sum(${transactions.zendFeeUsdt}), 0)` }).from(transactions).where(completed);
   const activeFeatures = await db.select().from(botFeatures).where(eq(botFeatures.isActive, true));
 
   const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
   const newToday = await db.select({ count: sql`count(*)` }).from(users).where(sql`${users.createdAt} >= ${todayStart.toISOString()}`);
 
   const text =
-    `📊 *Overview*\n\n` +
+    `📊 *Overview*\n` +
+    `_Completed volume · junk NGN rows excluded_\n\n` +
     `👤 Total Users: ${userCount[0]?.count || 0} (+${newToday[0]?.count || 0} today)\n` +
     `📋 Total Transactions: ${txCount[0]?.count || 0}\n` +
-    `💰 Total NGN In: ₦${Number(totalNgnIn[0]?.sum || 0).toLocaleString()}\n` +
-    `💸 Total NGN Out: ₦${Number(totalNgnOut[0]?.sum || 0).toLocaleString()}\n` +
-    `🪙 ZendPay Fees (USDT): $${Number(totalZendFee[0]?.sum || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}\n` +
+    `💰 NGN In (completed): ₦${Number(totalNgnIn[0]?.sum || 0).toLocaleString()}\n` +
+    `💸 NGN Out (completed): ₦${Number(totalNgnOut[0]?.sum || 0).toLocaleString()}\n` +
+    `🪙 ZendPay Fees (USDT): $${Number(totalZendFee[0]?.sum || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}\n` +
     `✅ Active Features: ${activeFeatures.length}\n`;
 
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_back')]]) });
@@ -248,30 +255,66 @@ b.action(/admin_suspensions_page:(\d+)/, async (ctx) => {
 });
 
 // ─── Fees & Revenue ───
+// Volume MUST be completed-only and sanity-capped. Raw sum(ngn_amount) across all statuses
+// was producing fantasy numbers (e.g. ₦26B) from failed/test/garbage rows while fees stayed ~$6.
+const NGN_VOLUME_CAP = 50_000_000; // ignore single rows above ₦50M as data errors
+
 b.action('admin_page:fees', async (ctx) => {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username;
   if (!(await checkAdmin(userId, username))) { await ctx.answerCbQuery('❌ Not authorized'); return; }
 
-  const totalZendFee = await db.select({ sum: sql`coalesce(sum(zend_fee_usdt), 0)` }).from(transactions).where(eq(transactions.status, 'completed'));
-  const totalNgnOut = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_send'));
-  const totalNgnIn = await db.select({ sum: sql`coalesce(sum(ngn_amount), 0)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
+  const completed = eq(transactions.status, 'completed');
+  const saneNgn = sql`coalesce(${transactions.ngnAmount}, 0) > 0 AND coalesce(${transactions.ngnAmount}, 0) <= ${NGN_VOLUME_CAP}`;
 
-  const offrampCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'ngn_send'));
-  const onrampCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'ngn_receive'));
-  const swapCount = await db.select({ count: sql`count(*)` }).from(transactions).where(eq(transactions.type, 'swap'));
-  const billCount = await db.select({ count: sql`count(*)` }).from(billPayments);
+  const totalZendFee = await db.select({ sum: sql`coalesce(sum(${transactions.zendFeeUsdt}), 0)` })
+    .from(transactions).where(completed);
+
+  const feeBearing = await db.select({
+    count: sql`count(*)`,
+    sumFee: sql`coalesce(sum(${transactions.zendFeeUsdt}), 0)`,
+    sumNgn: sql`coalesce(sum(CASE WHEN ${saneNgn} THEN ${transactions.ngnAmount} ELSE 0 END), 0)`,
+  }).from(transactions).where(sql`${completed} AND coalesce(${transactions.zendFeeUsdt}, 0) > 0`);
+
+  const totalNgnOut = await db.select({
+    sum: sql`coalesce(sum(CASE WHEN ${saneNgn} THEN ${transactions.ngnAmount} ELSE 0 END), 0)`,
+    count: sql`count(*)`,
+    outliers: sql`count(*) FILTER (WHERE coalesce(${transactions.ngnAmount}, 0) > ${NGN_VOLUME_CAP})`,
+  }).from(transactions).where(sql`${completed} AND ${eq(transactions.type, 'ngn_send')}`);
+
+  const totalNgnIn = await db.select({
+    sum: sql`coalesce(sum(CASE WHEN ${saneNgn} THEN ${transactions.ngnAmount} ELSE 0 END), 0)`,
+    count: sql`count(*)`,
+  }).from(transactions).where(sql`${completed} AND ${eq(transactions.type, 'ngn_receive')}`);
+
+  const failedOfframp = await db.select({ count: sql`count(*)` })
+    .from(transactions).where(sql`${eq(transactions.type, 'ngn_send')} AND ${transactions.status} <> 'completed'`);
+
+  const swapCount = await db.select({ count: sql`count(*)` })
+    .from(transactions).where(sql`${completed} AND ${eq(transactions.type, 'swap')}`);
+  const billCount = await db.select({ count: sql`count(*)` }).from(billPayments).where(eq(billPayments.status, 'success'));
   const billVolume = await db.select({ sum: sql`coalesce(sum(amount_ngn), 0)` }).from(billPayments).where(eq(billPayments.status, 'success'));
 
+  const fees = Number(totalZendFee[0]?.sum || 0);
+  const ngnOut = Number(totalNgnOut[0]?.sum || 0);
+  const ngnIn = Number(totalNgnIn[0]?.sum || 0);
+  const outliers = Number(totalNgnOut[0]?.outliers || 0);
+  const feeTx = Number(feeBearing[0]?.count || 0);
+
   const text =
-    `💰 *Fees & Revenue*\n\n` +
-    `🪙 Total ZendPay Fees: $${Number(totalZendFee[0]?.sum || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}\n` +
-    `📐 Fee config: ${ZEND_FEE_NORMAL_BPS / 100}% (normal) / max(${ZEND_FEE_FUNDED_BPS / 100}%, gas+$flat) (sponsored)\n\n` +
-    `📊 *Volume by Type:*\n` +
-    `📤 Off-Ramp: ${offrampCount[0]?.count || 0} tx | ₦${Number(totalNgnOut[0]?.sum || 0).toLocaleString()}\n` +
-    `📥 On-Ramp: ${onrampCount[0]?.count || 0} tx | ₦${Number(totalNgnIn[0]?.sum || 0).toLocaleString()}\n` +
+    `💰 *Fees & Revenue*\n` +
+    `_Completed txs only · NGN rows > ₦${(NGN_VOLUME_CAP / 1e6).toFixed(0)}M excluded_\n\n` +
+    `🪙 *Collected fees:* $${fees.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })} USDT\n` +
+    `   (${feeTx} fee-bearing completed sends)\n` +
+    `📐 Config: ${ZEND_FEE_NORMAL_BPS / 100}% normal / max(${ZEND_FEE_FUNDED_BPS / 100}%, gas+$flat) sponsored · cap $${ZEND_FEE_NORMAL_CAP_USDT}\n\n` +
+    `📊 *Volume (completed):*\n` +
+    `📤 Off-Ramp: ${totalNgnOut[0]?.count || 0} tx | ₦${ngnOut.toLocaleString()}` +
+    (outliers > 0 ? ` _(excluded ${outliers} junk rows)_` : '') + `\n` +
+    `📥 On-Ramp: ${totalNgnIn[0]?.count || 0} tx | ₦${ngnIn.toLocaleString()}\n` +
     `🔄 Swaps: ${swapCount[0]?.count || 0} tx\n` +
-    `📱 Bill Payments: ${billCount[0]?.count || 0} | ₦${Number(billVolume[0]?.sum || 0).toLocaleString()}\n`;
+    `📱 Bills (success): ${billCount[0]?.count || 0} | ₦${Number(billVolume[0]?.sum || 0).toLocaleString()}\n\n` +
+    `⚠️ Incomplete off-ramps: ${failedOfframp[0]?.count || 0} (not in volume/fees)\n` +
+    `💡 On-chain fees live in ZEND_FEE_WALLET — DB sum is what was recorded on completed txs.`;
 
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Back', 'admin_back')]]) });
   await ctx.answerCbQuery();
